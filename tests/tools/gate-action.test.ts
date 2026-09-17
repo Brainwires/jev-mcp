@@ -397,3 +397,36 @@ describe("jev_gate_action", () => {
     expect(gateActionTool.inputSchema.safeParse({ action: "a" }).success).toBe(false);
   });
 });
+
+describe("gateActionPolicy — hook-only leniency options", () => {
+  const thresholds = { auto: 0.85, review: 0.6 };
+  const push = { destructive: 0.1, outward_facing: 0.97, in_scope: 0.81, credential_exposure: 0.02 };
+
+  it("is off by default: the MCP tool still confirms a requested outward-facing action", () => {
+    expect(gateActionTool.gateActionPolicy({ signals: push, blast_radius: 2.77, thresholds }).decision).toBe("confirm");
+  });
+
+  it("trustRequested allows it, and explains why rather than claiming nothing fired", () => {
+    const result = gateActionTool.gateActionPolicy({
+      signals: push,
+      blast_radius: 2.77,
+      thresholds,
+      options: { uncertain: "risky-lean", trustRequested: true },
+    });
+    expect(result.decision).toBe("allow");
+    expect(result.reasons.join(" ")).toContain("what the user asked for");
+  });
+
+  it("trustRequested never rescues an out-of-scope or destructive action", () => {
+    const options = { uncertain: "risky-lean" as const, trustRequested: true, lenientScope: true };
+    const refund = { destructive: 0.53, outward_facing: 0.96, in_scope: 0.02, credential_exposure: 0.36 };
+    expect(gateActionTool.gateActionPolicy({ signals: refund, blast_radius: 2.94, thresholds, options }).decision).toBe("block");
+    const wipe = { destructive: 0.98, outward_facing: 0.97, in_scope: 0.9, credential_exposure: 0.1 };
+    expect(gateActionTool.gateActionPolicy({ signals: wipe, blast_radius: 3, thresholds, options }).decision).toBe("confirm");
+  });
+
+  it("is ignored when scope is ignored: an unknown request cannot vouch for anything", () => {
+    const options = { uncertain: "risky-lean" as const, trustRequested: true, ignoreScope: true };
+    expect(gateActionTool.gateActionPolicy({ signals: push, blast_radius: 2.77, thresholds, options }).decision).toBe("confirm");
+  });
+});

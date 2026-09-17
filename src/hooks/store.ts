@@ -71,7 +71,7 @@ export interface DecisionRecord {
   prefilter?: string;
   signals?: Record<string, number>;
   /** Policy options in force, so `/jev:calibrate` can replay the decision. */
-  policy?: { ignore_scope: boolean; uncertain: string };
+  policy?: { ignore_scope: boolean; uncertain: string; lenient_scope?: boolean; trust_requested?: boolean };
   decision: string;
   reasons?: string[];
   model?: string;

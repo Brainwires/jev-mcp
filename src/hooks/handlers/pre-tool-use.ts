@@ -99,6 +99,10 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
   const policyOptions = {
     ignoreScope: !knownRequest,
     uncertain: config.gateMode === "strict" ? ("confirm" as const) : ("risky-lean" as const),
+    // Strict mode keeps every reason to ask. Standard mode drops the two that
+    // fire on ordinary, requested work.
+    lenientScope: config.gateMode !== "strict",
+    trustRequested: config.gateMode !== "strict",
   };
 
   const controller = new AbortController();
@@ -124,7 +128,12 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
       ...base,
       decision: result.decision,
       signals: { ...result.signals, blast_radius: result.blast_radius.score },
-      policy: { ignore_scope: policyOptions.ignoreScope, uncertain: policyOptions.uncertain },
+      policy: {
+        ignore_scope: policyOptions.ignoreScope,
+        uncertain: policyOptions.uncertain,
+        lenient_scope: policyOptions.lenientScope,
+        trust_requested: policyOptions.trustRequested,
+      },
       reasons: result.reasons,
       model: result.model,
       latency_ms: result.latency_ms,
@@ -134,6 +143,20 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
     if (result.decision === "allow") {
       store.append(record);
       return undefined;
+    }
+
+    // Auto mode exists to remove prompts, and has its own classifier. For a
+    // confirm-grade judgment there, say what was seen and abstain: no
+    // permissionDecision at all, which is not an approval — Claude Code's own
+    // permission flow decides. `block` still escalates below.
+    if (result.decision === "confirm" && input.permission_mode === "auto" && config.autoMode === "advise") {
+      store.append({ ...record, decision: "advise" });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: `[jev] Advisory, not a block: ${result.reasons.slice(0, 3).join(" ")} Proceed only if this is what the user asked for.`,
+        },
+      };
     }
 
     // `confirm` asks the user. `block` asks too, unless nobody is there to

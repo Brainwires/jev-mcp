@@ -59,6 +59,7 @@ export function statusReport(config: HookConfig, store: Store, now: number = Dat
     `  model: ${config.model}`,
     `  base url: ${config.baseUrl}`,
     `  gate_mode: ${config.gateMode}`,
+    `  auto_mode: ${config.autoMode} (what a confirm-grade judgment does in auto mode)`,
     `  stop_check: ${config.stopCheck}   screen_results: ${config.screenResults}   route_prompts: ${config.routePrompts}`,
     `  thresholds: auto ${config.autoThreshold}, review ${config.reviewThreshold}`,
     `  per-call timeout: ${config.timeoutMs} ms, retries: ${config.maxRetries}`,
@@ -177,7 +178,9 @@ export function calibrateReport(config: HookConfig, store: Store): string {
   // Replay the same signals at other thresholds. The signals, the blast radius
   // and the policy options are all in the log, so this is an exact replay of
   // the pure policy function, not an estimate.
-  const asksNow = judged.filter((r) => r.decision === "ask" || r.decision === "deny").length;
+  // `advise` is a confirm-grade judgment that auto mode turned into a note; the
+  // replay below counts it, so the baseline has to as well.
+  const asksNow = judged.filter((r) => r.decision === "ask" || r.decision === "deny" || r.decision === "advise").length;
   lines.push("", `Replay at other auto thresholds (currently ${config.autoThreshold}; ${asksNow} escalations)`);
   for (const auto of [0.75, 0.8, 0.85, 0.9, 0.95]) {
     let escalations = 0;
@@ -195,6 +198,8 @@ export function calibrateReport(config: HookConfig, store: Store): string {
         options: {
           ignoreScope: record.policy?.ignore_scope ?? false,
           uncertain: record.policy?.uncertain === "confirm" ? "confirm" : "risky-lean",
+          lenientScope: record.policy?.lenient_scope ?? false,
+          trustRequested: record.policy?.trust_requested ?? false,
         },
       });
       if (gate.decision !== "allow") escalations += 1;

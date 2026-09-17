@@ -37258,6 +37258,11 @@ function gateActionPolicy(input2) {
   const auto = input2.thresholds.auto;
   const ignoreScope = input2.options?.ignoreScope === true;
   const uncertainMode = input2.options?.uncertain ?? "confirm";
+  const lenientScope = input2.options?.lenientScope === true;
+  const { signals } = input2;
+  const requested = input2.options?.trustRequested === true && !ignoreScope && signals.in_scope >= input2.thresholds.review && signals.destructive < 0.5 && signals.credential_exposure < 0.5;
+  const wideBlast = input2.blast_radius >= HIGH_BLAST_RADIUS;
+  const corroborated = wideBlast || signals.destructive >= 0.5 || signals.outward_facing >= 0.5 || signals.credential_exposure >= 0.5;
   const leans = {
     destructive: lean(input2.signals.destructive, auto),
     outward_facing: lean(input2.signals.outward_facing, auto),
@@ -37266,9 +37271,11 @@ function gateActionPolicy(input2) {
   };
   const reasons = [];
   if (leans.destructive === "yes") reasons.push("The action destroys or overwrites existing data.");
-  if (leans.outward_facing === "yes") reasons.push("The action affects people or systems outside this machine.");
+  if (leans.outward_facing === "yes" && !requested) {
+    reasons.push("The action affects people or systems outside this machine.");
+  }
   if (leans.credential_exposure === "yes") reasons.push("The action touches credentials or secret values.");
-  if (input2.blast_radius >= HIGH_BLAST_RADIUS) {
+  if (wideBlast && !requested) {
     reasons.push(`The blast radius is wide (${input2.blast_radius.toFixed(2)} of 3).`);
   }
   const outOfScope = !ignoreScope && leans.in_scope === "no";
@@ -37276,6 +37283,8 @@ function gateActionPolicy(input2) {
   const uncertainSignals = SIGNAL_NAMES.filter((signal) => {
     if (leans[signal] !== "uncertain") return false;
     if (ignoreScope && signal === "in_scope") return false;
+    if (signal === "in_scope" && (requested || lenientScope && !corroborated)) return false;
+    if (signal === "outward_facing" && requested) return false;
     return uncertainMode === "confirm" || leansRisky(signal, input2.signals[signal]);
   });
   for (const signal of uncertainSignals) {
@@ -37283,13 +37292,13 @@ function gateActionPolicy(input2) {
       `The model is unsure whether the action is ${signal.replace(/_/g, " ")} (${input2.signals[signal].toFixed(2)}).`
     );
   }
-  const consequential = leans.destructive === "yes" || leans.outward_facing === "yes";
+  const consequential = leans.destructive === "yes" || leans.outward_facing === "yes" && !requested;
   if (outOfScope && consequential) {
     return { decision: "block", reasons, leans };
   }
-  const needsConfirm = consequential || leans.credential_exposure === "yes" || input2.blast_radius >= HIGH_BLAST_RADIUS || outOfScope || uncertainSignals.length > 0;
+  const needsConfirm = consequential || leans.credential_exposure === "yes" || wideBlast && !requested || outOfScope || uncertainSignals.length > 0;
   if (needsConfirm) return { decision: "confirm", reasons, leans };
-  const nothingFired = ignoreScope ? "No risk signal fired." : "No risk signal fired and the action is in scope.";
+  const nothingFired = ignoreScope ? "No risk signal fired." : requested && (leans.outward_facing === "yes" || wideBlast) ? "The action reaches outside this machine, but it is what the user asked for and nothing destructive fired." : "No risk signal fired and the action is in scope.";
   return {
     decision: "allow",
     reasons: reasons.length > 0 ? reasons : [nothingFired],
@@ -37830,7 +37839,7 @@ function normalizeVerdict(choice) {
 
 // src/server.ts
 var SERVER_NAME = "jev-mcp";
-var SERVER_VERSION = "0.1.1";
+var SERVER_VERSION = "0.1.2";
 var ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 function ok(output2) {
   return {

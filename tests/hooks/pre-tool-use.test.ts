@@ -100,11 +100,99 @@ describe("handlePreToolUse", () => {
   });
 
   it("maps confirm to ask", async () => {
-    const model = new FakeModel(() => answers(NO, YES, YES, NO, 1));
+    // Destructive and in scope: requested or not, a human confirms it.
+    const model = new FakeModel(() => answers(YES, NO, YES, NO, 1));
     const deps = makeDeps(dir, { model });
-    deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["pay the invoice"] }));
+    deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["wipe the cache"] }));
     const output = await handlePreToolUse(input(), deps);
     expect(output?.hookSpecificOutput?.permissionDecision).toBe("ask");
+  });
+
+  describe("requested outward-facing work", () => {
+    it("stays silent for an in-scope, non-destructive push, even with a wide blast radius", async () => {
+      const model = new FakeModel(() => answers(0.1, YES, 0.81, NO, 2.77));
+      const deps = makeDeps(dir, { model });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["bump version and push"] }));
+      expect(await handlePreToolUse(input(), deps)).toBeUndefined();
+      expect(deps.store.readLog().at(-1)?.decision).toBe("allow");
+    });
+
+    it("still asks when the same action leans destructive, exposes credentials, or is weakly in scope", async () => {
+      for (const shape of [answers(0.6, YES, 0.81, NO, 2.77), answers(0.1, YES, 0.81, 0.6, 2.77), answers(0.1, YES, 0.55, NO, 2.77)]) {
+        const deps = makeDeps(dir, { model: new FakeModel(() => shape) });
+        deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["bump version and push"] }));
+        const output = await handlePreToolUse(input(), deps);
+        expect(output?.hookSpecificOutput?.permissionDecision).toBe("ask");
+      }
+    });
+
+    it("still asks in strict mode, and when the request is unknown", async () => {
+      const model = new FakeModel(() => answers(0.1, YES, 0.81, NO, 2.77));
+      const strict = makeDeps(dir, { model, config: { gateMode: "strict" } });
+      strict.store.updateSession("s1", (s) => ({ ...s, prompts: ["bump version and push"] }));
+      expect((await handlePreToolUse(input(), strict))?.hookSpecificOutput?.permissionDecision).toBe("ask");
+      const unknown = makeDeps(tempDir(), { model });
+      expect((await handlePreToolUse(input(), unknown))?.hookSpecificOutput?.permissionDecision).toBe("ask");
+    });
+  });
+
+  describe("scope uncertainty", () => {
+    it("does not ask for an uncertain scope with nothing else behind it", async () => {
+      const model = new FakeModel(() => answers(0.12, 0.31, 0.37, 0.03, 1.93));
+      const deps = makeDeps(dir, { model });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["fix the date parser test"] }));
+      expect(await handlePreToolUse(input({ tool_input: { command: "npm install --save-dev date-fns" } }), deps)).toBeUndefined();
+    });
+
+    it("asks when the uncertain scope is corroborated by a risk signal", async () => {
+      const model = new FakeModel(() => answers(0.12, 0.6, 0.37, 0.03, 1));
+      const deps = makeDeps(dir, { model });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["fix the date parser test"] }));
+      expect((await handlePreToolUse(input(), deps))?.hookSpecificOutput?.permissionDecision).toBe("ask");
+    });
+
+    it("asks on a firm out-of-scope reading by itself", async () => {
+      const model = new FakeModel(() => answers(NO, NO, NO, NO, 0));
+      const deps = makeDeps(dir, { model });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["fix the date parser test"] }));
+      expect((await handlePreToolUse(input(), deps))?.hookSpecificOutput?.permissionDecision).toBe("ask");
+    });
+  });
+
+  describe("auto mode", () => {
+    const confirmGrade = () => answers(YES, NO, YES, NO, 1);
+
+    it("advises instead of asking, and emits no permission decision at all", async () => {
+      const deps = makeDeps(dir, { model: new FakeModel(confirmGrade) });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["wipe the cache"] }));
+      const output = await handlePreToolUse(input({ permission_mode: "auto" }), deps);
+      expect(output?.hookSpecificOutput?.permissionDecision).toBeUndefined();
+      expect(output?.hookSpecificOutput?.additionalContext).toContain("[jev] Advisory");
+      expect(deps.store.readLog().at(-1)?.decision).toBe("advise");
+      expect(deps.store.readSession("s1").pending_asks ?? []).toHaveLength(0);
+    });
+
+    it("asks when auto_mode is set to ask", async () => {
+      const deps = makeDeps(dir, { model: new FakeModel(confirmGrade), config: { autoMode: "ask" } });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["wipe the cache"] }));
+      const output = await handlePreToolUse(input({ permission_mode: "auto" }), deps);
+      expect(output?.hookSpecificOutput?.permissionDecision).toBe("ask");
+    });
+
+    it("only applies to auto mode", async () => {
+      const deps = makeDeps(dir, { model: new FakeModel(confirmGrade) });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["wipe the cache"] }));
+      for (const mode of ["default", "plan", "acceptEdits", "dontAsk", "bypassPermissions"]) {
+        const output = await handlePreToolUse(input({ permission_mode: mode }), deps);
+        expect(output?.hookSpecificOutput?.permissionDecision, mode).toBe("ask");
+      }
+    });
+
+    it("still asks for a hard-coded pattern", async () => {
+      const deps = makeDeps(dir);
+      const output = await handlePreToolUse(input({ permission_mode: "auto", tool_input: { command: "rm -rf ~/" } }), deps);
+      expect(output?.hookSpecificOutput?.permissionDecision).toBe("ask");
+    });
   });
 
   it("maps block to ask in an interactive mode", async () => {
@@ -211,7 +299,7 @@ describe("handlePreToolUse", () => {
   });
 
   it("logs the judgment with its signals and policy options", async () => {
-    const model = new FakeModel(() => answers(NO, YES, YES, NO, 1));
+    const model = new FakeModel(() => answers(YES, YES, YES, NO, 1));
     const deps = makeDeps(dir, { model });
     deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["send it"] }));
     await handlePreToolUse(input(), deps);
@@ -219,7 +307,7 @@ describe("handlePreToolUse", () => {
     expect(record?.event).toBe("PreToolUse");
     expect(record?.decision).toBe("ask");
     expect(record?.signals?.outward_facing).toBe(YES);
-    expect(record?.policy).toEqual({ ignore_scope: false, uncertain: "risky-lean" });
+    expect(record?.policy).toEqual({ ignore_scope: false, uncertain: "risky-lean", lenient_scope: true, trust_requested: true });
     expect(record?.tool_use_id).toBe("toolu_1");
   });
 

@@ -457,12 +457,14 @@ function isRetryableStatus(status) {
 import { homedir } from "node:os";
 import { join } from "node:path";
 var GATE_MODES = ["off", "standard", "strict"];
+var AUTO_MODE_BEHAVIORS = ["ask", "advise"];
 var HOOK_DEFAULTS = {
   baseUrl: "https://api.typesafe.ai",
   model: "jev-latest",
   timeoutMs: 1500,
   maxRetries: 0,
   gateMode: "standard",
+  autoMode: "advise",
   stopCheck: true,
   screenResults: true,
   routePrompts: false,
@@ -525,6 +527,16 @@ function loadHookConfig(env = process.env) {
       warnings.push(`gate_mode=${JSON.stringify(gateRaw)} is not one of ${GATE_MODES.join("|")}; using standard.`);
     }
   }
+  const autoRaw = read(env, "auto_mode", "JEV_AUTO_MODE");
+  let autoMode = HOOK_DEFAULTS.autoMode;
+  if (autoRaw !== void 0) {
+    const lowered = autoRaw.toLowerCase();
+    if (AUTO_MODE_BEHAVIORS.includes(lowered)) {
+      autoMode = lowered;
+    } else {
+      warnings.push(`auto_mode=${JSON.stringify(autoRaw)} is not one of ${AUTO_MODE_BEHAVIORS.join("|")}; using advise.`);
+    }
+  }
   const apiKey = read(env, "api_key", "TYPESAFE_API_KEY") ?? null;
   const auto = readNumber(env, "auto_threshold", HOOK_DEFAULTS.autoThreshold, 0, 1, warnings, "JEV_AUTO_THRESHOLD");
   const review = readNumber(
@@ -543,6 +555,7 @@ function loadHookConfig(env = process.env) {
     timeoutMs: readNumber(env, "timeout_ms", HOOK_DEFAULTS.timeoutMs, 100, 1e4, warnings, "JEV_HOOK_TIMEOUT_MS"),
     maxRetries: HOOK_DEFAULTS.maxRetries,
     gateMode,
+    autoMode,
     stopCheck: readBool(env, "stop_check", HOOK_DEFAULTS.stopCheck, warnings, "JEV_STOP_CHECK"),
     screenResults: readBool(env, "screen_results", HOOK_DEFAULTS.screenResults, warnings, "JEV_SCREEN_RESULTS"),
     routePrompts: readBool(env, "route_prompts", HOOK_DEFAULTS.routePrompts, warnings, "JEV_ROUTE_PROMPTS"),
@@ -803,6 +816,11 @@ function gateActionPolicy(input) {
   const auto = input.thresholds.auto;
   const ignoreScope = input.options?.ignoreScope === true;
   const uncertainMode = input.options?.uncertain ?? "confirm";
+  const lenientScope = input.options?.lenientScope === true;
+  const { signals } = input;
+  const requested = input.options?.trustRequested === true && !ignoreScope && signals.in_scope >= input.thresholds.review && signals.destructive < 0.5 && signals.credential_exposure < 0.5;
+  const wideBlast = input.blast_radius >= HIGH_BLAST_RADIUS;
+  const corroborated = wideBlast || signals.destructive >= 0.5 || signals.outward_facing >= 0.5 || signals.credential_exposure >= 0.5;
   const leans = {
     destructive: lean(input.signals.destructive, auto),
     outward_facing: lean(input.signals.outward_facing, auto),
@@ -811,9 +829,11 @@ function gateActionPolicy(input) {
   };
   const reasons = [];
   if (leans.destructive === "yes") reasons.push("The action destroys or overwrites existing data.");
-  if (leans.outward_facing === "yes") reasons.push("The action affects people or systems outside this machine.");
+  if (leans.outward_facing === "yes" && !requested) {
+    reasons.push("The action affects people or systems outside this machine.");
+  }
   if (leans.credential_exposure === "yes") reasons.push("The action touches credentials or secret values.");
-  if (input.blast_radius >= HIGH_BLAST_RADIUS) {
+  if (wideBlast && !requested) {
     reasons.push(`The blast radius is wide (${input.blast_radius.toFixed(2)} of 3).`);
   }
   const outOfScope = !ignoreScope && leans.in_scope === "no";
@@ -821,6 +841,8 @@ function gateActionPolicy(input) {
   const uncertainSignals = SIGNAL_NAMES.filter((signal) => {
     if (leans[signal] !== "uncertain") return false;
     if (ignoreScope && signal === "in_scope") return false;
+    if (signal === "in_scope" && (requested || lenientScope && !corroborated)) return false;
+    if (signal === "outward_facing" && requested) return false;
     return uncertainMode === "confirm" || leansRisky(signal, input.signals[signal]);
   });
   for (const signal of uncertainSignals) {
@@ -828,13 +850,13 @@ function gateActionPolicy(input) {
       `The model is unsure whether the action is ${signal.replace(/_/g, " ")} (${input.signals[signal].toFixed(2)}).`
     );
   }
-  const consequential = leans.destructive === "yes" || leans.outward_facing === "yes";
+  const consequential = leans.destructive === "yes" || leans.outward_facing === "yes" && !requested;
   if (outOfScope && consequential) {
     return { decision: "block", reasons, leans };
   }
-  const needsConfirm = consequential || leans.credential_exposure === "yes" || input.blast_radius >= HIGH_BLAST_RADIUS || outOfScope || uncertainSignals.length > 0;
+  const needsConfirm = consequential || leans.credential_exposure === "yes" || wideBlast && !requested || outOfScope || uncertainSignals.length > 0;
   if (needsConfirm) return { decision: "confirm", reasons, leans };
-  const nothingFired = ignoreScope ? "No risk signal fired." : "No risk signal fired and the action is in scope.";
+  const nothingFired = ignoreScope ? "No risk signal fired." : requested && (leans.outward_facing === "yes" || wideBlast) ? "The action reaches outside this machine, but it is what the user asked for and nothing destructive fired." : "No risk signal fired and the action is in scope.";
   return {
     decision: "allow",
     reasons: reasons.length > 0 ? reasons : [nothingFired],
@@ -1639,7 +1661,11 @@ async function handlePreToolUse(input, deps) {
   if (input.permission_mode !== void 0) contextParts.push(`Permission mode: ${input.permission_mode}`);
   const policyOptions = {
     ignoreScope: !knownRequest,
-    uncertain: config.gateMode === "strict" ? "confirm" : "risky-lean"
+    uncertain: config.gateMode === "strict" ? "confirm" : "risky-lean",
+    // Strict mode keeps every reason to ask. Standard mode drops the two that
+    // fire on ordinary, requested work.
+    lenientScope: config.gateMode !== "strict",
+    trustRequested: config.gateMode !== "strict"
   };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
@@ -1663,7 +1689,12 @@ async function handlePreToolUse(input, deps) {
       ...base,
       decision: result.decision,
       signals: { ...result.signals, blast_radius: result.blast_radius.score },
-      policy: { ignore_scope: policyOptions.ignoreScope, uncertain: policyOptions.uncertain },
+      policy: {
+        ignore_scope: policyOptions.ignoreScope,
+        uncertain: policyOptions.uncertain,
+        lenient_scope: policyOptions.lenientScope,
+        trust_requested: policyOptions.trustRequested
+      },
       reasons: result.reasons,
       model: result.model,
       latency_ms: result.latency_ms,
@@ -1672,6 +1703,15 @@ async function handlePreToolUse(input, deps) {
     if (result.decision === "allow") {
       store.append(record);
       return void 0;
+    }
+    if (result.decision === "confirm" && input.permission_mode === "auto" && config.autoMode === "advise") {
+      store.append({ ...record, decision: "advise" });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: `[jev] Advisory, not a block: ${result.reasons.slice(0, 3).join(" ")} Proceed only if this is what the user asked for.`
+        }
+      };
     }
     const decision = result.decision === "block" ? escalation(input.permission_mode) : "ask";
     const mapped = { ...record, decision };
@@ -2147,6 +2187,7 @@ function statusReport(config, store, now = Date.now()) {
     `  model: ${config.model}`,
     `  base url: ${config.baseUrl}`,
     `  gate_mode: ${config.gateMode}`,
+    `  auto_mode: ${config.autoMode} (what a confirm-grade judgment does in auto mode)`,
     `  stop_check: ${config.stopCheck}   screen_results: ${config.screenResults}   route_prompts: ${config.routePrompts}`,
     `  thresholds: auto ${config.autoThreshold}, review ${config.reviewThreshold}`,
     `  per-call timeout: ${config.timeoutMs} ms, retries: ${config.maxRetries}`,
@@ -2243,7 +2284,7 @@ function calibrateReport(config, store) {
   }
   lines.push("", "How often each gate fired");
   lines.push(formatTally(tally(judged.map((r) => r.decision ?? "?"))));
-  const asksNow = judged.filter((r) => r.decision === "ask" || r.decision === "deny").length;
+  const asksNow = judged.filter((r) => r.decision === "ask" || r.decision === "deny" || r.decision === "advise").length;
   lines.push("", `Replay at other auto thresholds (currently ${config.autoThreshold}; ${asksNow} escalations)`);
   for (const auto of [0.75, 0.8, 0.85, 0.9, 0.95]) {
     let escalations = 0;
@@ -2260,7 +2301,9 @@ function calibrateReport(config, store) {
         thresholds: { auto, review: Math.min(config.reviewThreshold, auto) },
         options: {
           ignoreScope: record.policy?.ignore_scope ?? false,
-          uncertain: record.policy?.uncertain === "confirm" ? "confirm" : "risky-lean"
+          uncertain: record.policy?.uncertain === "confirm" ? "confirm" : "risky-lean",
+          lenientScope: record.policy?.lenient_scope ?? false,
+          trustRequested: record.policy?.trust_requested ?? false
         }
       });
       if (gate.decision !== "allow") escalations += 1;

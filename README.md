@@ -317,6 +317,7 @@ To send less:
 |---|---|---|
 | `api_key` | — | TypeSafe API key. Stored in your keychain, never in a settings file |
 | `gate_mode` | `standard` | `off`, `standard`, or `strict`. `strict` also judges ordinary in-project edits and treats every uncertain signal as a reason to ask |
+| `auto_mode` | `advise` | What a confirm-grade judgment does while the session is in auto mode. `advise` adds a `[jev]` note to Claude's context and abstains, so Claude Code's auto-mode classifier decides and you are not prompted. `ask` prompts anyway. Out-of-scope actions that are destructive or outward-facing, and the hard-coded patterns, prompt either way |
 | `stop_check` | `true` | The `Stop` hook |
 | `screen_results` | `true` | The `PostToolUse` screen |
 | `route_prompts` | `false` | Prompt classification |

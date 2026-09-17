@@ -18,6 +18,15 @@ import { join } from "node:path";
 export const GATE_MODES = ["off", "standard", "strict"] as const;
 export type GateMode = (typeof GATE_MODES)[number];
 
+/**
+ * `ask`: a confirm-grade judgment prompts, in every mode. `advise`: while the
+ * session is in auto mode it hands Claude a note instead and abstains, leaving
+ * the decision to Claude Code's own auto-mode classifier. Block-grade
+ * judgments and the hard-coded patterns prompt either way.
+ */
+export const AUTO_MODE_BEHAVIORS = ["ask", "advise"] as const;
+export type AutoModeBehavior = (typeof AUTO_MODE_BEHAVIORS)[number];
+
 export interface HookConfig {
   apiKey: string | null;
   baseUrl: string;
@@ -26,6 +35,8 @@ export interface HookConfig {
   timeoutMs: number;
   maxRetries: number;
   gateMode: GateMode;
+  /** What a confirm-grade judgment does while the session is in auto mode. */
+  autoMode: AutoModeBehavior;
   stopCheck: boolean;
   screenResults: boolean;
   routePrompts: boolean;
@@ -45,6 +56,7 @@ export const HOOK_DEFAULTS = {
   timeoutMs: 1500,
   maxRetries: 0,
   gateMode: "standard" as GateMode,
+  autoMode: "advise" as AutoModeBehavior,
   stopCheck: true,
   screenResults: true,
   routePrompts: false,
@@ -135,6 +147,17 @@ export function loadHookConfig(env: Env = process.env): HookConfig {
     }
   }
 
+  const autoRaw = read(env, "auto_mode", "JEV_AUTO_MODE");
+  let autoMode: AutoModeBehavior = HOOK_DEFAULTS.autoMode;
+  if (autoRaw !== undefined) {
+    const lowered = autoRaw.toLowerCase();
+    if ((AUTO_MODE_BEHAVIORS as readonly string[]).includes(lowered)) {
+      autoMode = lowered as AutoModeBehavior;
+    } else {
+      warnings.push(`auto_mode=${JSON.stringify(autoRaw)} is not one of ${AUTO_MODE_BEHAVIORS.join("|")}; using advise.`);
+    }
+  }
+
   const apiKey = read(env, "api_key", "TYPESAFE_API_KEY") ?? null;
   const auto = readNumber(env, "auto_threshold", HOOK_DEFAULTS.autoThreshold, 0, 1, warnings, "JEV_AUTO_THRESHOLD");
   const review = readNumber(
@@ -154,6 +177,7 @@ export function loadHookConfig(env: Env = process.env): HookConfig {
     timeoutMs: readNumber(env, "timeout_ms", HOOK_DEFAULTS.timeoutMs, 100, 10_000, warnings, "JEV_HOOK_TIMEOUT_MS"),
     maxRetries: HOOK_DEFAULTS.maxRetries,
     gateMode,
+    autoMode,
     stopCheck: readBool(env, "stop_check", HOOK_DEFAULTS.stopCheck, warnings, "JEV_STOP_CHECK"),
     screenResults: readBool(env, "screen_results", HOOK_DEFAULTS.screenResults, warnings, "JEV_SCREEN_RESULTS"),
     routePrompts: readBool(env, "route_prompts", HOOK_DEFAULTS.routePrompts, warnings, "JEV_ROUTE_PROMPTS"),

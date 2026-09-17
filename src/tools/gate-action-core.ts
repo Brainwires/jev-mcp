@@ -112,6 +112,23 @@ export interface GateActionPolicyOptions {
    * because prompt fatigue is the main failure mode of an automatic gate.
    */
   uncertain?: UncertainMode | undefined;
+  /**
+   * An uncertain `in_scope` fires only when something corroborates it: another
+   * risk signal at `p >= 0.5`, or a wide blast radius. Jev reads scope
+   * literally, so supporting work the request never named — installing a
+   * dependency, committing — lands in the uncertain band on its own, and a
+   * prompt for each of those teaches the user to stop reading prompts. A firm
+   * out-of-scope reading still confirms by itself.
+   */
+  lenientScope?: boolean | undefined;
+  /**
+   * Do not confirm an action merely for reaching outside the machine when the
+   * user asked for it: `in_scope >= thresholds.review`, and neither
+   * `destructive` nor `credential_exposure` leans yes (`p < 0.5`). Outward
+   * reach and blast radius then stop being reasons to ask. The caller abstains
+   * rather than approves, so the host's own permission flow still applies.
+   */
+  trustRequested?: boolean | undefined;
 }
 
 export interface GateActionPolicyInput {
@@ -153,6 +170,18 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
   const auto = input.thresholds.auto;
   const ignoreScope = input.options?.ignoreScope === true;
   const uncertainMode: UncertainMode = input.options?.uncertain ?? "confirm";
+  const lenientScope = input.options?.lenientScope === true;
+  const { signals } = input;
+
+  const requested =
+    input.options?.trustRequested === true &&
+    !ignoreScope &&
+    signals.in_scope >= input.thresholds.review &&
+    signals.destructive < 0.5 &&
+    signals.credential_exposure < 0.5;
+  const wideBlast = input.blast_radius >= HIGH_BLAST_RADIUS;
+  const corroborated =
+    wideBlast || signals.destructive >= 0.5 || signals.outward_facing >= 0.5 || signals.credential_exposure >= 0.5;
 
   const leans = {
     destructive: lean(input.signals.destructive, auto),
@@ -164,9 +193,11 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
   const reasons: string[] = [];
 
   if (leans.destructive === "yes") reasons.push("The action destroys or overwrites existing data.");
-  if (leans.outward_facing === "yes") reasons.push("The action affects people or systems outside this machine.");
+  if (leans.outward_facing === "yes" && !requested) {
+    reasons.push("The action affects people or systems outside this machine.");
+  }
   if (leans.credential_exposure === "yes") reasons.push("The action touches credentials or secret values.");
-  if (input.blast_radius >= HIGH_BLAST_RADIUS) {
+  if (wideBlast && !requested) {
     reasons.push(`The blast radius is wide (${input.blast_radius.toFixed(2)} of 3).`);
   }
   const outOfScope = !ignoreScope && leans.in_scope === "no";
@@ -175,6 +206,8 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
   const uncertainSignals = SIGNAL_NAMES.filter((signal) => {
     if (leans[signal] !== "uncertain") return false;
     if (ignoreScope && signal === "in_scope") return false;
+    if (signal === "in_scope" && (requested || (lenientScope && !corroborated))) return false;
+    if (signal === "outward_facing" && requested) return false;
     return uncertainMode === "confirm" || leansRisky(signal, input.signals[signal]);
   });
 
@@ -184,7 +217,7 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
     );
   }
 
-  const consequential = leans.destructive === "yes" || leans.outward_facing === "yes";
+  const consequential = leans.destructive === "yes" || (leans.outward_facing === "yes" && !requested);
 
   if (outOfScope && consequential) {
     return { decision: "block", reasons, leans };
@@ -193,7 +226,7 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
   const needsConfirm =
     consequential ||
     leans.credential_exposure === "yes" ||
-    input.blast_radius >= HIGH_BLAST_RADIUS ||
+    (wideBlast && !requested) ||
     outOfScope ||
     uncertainSignals.length > 0;
 
@@ -201,7 +234,9 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
 
   const nothingFired = ignoreScope
     ? "No risk signal fired."
-    : "No risk signal fired and the action is in scope.";
+    : requested && (leans.outward_facing === "yes" || wideBlast)
+      ? "The action reaches outside this machine, but it is what the user asked for and nothing destructive fired."
+      : "No risk signal fired and the action is in scope.";
   return {
     decision: "allow",
     reasons: reasons.length > 0 ? reasons : [nothingFired],
