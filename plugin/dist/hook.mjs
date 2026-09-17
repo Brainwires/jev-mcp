@@ -495,12 +495,23 @@ function readNumber(env, option, fallback, min, max, warnings, ...aliases) {
   }
   return value;
 }
-function resolveDataDir(env = process.env) {
+function resolveDataDir(env = process.env, scriptPath = process.argv[1]) {
   const explicit = env.CLAUDE_PLUGIN_DATA?.trim();
   if (explicit !== void 0 && explicit !== "") return explicit;
   const jev = env.JEV_HOOKS_DATA_DIR?.trim();
   if (jev !== void 0 && jev !== "") return jev;
-  return join(env.HOME?.trim() || homedir(), ".claude", "plugins", "data", "jev");
+  const dataRoot = join(env.HOME?.trim() || homedir(), ".claude", "plugins", "data");
+  return join(dataRoot, installIdFromScriptPath(scriptPath) ?? "jev");
+}
+function installIdFromScriptPath(scriptPath) {
+  if (scriptPath === void 0) return void 0;
+  const parts = scriptPath.replace(/\\/g, "/").split("/");
+  const cache = parts.lastIndexOf("cache");
+  if (cache < 1 || parts[cache - 1] !== "plugins") return void 0;
+  const marketplace = parts[cache + 1];
+  const plugin = parts[cache + 2];
+  if (!marketplace || !plugin || parts.length < cache + 5) return void 0;
+  return `${plugin}@${marketplace}`.replace(/[^A-Za-z0-9_-]/g, "-");
 }
 function loadHookConfig(env = process.env) {
   const warnings = [];

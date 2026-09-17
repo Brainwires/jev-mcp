@@ -6,7 +6,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { HOOK_DEFAULTS, loadHookConfig, resolveDataDir } from "../../src/hooks/config.js";
+import { HOOK_DEFAULTS, installIdFromScriptPath, loadHookConfig, resolveDataDir } from "../../src/hooks/config.js";
 
 describe("loadHookConfig", () => {
   it("uses the documented defaults with an empty environment", () => {
@@ -95,5 +95,25 @@ describe("resolveDataDir", () => {
   it("falls back to the documented location under the home directory", () => {
     expect(resolveDataDir({ HOME: "/home/dev" })).toBe(join("/home/dev", ".claude", "plugins", "data", "jev"));
     expect(resolveDataDir({})).toBe(join(homedir(), ".claude", "plugins", "data", "jev"));
+  });
+
+  // A /jev:* command runs through the Bash tool, where CLAUDE_PLUGIN_DATA is not
+  // exported. It has to land on the directory the hooks write to.
+  it("derives the install id from an installed plugin's script path", () => {
+    const script = "/home/dev/.claude/plugins/cache/brainwires-jev/jev/0.1.0/dist/hook.mjs";
+    expect(resolveDataDir({ HOME: "/home/dev" }, script)).toBe(
+      join("/home/dev", ".claude", "plugins", "data", "jev-brainwires-jev"),
+    );
+    expect(installIdFromScriptPath("C:\\Users\\dev\\.claude\\plugins\\cache\\my.market\\jev\\1.0.0\\dist\\hook.mjs")).toBe(
+      "jev-my-market",
+    );
+  });
+
+  it("prefers CLAUDE_PLUGIN_DATA over the derived id, and ignores paths outside the plugin cache", () => {
+    const script = "/home/dev/.claude/plugins/cache/brainwires-jev/jev/0.1.0/dist/hook.mjs";
+    expect(resolveDataDir({ CLAUDE_PLUGIN_DATA: "/tmp/data" }, script)).toBe("/tmp/data");
+    expect(installIdFromScriptPath("/repo/jev-mcp/plugin/dist/hook.mjs")).toBeUndefined();
+    expect(installIdFromScriptPath("/x/cache/a/b/1/dist/hook.mjs")).toBeUndefined();
+    expect(installIdFromScriptPath(undefined)).toBeUndefined();
   });
 });

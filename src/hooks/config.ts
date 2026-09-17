@@ -93,12 +93,32 @@ function readNumber(
 }
 
 /** Where session files and the decision log live. */
-export function resolveDataDir(env: Env = process.env): string {
+export function resolveDataDir(env: Env = process.env, scriptPath: string | undefined = process.argv[1]): string {
   const explicit = env.CLAUDE_PLUGIN_DATA?.trim();
   if (explicit !== undefined && explicit !== "") return explicit;
   const jev = env.JEV_HOOKS_DATA_DIR?.trim();
   if (jev !== undefined && jev !== "") return jev;
-  return join(env.HOME?.trim() || homedir(), ".claude", "plugins", "data", "jev");
+  const dataRoot = join(env.HOME?.trim() || homedir(), ".claude", "plugins", "data");
+  return join(dataRoot, installIdFromScriptPath(scriptPath) ?? "jev");
+}
+
+/**
+ * CLAUDE_PLUGIN_DATA is exported to hook processes only. A /jev:* command runs
+ * through the Bash tool without it, and must still read the directory the hooks
+ * write to. An installed plugin runs from
+ * `<…>/plugins/cache/<marketplace>/<plugin>/<version>/dist/hook.mjs`, and Claude
+ * Code names the data directory `<plugin>-<marketplace>` with characters
+ * outside [A-Za-z0-9_-] replaced by `-`.
+ */
+export function installIdFromScriptPath(scriptPath: string | undefined): string | undefined {
+  if (scriptPath === undefined) return undefined;
+  const parts = scriptPath.replace(/\\/g, "/").split("/");
+  const cache = parts.lastIndexOf("cache");
+  if (cache < 1 || parts[cache - 1] !== "plugins") return undefined;
+  const marketplace = parts[cache + 1];
+  const plugin = parts[cache + 2];
+  if (!marketplace || !plugin || parts.length < cache + 5) return undefined;
+  return `${plugin}@${marketplace}`.replace(/[^A-Za-z0-9_-]/g, "-");
 }
 
 export function loadHookConfig(env: Env = process.env): HookConfig {
