@@ -28,14 +28,34 @@ describe("handleUserPromptSubmit", () => {
     expect(model.calls).toHaveLength(0);
   });
 
-  it("keeps only the last few prompts", async () => {
+  it("keeps only the last few substantive prompts", async () => {
     const deps = makeDeps(dir);
+    const long = (n: number): string => `Please implement feature number ${n} across the whole codebase`;
     for (const n of [1, 2, 3, 4, 5]) {
-      await handleUserPromptSubmit({ session_id: "s1", prompt: `prompt ${n}` }, deps);
+      await handleUserPromptSubmit({ session_id: "s1", prompt: long(n) }, deps);
     }
     const prompts = deps.store.readSession("s1").prompts;
+    expect(prompts).toEqual([long(3), long(4), long(5)]);
     expect(prompts).toHaveLength(MAX_PROMPTS);
-    expect(prompts.at(-1)).toBe("prompt 5");
+  });
+
+  it("does not let short follow-ups evict the request they continue", async () => {
+    const deps = makeDeps(dir);
+    const request = "Bump the version everywhere and push the release to the public repo";
+    await handleUserPromptSubmit({ session_id: "s1", prompt: request }, deps);
+    for (const follow of ["go", "yes", "ship both", "try it now"]) {
+      await handleUserPromptSubmit({ session_id: "s1", prompt: follow }, deps);
+    }
+    expect(deps.store.readSession("s1").prompts).toEqual([request, "ship both", "try it now"]);
+  });
+
+  it("ignores an empty prompt but still resets the stop counter", async () => {
+    const deps = makeDeps(dir);
+    deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["a real request that is long enough to keep"], stop_blocks: 1 }));
+    await handleUserPromptSubmit({ session_id: "s1", prompt: "   " }, deps);
+    const session = deps.store.readSession("s1");
+    expect(session.prompts).toHaveLength(1);
+    expect(session.stop_blocks).toBe(0);
   });
 
   it("truncates a very long prompt", async () => {

@@ -26,9 +26,61 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-/** Maximum prompts kept per session, oldest first. */
+/** Maximum substantive prompts kept per session, oldest first. */
 export const MAX_PROMPTS = 3;
 export const MAX_PROMPT_CHARS = 2000;
+/**
+ * Below this a prompt is a continuation — "go", "ship both", "try it now". It
+ * is kept, because "make it public" is an authorization the gate should see,
+ * but it carries almost no scope and must not evict the request it continues.
+ */
+export const SHORT_PROMPT_CHARS = 40;
+export const MAX_SHORT_PROMPTS = 2;
+
+/** Append a prompt, trimming short and substantive prompts separately. Order is preserved. */
+export function nextPrompts(existing: readonly string[], prompt: string): string[] {
+  const text = prompt.trim();
+  if (text === "") return [...existing];
+  const all = [...existing, text];
+  const isShort = (p: string): boolean => p.length < SHORT_PROMPT_CHARS;
+  let short = all.filter(isShort).length;
+  let long = all.length - short;
+  return all.filter((p) => {
+    if (isShort(p)) {
+      if (short > MAX_SHORT_PROMPTS) {
+        short -= 1;
+        return false;
+      }
+      return true;
+    }
+    if (long > MAX_PROMPTS) {
+      long -= 1;
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * The user's request as one string within `max` characters. The budget is
+ * filled from the newest prompt backwards, so what gets cut is the oldest
+ * context and never the instruction the user just gave.
+ */
+export function requestText(prompts: readonly string[], max: number, separator = "\n---\n"): string {
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = prompts.length - 1; i >= 0; i -= 1) {
+    const prompt = prompts[i] as string;
+    const cost = prompt.length + (kept.length > 0 ? separator.length : 0);
+    if (used + cost > max) {
+      if (kept.length === 0) kept.unshift(prompt.slice(0, max));
+      break;
+    }
+    kept.unshift(prompt);
+    used += cost;
+  }
+  return kept.join(separator);
+}
 /** Rotate the decision log at this size. One generation is kept. */
 export const LOG_ROTATE_BYTES = 5 * 1024 * 1024;
 /** Session files older than this are pruned. */

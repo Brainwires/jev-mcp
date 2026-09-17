@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "jev",
   "displayName": "Jev",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Puts a fast calibrated classifier at the harness boundaries: escalates risky tool calls to a permission prompt, flags tool results that read like prompt injection, and catches a turn that stops short of the work it was asked to do. Escalate-only and fail-open.",
   "author": {
     "name": "Brainwires"

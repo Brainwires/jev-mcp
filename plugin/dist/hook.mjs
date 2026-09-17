@@ -567,6 +567,225 @@ function loadHookConfig(env = process.env) {
   };
 }
 
+// src/hooks/store.ts
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync
+} from "node:fs";
+import { join as join2 } from "node:path";
+var MAX_PROMPTS = 3;
+var MAX_PROMPT_CHARS = 2e3;
+var SHORT_PROMPT_CHARS = 40;
+var MAX_SHORT_PROMPTS = 2;
+function nextPrompts(existing, prompt) {
+  const text = prompt.trim();
+  if (text === "") return [...existing];
+  const all = [...existing, text];
+  const isShort = (p) => p.length < SHORT_PROMPT_CHARS;
+  let short = all.filter(isShort).length;
+  let long = all.length - short;
+  return all.filter((p) => {
+    if (isShort(p)) {
+      if (short > MAX_SHORT_PROMPTS) {
+        short -= 1;
+        return false;
+      }
+      return true;
+    }
+    if (long > MAX_PROMPTS) {
+      long -= 1;
+      return false;
+    }
+    return true;
+  });
+}
+function requestText(prompts, max, separator = "\n---\n") {
+  const kept = [];
+  let used = 0;
+  for (let i = prompts.length - 1; i >= 0; i -= 1) {
+    const prompt = prompts[i];
+    const cost = prompt.length + (kept.length > 0 ? separator.length : 0);
+    if (used + cost > max) {
+      if (kept.length === 0) kept.unshift(prompt.slice(0, max));
+      break;
+    }
+    kept.unshift(prompt);
+    used += cost;
+  }
+  return kept.join(separator);
+}
+var LOG_ROTATE_BYTES = 5 * 1024 * 1024;
+var SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1e3;
+var PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1e3;
+var MAX_PENDING = 20;
+var EMPTY_SESSION = { prompts: [], stop_blocks: 0 };
+function safe(fn, fallback) {
+  try {
+    return fn();
+  } catch {
+    return fallback;
+  }
+}
+function safeSessionId(sessionId) {
+  const cleaned = sessionId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 120);
+  return cleaned === "" ? "unknown" : cleaned;
+}
+var Store = class {
+  dir;
+  constructor(dir) {
+    this.dir = dir;
+  }
+  ensureDir(sub) {
+    const target = sub === void 0 ? this.dir : join2(this.dir, sub);
+    safe(() => mkdirSync(target, { recursive: true }), void 0);
+    return target;
+  }
+  sessionPath(sessionId) {
+    return join2(this.dir, "sessions", `${safeSessionId(sessionId)}.json`);
+  }
+  get logPath() {
+    return join2(this.dir, "decisions.jsonl");
+  }
+  /** The `/jev:off` fallback when a command cannot learn the session id. */
+  get globalDisablePath() {
+    return join2(this.dir, "disabled");
+  }
+  readSession(sessionId) {
+    return safe(() => {
+      const raw = readFileSync(this.sessionPath(sessionId), "utf8");
+      const parsed = JSON.parse(raw);
+      if (typeof parsed !== "object" || parsed === null) return { ...EMPTY_SESSION };
+      const state = parsed;
+      const session = {
+        prompts: Array.isArray(state.prompts) ? state.prompts.filter((p) => typeof p === "string") : [],
+        stop_blocks: typeof state.stop_blocks === "number" ? state.stop_blocks : 0
+      };
+      if (state.disabled === true) session.disabled = true;
+      if (state.key_warned === true) session.key_warned = true;
+      if (Array.isArray(state.pending_asks)) {
+        session.pending_asks = state.pending_asks.filter(
+          (p) => typeof p === "object" && p !== null && typeof p.tool_use_id === "string"
+        );
+      }
+      if (typeof state.updated === "number") session.updated = state.updated;
+      return session;
+    }, { ...EMPTY_SESSION });
+  }
+  writeSession(sessionId, state, now = Date.now()) {
+    this.ensureDir("sessions");
+    safe(() => {
+      writeFileSync(this.sessionPath(sessionId), `${JSON.stringify({ ...state, updated: now })}
+`, "utf8");
+    }, void 0);
+  }
+  updateSession(sessionId, mutate, now = Date.now()) {
+    const next = mutate(this.readSession(sessionId));
+    this.writeSession(sessionId, next, now);
+    return next;
+  }
+  /** Session-scoped or global `/jev:off`. */
+  isDisabled(sessionId) {
+    if (safe(() => existsSync(this.globalDisablePath), false)) return true;
+    return this.readSession(sessionId).disabled === true;
+  }
+  setDisabled(sessionId, disabled) {
+    if (sessionId === null) {
+      this.ensureDir();
+      if (disabled) {
+        safe(() => writeFileSync(this.globalDisablePath, `${(/* @__PURE__ */ new Date()).toISOString()}
+`, "utf8"), void 0);
+      } else {
+        safe(() => unlinkSync(this.globalDisablePath), void 0);
+      }
+      return { scope: "global", path: this.globalDisablePath };
+    }
+    this.updateSession(sessionId, (state) => {
+      const next = { ...state };
+      if (disabled) next.disabled = true;
+      else delete next.disabled;
+      return next;
+    });
+    if (!disabled) safe(() => unlinkSync(this.globalDisablePath), void 0);
+    return { scope: "session", path: this.sessionPath(sessionId) };
+  }
+  /** Record that this tool call was escalated, so PostToolUse can see it ran. */
+  rememberAsk(sessionId, pending) {
+    this.updateSession(sessionId, (state) => ({
+      ...state,
+      pending_asks: [...state.pending_asks ?? [], pending].slice(-MAX_PENDING)
+    }));
+  }
+  /** Consume a pending ask. Returns it when this tool call was one of ours. */
+  takeAsk(sessionId, toolUseId) {
+    const state = this.readSession(sessionId);
+    const pending = state.pending_asks ?? [];
+    const found = pending.find((p) => p.tool_use_id === toolUseId);
+    if (found === void 0) return void 0;
+    this.writeSession(sessionId, {
+      ...state,
+      pending_asks: pending.filter((p) => p.tool_use_id !== toolUseId)
+    });
+    return found;
+  }
+  /** One `appendFileSync` call, so concurrent hooks cannot interleave a line. */
+  append(record) {
+    this.ensureDir();
+    safe(() => {
+      const size = safe(() => statSync(this.logPath).size, 0);
+      if (size >= LOG_ROTATE_BYTES) {
+        safe(() => renameSync(this.logPath, join2(this.dir, "decisions.1.jsonl")), void 0);
+      }
+      appendFileSync(this.logPath, `${JSON.stringify(record)}
+`, "utf8");
+    }, void 0);
+  }
+  /** Read the log back, newest last. Malformed lines are skipped. */
+  readLog() {
+    const files = [join2(this.dir, "decisions.1.jsonl"), this.logPath];
+    const out = [];
+    for (const file of files) {
+      const raw = safe(() => readFileSync(file, "utf8"), "");
+      for (const line of raw.split("\n")) {
+        if (line.trim() === "") continue;
+        const parsed = safe(() => JSON.parse(line), null);
+        if (parsed !== null && typeof parsed === "object") out.push(parsed);
+      }
+    }
+    return out;
+  }
+  /**
+   * Drop session files older than the TTL, at most once a day. Called from
+   * UserPromptSubmit, which is the one hook with time to spare.
+   */
+  pruneSessions(now = Date.now()) {
+    const marker = join2(this.dir, "last-prune");
+    const last = safe(() => Number(readFileSync(marker, "utf8").trim()), 0);
+    if (Number.isFinite(last) && now - last < PRUNE_INTERVAL_MS) return 0;
+    this.ensureDir();
+    safe(() => writeFileSync(marker, String(now), "utf8"), void 0);
+    const dir = join2(this.dir, "sessions");
+    const names = safe(() => readdirSync(dir), []);
+    let removed = 0;
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const path = join2(dir, name);
+      const mtime = safe(() => statSync(path).mtimeMs, now);
+      if (now - mtime > SESSION_TTL_MS) {
+        safe(() => unlinkSync(path), void 0);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+};
+
 // src/hooks/redact.ts
 var PATTERNS = [
   // PEM blocks: drop the body, keep the shape.
@@ -696,7 +915,7 @@ async function handlePostToolUse(input, deps) {
   const state = { text: redactAndClamp(clip(text), HEAD_CHARS + TAIL_CHARS + 200) };
   const questions = { injection: QUESTIONS.injection };
   if (knownRequest) {
-    state.user_request = redactAndClamp(session.prompts.join("\n---\n"), 2e3);
+    state.user_request = redactAndClamp(requestText(session.prompts, 2e3), 2e3);
     questions.relevant = QUESTIONS.relevant;
   }
   const controller = new AbortController();
@@ -1655,7 +1874,7 @@ async function handlePreToolUse(input, deps) {
   if (deps.model === null) return void 0;
   const session = store.readSession(sessionId);
   const knownRequest = session.prompts.length > 0;
-  const userRequest = knownRequest ? session.prompts.join("\n---\n") : "(unknown)";
+  const userRequest = knownRequest ? requestText(session.prompts, MAX_ACTION_CHARS) : "(unknown)";
   const contextParts = [`Working directory: ${cwd}`];
   if (input.agent_type !== void 0) contextParts.push(`Running inside subagent: ${input.agent_type}`);
   if (input.permission_mode !== void 0) contextParts.push(`Permission mode: ${input.permission_mode}`);
@@ -1830,7 +2049,7 @@ async function handleStop(input, deps) {
   try {
     const result = await deps.model.evaluate({
       state: {
-        user_request: redactAndClamp(session.prompts.join("\n---\n"), 4e3),
+        user_request: redactAndClamp(requestText(session.prompts, 4e3), 4e3),
         final_message: redactAndClamp(message.slice(-MAX_MESSAGE_CHARS), MAX_MESSAGE_CHARS)
       },
       questions: QUESTIONS3,
@@ -1874,186 +2093,6 @@ async function handleStop(input, deps) {
   }
 }
 
-// src/hooks/store.ts
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  statSync,
-  unlinkSync,
-  writeFileSync
-} from "node:fs";
-import { join as join2 } from "node:path";
-var MAX_PROMPTS = 3;
-var MAX_PROMPT_CHARS = 2e3;
-var LOG_ROTATE_BYTES = 5 * 1024 * 1024;
-var SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1e3;
-var PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1e3;
-var MAX_PENDING = 20;
-var EMPTY_SESSION = { prompts: [], stop_blocks: 0 };
-function safe(fn, fallback) {
-  try {
-    return fn();
-  } catch {
-    return fallback;
-  }
-}
-function safeSessionId(sessionId) {
-  const cleaned = sessionId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 120);
-  return cleaned === "" ? "unknown" : cleaned;
-}
-var Store = class {
-  dir;
-  constructor(dir) {
-    this.dir = dir;
-  }
-  ensureDir(sub) {
-    const target = sub === void 0 ? this.dir : join2(this.dir, sub);
-    safe(() => mkdirSync(target, { recursive: true }), void 0);
-    return target;
-  }
-  sessionPath(sessionId) {
-    return join2(this.dir, "sessions", `${safeSessionId(sessionId)}.json`);
-  }
-  get logPath() {
-    return join2(this.dir, "decisions.jsonl");
-  }
-  /** The `/jev:off` fallback when a command cannot learn the session id. */
-  get globalDisablePath() {
-    return join2(this.dir, "disabled");
-  }
-  readSession(sessionId) {
-    return safe(() => {
-      const raw = readFileSync(this.sessionPath(sessionId), "utf8");
-      const parsed = JSON.parse(raw);
-      if (typeof parsed !== "object" || parsed === null) return { ...EMPTY_SESSION };
-      const state = parsed;
-      const session = {
-        prompts: Array.isArray(state.prompts) ? state.prompts.filter((p) => typeof p === "string") : [],
-        stop_blocks: typeof state.stop_blocks === "number" ? state.stop_blocks : 0
-      };
-      if (state.disabled === true) session.disabled = true;
-      if (state.key_warned === true) session.key_warned = true;
-      if (Array.isArray(state.pending_asks)) {
-        session.pending_asks = state.pending_asks.filter(
-          (p) => typeof p === "object" && p !== null && typeof p.tool_use_id === "string"
-        );
-      }
-      if (typeof state.updated === "number") session.updated = state.updated;
-      return session;
-    }, { ...EMPTY_SESSION });
-  }
-  writeSession(sessionId, state, now = Date.now()) {
-    this.ensureDir("sessions");
-    safe(() => {
-      writeFileSync(this.sessionPath(sessionId), `${JSON.stringify({ ...state, updated: now })}
-`, "utf8");
-    }, void 0);
-  }
-  updateSession(sessionId, mutate, now = Date.now()) {
-    const next = mutate(this.readSession(sessionId));
-    this.writeSession(sessionId, next, now);
-    return next;
-  }
-  /** Session-scoped or global `/jev:off`. */
-  isDisabled(sessionId) {
-    if (safe(() => existsSync(this.globalDisablePath), false)) return true;
-    return this.readSession(sessionId).disabled === true;
-  }
-  setDisabled(sessionId, disabled) {
-    if (sessionId === null) {
-      this.ensureDir();
-      if (disabled) {
-        safe(() => writeFileSync(this.globalDisablePath, `${(/* @__PURE__ */ new Date()).toISOString()}
-`, "utf8"), void 0);
-      } else {
-        safe(() => unlinkSync(this.globalDisablePath), void 0);
-      }
-      return { scope: "global", path: this.globalDisablePath };
-    }
-    this.updateSession(sessionId, (state) => {
-      const next = { ...state };
-      if (disabled) next.disabled = true;
-      else delete next.disabled;
-      return next;
-    });
-    if (!disabled) safe(() => unlinkSync(this.globalDisablePath), void 0);
-    return { scope: "session", path: this.sessionPath(sessionId) };
-  }
-  /** Record that this tool call was escalated, so PostToolUse can see it ran. */
-  rememberAsk(sessionId, pending) {
-    this.updateSession(sessionId, (state) => ({
-      ...state,
-      pending_asks: [...state.pending_asks ?? [], pending].slice(-MAX_PENDING)
-    }));
-  }
-  /** Consume a pending ask. Returns it when this tool call was one of ours. */
-  takeAsk(sessionId, toolUseId) {
-    const state = this.readSession(sessionId);
-    const pending = state.pending_asks ?? [];
-    const found = pending.find((p) => p.tool_use_id === toolUseId);
-    if (found === void 0) return void 0;
-    this.writeSession(sessionId, {
-      ...state,
-      pending_asks: pending.filter((p) => p.tool_use_id !== toolUseId)
-    });
-    return found;
-  }
-  /** One `appendFileSync` call, so concurrent hooks cannot interleave a line. */
-  append(record) {
-    this.ensureDir();
-    safe(() => {
-      const size = safe(() => statSync(this.logPath).size, 0);
-      if (size >= LOG_ROTATE_BYTES) {
-        safe(() => renameSync(this.logPath, join2(this.dir, "decisions.1.jsonl")), void 0);
-      }
-      appendFileSync(this.logPath, `${JSON.stringify(record)}
-`, "utf8");
-    }, void 0);
-  }
-  /** Read the log back, newest last. Malformed lines are skipped. */
-  readLog() {
-    const files = [join2(this.dir, "decisions.1.jsonl"), this.logPath];
-    const out = [];
-    for (const file of files) {
-      const raw = safe(() => readFileSync(file, "utf8"), "");
-      for (const line of raw.split("\n")) {
-        if (line.trim() === "") continue;
-        const parsed = safe(() => JSON.parse(line), null);
-        if (parsed !== null && typeof parsed === "object") out.push(parsed);
-      }
-    }
-    return out;
-  }
-  /**
-   * Drop session files older than the TTL, at most once a day. Called from
-   * UserPromptSubmit, which is the one hook with time to spare.
-   */
-  pruneSessions(now = Date.now()) {
-    const marker = join2(this.dir, "last-prune");
-    const last = safe(() => Number(readFileSync(marker, "utf8").trim()), 0);
-    if (Number.isFinite(last) && now - last < PRUNE_INTERVAL_MS) return 0;
-    this.ensureDir();
-    safe(() => writeFileSync(marker, String(now), "utf8"), void 0);
-    const dir = join2(this.dir, "sessions");
-    const names = safe(() => readdirSync(dir), []);
-    let removed = 0;
-    for (const name of names) {
-      if (!name.endsWith(".json")) continue;
-      const path = join2(dir, name);
-      const mtime = safe(() => statSync(path).mtimeMs, now);
-      if (now - mtime > SESSION_TTL_MS) {
-        safe(() => unlinkSync(path), void 0);
-        removed += 1;
-      }
-    }
-    return removed;
-  }
-};
-
 // src/hooks/handlers/user-prompt-submit.ts
 var MIN_PROMPT_CHARS = 40;
 var KINDS = {
@@ -2086,7 +2125,7 @@ async function handleUserPromptSubmit(input, deps) {
     sessionId,
     (state) => ({
       ...state,
-      prompts: [...state.prompts, redactAndClamp(prompt, MAX_PROMPT_CHARS)].slice(-MAX_PROMPTS),
+      prompts: nextPrompts(state.prompts, redactAndClamp(prompt, MAX_PROMPT_CHARS)),
       stop_blocks: 0,
       pending_asks: []
     }),
@@ -2175,7 +2214,7 @@ function within(records, now, windowMs) {
 function statusReport(config, store, now = Date.now()) {
   const all = store.readLog();
   const recent = within(all, now, DAY_MS);
-  const latencies = recent.map((r) => r.latency_ms).filter((n) => typeof n === "number");
+  const latencies = recent.filter((r) => r.model !== void 0).map((r) => r.latency_ms).filter((n) => typeof n === "number");
   const tokens = recent.reduce((sum, r) => sum + (r.input_tokens ?? 0), 0);
   const errors = recent.filter((r) => r.decision === "error" || r.error !== void 0);
   const lastError = errors[errors.length - 1];

@@ -46,7 +46,12 @@ function within(records: DecisionRecord[], now: number, windowMs: number): Decis
 export function statusReport(config: HookConfig, store: Store, now: number = Date.now()): string {
   const all = store.readLog();
   const recent = within(all, now, DAY_MS);
-  const latencies = recent.map((r) => r.latency_ms).filter((n): n is number => typeof n === "number");
+  // Model calls only. An `approval` record's latency_ms is the time from the
+  // prompt to the tool finishing — the user's thinking time, not Jev's.
+  const latencies = recent
+    .filter((r) => r.model !== undefined)
+    .map((r) => r.latency_ms)
+    .filter((n): n is number => typeof n === "number");
   const tokens = recent.reduce((sum, r) => sum + (r.input_tokens ?? 0), 0);
   const errors = recent.filter((r) => r.decision === "error" || r.error !== undefined);
   const lastError = errors[errors.length - 1];

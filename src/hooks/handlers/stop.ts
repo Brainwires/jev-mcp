@@ -13,6 +13,7 @@
 
 import type { NoulAnswer, Question } from "../../decision/types.js";
 import { redactAndClamp } from "../redact.js";
+import { requestText } from "../store.js";
 import type { Deps, HookInput, HookOutput } from "../types.js";
 
 /** Below this, the message is an acknowledgement, not a report. */
@@ -125,7 +126,7 @@ export async function handleStop(input: HookInput, deps: Deps): Promise<HookOutp
   try {
     const result = await deps.model.evaluate({
       state: {
-        user_request: redactAndClamp(session.prompts.join("\n---\n"), 4000),
+        user_request: redactAndClamp(requestText(session.prompts, 4000), 4000),
         final_message: redactAndClamp(message.slice(-MAX_MESSAGE_CHARS), MAX_MESSAGE_CHARS),
       },
       questions: QUESTIONS,

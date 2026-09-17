@@ -16,6 +16,7 @@
  */
 
 import type { NoulAnswer, Question } from "../../decision/types.js";
+import { requestText } from "../store.js";
 import { redactAndClamp } from "../redact.js";
 import type { Deps, HookInput, HookOutput } from "../types.js";
 
@@ -128,7 +129,7 @@ export async function handlePostToolUse(input: HookInput, deps: Deps): Promise<H
   const state: Record<string, string> = { text: redactAndClamp(clip(text), HEAD_CHARS + TAIL_CHARS + 200) };
   const questions: Record<string, Question> = { injection: QUESTIONS.injection as Question };
   if (knownRequest) {
-    state.user_request = redactAndClamp(session.prompts.join("\n---\n"), 2000);
+    state.user_request = redactAndClamp(requestText(session.prompts, 2000), 2000);
     questions.relevant = QUESTIONS.relevant as Question;
   }
 

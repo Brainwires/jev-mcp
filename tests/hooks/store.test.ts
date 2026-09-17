@@ -7,6 +7,8 @@ import { existsSync, readFileSync, statSync, utimesSync, writeFileSync } from "n
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  nextPrompts,
+  requestText,
   LOG_ROTATE_BYTES,
   SESSION_TTL_MS,
   Store,
@@ -190,3 +192,41 @@ describe("resilience", () => {
     expect(blocked.isDisabled("s1")).toBe(false);
   });
 });
+
+describe("requestText", () => {
+  it("joins everything when it fits", () => {
+    expect(requestText(["first", "second"], 100)).toBe("first\n---\nsecond");
+    expect(requestText([], 100)).toBe("");
+  });
+
+  it("drops the oldest prompts first, never the newest", () => {
+    const old = "o".repeat(60);
+    const mid = "m".repeat(60);
+    const latest = "push the release";
+    const text = requestText([old, mid, latest], 100);
+    expect(text.endsWith(latest)).toBe(true);
+    expect(text).toContain(mid);
+    expect(text).not.toContain(old);
+    expect(text.length).toBeLessThanOrEqual(100);
+  });
+
+  it("cuts a single oversized prompt rather than returning nothing", () => {
+    expect(requestText(["x".repeat(500)], 100)).toHaveLength(100);
+  });
+});
+
+describe("nextPrompts", () => {
+  it("preserves chronological order across short and substantive prompts", () => {
+    const a = "a".repeat(50);
+    const b = "b".repeat(50);
+    expect(nextPrompts([a, "go"], b)).toEqual([a, "go", b]);
+  });
+
+  it("caps short and substantive prompts independently", () => {
+    const long = ["a", "b", "c", "d"].map((c) => c.repeat(50));
+    let prompts: string[] = [];
+    for (const p of [long[0], "one", long[1], "two", long[2], "three", long[3]] as string[]) prompts = nextPrompts(prompts, p);
+    expect(prompts).toEqual([long[1], "two", long[2], "three", long[3]]);
+  });
+});
+

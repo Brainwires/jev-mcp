@@ -12,7 +12,7 @@
  */
 
 import type { ChoiceAnswer, Question, ScoreAnswer } from "../../decision/types.js";
-import { MAX_PROMPT_CHARS, MAX_PROMPTS } from "../store.js";
+import { MAX_PROMPT_CHARS, nextPrompts } from "../store.js";
 import { redactAndClamp } from "../redact.js";
 import type { Deps, HookInput, HookOutput } from "../types.js";
 
@@ -55,7 +55,7 @@ export async function handleUserPromptSubmit(input: HookInput, deps: Deps): Prom
     sessionId,
     (state) => ({
       ...state,
-      prompts: [...state.prompts, redactAndClamp(prompt, MAX_PROMPT_CHARS)].slice(-MAX_PROMPTS),
+      prompts: nextPrompts(state.prompts, redactAndClamp(prompt, MAX_PROMPT_CHARS)),
       stop_blocks: 0,
       pending_asks: [],
     }),

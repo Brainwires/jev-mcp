@@ -14,6 +14,7 @@
 import { runGateAction } from "../../tools/gate-action-core.js";
 import { prefilter } from "../prefilter.js";
 import { compactJson, redactAndClamp } from "../redact.js";
+import { requestText } from "../store.js";
 import type { DecisionRecord } from "../store.js";
 import type { Deps, EscalatingDecision, HookInput, HookOutput } from "../types.js";
 
@@ -90,7 +91,7 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
 
   const session = store.readSession(sessionId);
   const knownRequest = session.prompts.length > 0;
-  const userRequest = knownRequest ? session.prompts.join("\n---\n") : "(unknown)";
+  const userRequest = knownRequest ? requestText(session.prompts, MAX_ACTION_CHARS) : "(unknown)";
 
   const contextParts = [`Working directory: ${cwd}`];
   if (input.agent_type !== undefined) contextParts.push(`Running inside subagent: ${input.agent_type}`);

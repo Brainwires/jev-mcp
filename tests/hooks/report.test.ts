@@ -82,6 +82,15 @@ describe("statusReport", () => {
     expect(report).toContain(`$${(5 * USD_PER_MTOK).toFixed(4)}`);
   });
 
+  it("keeps approval records out of the latency figures", () => {
+    // An approval's latency_ms is prompt-to-completion time: the user thinking.
+    store.append(record({ latency_ms: 400 }));
+    const { model: _model, signals: _signals, policy: _policy, ...bare } = record();
+    store.append({ ...bare, event: "approval", decision: "approved", latency_ms: 32_342 });
+    const report = statusReport(testConfig(dir), store, NOW);
+    expect(report).toContain("p95 400 ms (1 calls)");
+  });
+
   it("reports the error count and the last error", () => {
     store.append(record());
     store.append(record({ decision: "error", error: "JevTimeoutError: deadline" }));
