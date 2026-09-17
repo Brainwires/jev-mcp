@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "jev",
+  "displayName": "Jev",
+  "version": "0.1.0",
+  "description": "Puts a fast calibrated classifier at the harness boundaries: escalates risky tool calls to a permission prompt, flags tool results that read like prompt injection, and catches a turn that stops short of the work it was asked to do. Escalate-only and fail-open.",
+  "author": {
+    "name": "Brainwires"
+  },
+  "homepage": "https://github.com/Brainwires/jev-mcp#claude-code-plugin",
+  "repository": "https://github.com/Brainwires/jev-mcp",
+  "license": "MIT",
+  "keywords": [
+    "hooks",
+    "permissions",
+    "guardrails",
+    "prompt-injection",
+    "typesafe",
+    "jev",
+    "decision-model",
+    "mcp"
+  ],
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "TypeSafe API key",
+      "description": "Key for TypeSafe's Jev API, issued at https://typesafe.ai. Without it the judgment hooks stay inactive and only the deterministic pattern checks run.",
+      "sensitive": true,
+      "required": false
+    },
+    "gate_mode": {
+      "type": "string",
+      "title": "Tool-call gate",
+      "description": "off: no PreToolUse gate. standard: judge writes outside the project, sensitive paths, unrecognized shell commands, and MCP tools with unknown effects. strict: also judge ordinary edits inside the project, and treat any uncertain signal as a reason to ask.",
+      "default": "standard",
+      "options": ["off", "standard", "strict"]
+    },
+    "stop_check": {
+      "type": "boolean",
+      "title": "Check the final message before stopping",
+      "description": "When the final message of a turn says part of the requested work is unfinished and is not waiting on you, ask Claude to continue. At most one block per prompt.",
+      "default": true
+    },
+    "screen_results": {
+      "type": "boolean",
+      "title": "Screen fetched text for injected instructions",
+      "description": "Judge WebFetch, WebSearch and MCP tool results for text that gives orders to an AI agent, and tell Claude to treat such a result as data. Never blocks and never rewrites the result.",
+      "default": true
+    },
+    "route_prompts": {
+      "type": "boolean",
+      "title": "Classify each prompt",
+      "description": "Add one advisory line naming the kind of task a prompt is asking for, and whether it reads as ambiguous. Off by default: it costs a call on every prompt.",
+      "default": false
+    },
+    "auto_threshold": {
+      "type": "number",
+      "title": "Certainty threshold",
+      "description": "Probability at or above which a signal counts as established. Lower means more prompts. 0.85 is the default; /jev:calibrate replays your own log at other values.",
+      "default": 0.85,
+      "min": 0.5,
+      "max": 0.99
+    }
+  },
+  "mcpServers": {
+    "jev": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/mcp.mjs"],
+      "env": {
+        "TYPESAFE_API_KEY": "${user_config.api_key}"
+      }
+    }
+  }
+}

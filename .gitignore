@@ -1,0 +1,8 @@
+node_modules/
+# The tsc build output at the repo root. `plugin/dist/` is deliberately NOT
+# ignored: a Claude Code plugin install runs no build step, so the bundled
+# hook.mjs and mcp.mjs have to be committed.
+/dist/
+.env
+*.log
+.DS_Store

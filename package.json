@@ -1,0 +1,57 @@
+{
+  "name": "jev-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MCP server and embeddable decision layer for TypeSafe AI's Jev System One model",
+  "license": "MIT",
+  "bin": {
+    "jev-mcp": "dist/index.js"
+  },
+  "main": "dist/lib.js",
+  "types": "dist/lib.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/lib.d.ts",
+      "import": "./dist/lib.js",
+      "default": "./dist/lib.js"
+    }
+  },
+  "files": [
+    "dist",
+    "plugin",
+    ".claude-plugin"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "typesafe",
+    "jev",
+    "system-one",
+    "decision-model"
+  ],
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "npm run build:tsc && npm run build:plugin",
+    "build:tsc": "tsc --project tsconfig.build.json",
+    "build:plugin": "tsx scripts/build-plugin.ts",
+    "type-check": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "smoke": "tsx scripts/smoke.ts",
+    "prepare": "tsc --project tsconfig.build.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.1",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

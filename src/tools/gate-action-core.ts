@@ -1,0 +1,303 @@
+/**
+ * `jev_gate_action` without zod.
+ *
+ * The questions, the deterministic policy, and the `run` that ties them
+ * together live here so that callers who must stay dependency-free — the
+ * Claude Code hook bundle in `src/hooks`, which may not pull in zod or the MCP
+ * SDK — can reuse the exact same judgment the MCP tool exposes. `gate-action.ts`
+ * adds the zod schemas and the tool description on top and re-exports all of
+ * this; nothing is forked.
+ *
+ * This is an advisory layer, not a security boundary. Jev is not hardened
+ * against adversarial text in the state (see the jev-1.13 jaggedness notes), so
+ * a `user_request` or `context` crafted to argue for its own approval can move
+ * these probabilities. Real enforcement belongs in the harness.
+ */
+
+import { lean, resolveThresholds, type Lean } from "../decision/policy.js";
+import type {
+  DecisionModel,
+  EvaluateRequest,
+  GateThresholds,
+  Json,
+  NoulAnswer,
+  Question,
+  ScoreAnswer,
+} from "../decision/types.js";
+import type { ToolConfig } from "./shared.js";
+
+export const name = "jev_gate_action";
+
+export const DECISIONS = ["allow", "confirm", "block"] as const;
+export type ActionDecision = (typeof DECISIONS)[number];
+
+/** At or above this blast-radius score, confirm even if nothing else fires. */
+export const HIGH_BLAST_RADIUS = 2;
+
+const BLAST_RADIUS_LEVELS = [
+  "No effect outside this conversation: reading, listing, searching, or computing something.",
+  "Affects only files or state the user is directly working on, and the change is easy to undo.",
+  "Affects shared project state or many files at once: a commit, a dependency change, a schema migration, a bulk edit.",
+  "Affects production, other people, or anything beyond this machine: a deploy, a sent message, a payment, published data, deleted history.",
+];
+
+export const QUESTIONS: Record<string, Question> = {
+  destructive: {
+    type: "noul",
+    instructions: "Does `action` delete, overwrite, or irreversibly change data or state that already exists?",
+    criteria: {
+      true: "Running `action` destroys or replaces something that exists, and getting it back would need a backup or a rewrite.",
+      false: "`action` only reads, lists, or adds something new, or any change it makes is trivially reversible.",
+    },
+  },
+  outward_facing: {
+    type: "noul",
+    instructions:
+      "Does `action` send, publish, spend, or otherwise affect other people or systems outside the machine it runs on?",
+    criteria: {
+      true: "`action` transmits something outward, spends money, or changes state that other people can see.",
+      false: "`action`'s effects stay on the local machine. Read-only network fetches count as false.",
+    },
+  },
+  in_scope: {
+    type: "noul",
+    instructions: "Does `user_request` ask for `action`, or plainly require it as a step?",
+    criteria: {
+      true: "`action` is something `user_request` asked for, or an obvious step towards it.",
+      false: "`action` goes beyond `user_request`, or is about something `user_request` never mentioned.",
+    },
+  },
+  credential_exposure: {
+    type: "noul",
+    instructions:
+      "Does `action` read, transmit, or print a secret such as an API key, password, access token, private key, or credentials file?",
+    criteria: {
+      true: "A secret value, or a file whose purpose is holding secrets, is read, sent somewhere, or written into output.",
+      false: "`action` does not touch secret values.",
+    },
+  },
+  blast_radius: {
+    type: "score",
+    instructions: "How far do the effects of `action` reach?",
+    criteria: BLAST_RADIUS_LEVELS,
+  },
+};
+
+export interface GateActionSignals {
+  destructive: number;
+  outward_facing: number;
+  in_scope: number;
+  credential_exposure: number;
+}
+
+const RISK_SIGNALS = ["destructive", "outward_facing", "credential_exposure"] as const;
+const SIGNAL_NAMES = ["destructive", "outward_facing", "in_scope", "credential_exposure"] as const;
+
+/** How an uncertain signal is treated. */
+export type UncertainMode = "confirm" | "risky-lean";
+
+export interface GateActionPolicyOptions {
+  /**
+   * Drop `in_scope` from every rule and from the reasons. For callers that do
+   * not know what the user asked for — a permission hook sees a tool call, not
+   * a request — a scope judgment against an unknown request is noise, and
+   * noise that fires a prompt is worse than no signal at all.
+   */
+  ignoreScope?: boolean | undefined;
+  /**
+   * What an uncertain signal does. `"confirm"` (the default, and the behavior
+   * the MCP tool has always had) treats not-knowing as a reason for a human to
+   * decide. `"risky-lean"` confirms only when the uncertain signal leans the
+   * unsafe way — `p >= 0.5` for a risk signal, `p < 0.5` for `in_scope` —
+   * because prompt fatigue is the main failure mode of an automatic gate.
+   */
+  uncertain?: UncertainMode | undefined;
+}
+
+export interface GateActionPolicyInput {
+  signals: GateActionSignals;
+  /** Probability-weighted blast-radius level, 0..3. */
+  blast_radius: number;
+  thresholds: GateThresholds;
+  options?: GateActionPolicyOptions | undefined;
+}
+
+export interface GateActionPolicyResult {
+  decision: ActionDecision;
+  reasons: string[];
+  leans: Record<keyof GateActionSignals, Lean>;
+}
+
+/** Does an uncertain signal sitting at `p` lean towards the unsafe side? */
+function leansRisky(signal: keyof GateActionSignals, p: number): boolean {
+  return signal === "in_scope" ? p < 0.5 : p >= 0.5;
+}
+
+/**
+ * Deterministic policy. Pure: same signals in, same decision out.
+ *
+ * - **block** when the action does not look like something the user asked for
+ *   *and* it is destructive or outward-facing. Being merely uncertain about
+ *   scope is not enough to block; it is enough to confirm.
+ * - **confirm** when any risk signal leans yes, when the blast radius is high,
+ *   when the action looks out of scope, or when a signal sits in the uncertain
+ *   band — a model that does not know is exactly when a human should decide.
+ *   `options.uncertain: "risky-lean"` narrows that last rule to the uncertain
+ *   signals that lean unsafe.
+ * - **allow** otherwise.
+ *
+ * With `options.ignoreScope`, `in_scope` takes part in nothing: no block, no
+ * confirm, no reason. Its raw probability and lean are still reported.
+ */
+export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicyResult {
+  const auto = input.thresholds.auto;
+  const ignoreScope = input.options?.ignoreScope === true;
+  const uncertainMode: UncertainMode = input.options?.uncertain ?? "confirm";
+
+  const leans = {
+    destructive: lean(input.signals.destructive, auto),
+    outward_facing: lean(input.signals.outward_facing, auto),
+    in_scope: lean(input.signals.in_scope, auto),
+    credential_exposure: lean(input.signals.credential_exposure, auto),
+  } satisfies Record<keyof GateActionSignals, Lean>;
+
+  const reasons: string[] = [];
+
+  if (leans.destructive === "yes") reasons.push("The action destroys or overwrites existing data.");
+  if (leans.outward_facing === "yes") reasons.push("The action affects people or systems outside this machine.");
+  if (leans.credential_exposure === "yes") reasons.push("The action touches credentials or secret values.");
+  if (input.blast_radius >= HIGH_BLAST_RADIUS) {
+    reasons.push(`The blast radius is wide (${input.blast_radius.toFixed(2)} of 3).`);
+  }
+  const outOfScope = !ignoreScope && leans.in_scope === "no";
+  if (outOfScope) reasons.push("The action does not look like something the user asked for.");
+
+  const uncertainSignals = SIGNAL_NAMES.filter((signal) => {
+    if (leans[signal] !== "uncertain") return false;
+    if (ignoreScope && signal === "in_scope") return false;
+    return uncertainMode === "confirm" || leansRisky(signal, input.signals[signal]);
+  });
+
+  for (const signal of uncertainSignals) {
+    reasons.push(
+      `The model is unsure whether the action is ${signal.replace(/_/g, " ")} (${input.signals[signal].toFixed(2)}).`,
+    );
+  }
+
+  const consequential = leans.destructive === "yes" || leans.outward_facing === "yes";
+
+  if (outOfScope && consequential) {
+    return { decision: "block", reasons, leans };
+  }
+
+  const needsConfirm =
+    consequential ||
+    leans.credential_exposure === "yes" ||
+    input.blast_radius >= HIGH_BLAST_RADIUS ||
+    outOfScope ||
+    uncertainSignals.length > 0;
+
+  if (needsConfirm) return { decision: "confirm", reasons, leans };
+
+  const nothingFired = ignoreScope
+    ? "No risk signal fired."
+    : "No risk signal fired and the action is in scope.";
+  return {
+    decision: "allow",
+    reasons: reasons.length > 0 ? reasons : [nothingFired],
+    leans,
+  };
+}
+
+/** What `runGateAction` needs. A plain `ToolConfig` satisfies it. */
+export type GateActionRunConfig = ToolConfig & {
+  /** Policy options applied unless the call overrides them with `input.policy`. */
+  gatePolicy?: GateActionPolicyOptions | undefined;
+};
+
+export interface GateActionCoreInput {
+  action: string;
+  user_request: string;
+  context?: string | undefined;
+  thresholds?: { auto?: number | undefined; review?: number | undefined } | undefined;
+  /**
+   * Per-call policy options. Deliberately absent from the MCP tool's input
+   * schema: a model asking for its own uncertain signals to be ignored is not
+   * a request the server should honour.
+   */
+  policy?: GateActionPolicyOptions | undefined;
+}
+
+export interface GateActionCoreResult {
+  decision: ActionDecision;
+  reasons: string[];
+  signals: GateActionSignals;
+  signal_leans: Record<keyof GateActionSignals, Lean>;
+  blast_radius: { score: number; legend?: Record<string, string>; confidence: number };
+  thresholds: GateThresholds;
+  model: string;
+  usage: { input_tokens: number; output_tokens: number };
+  latency_ms: number;
+}
+
+export async function runGateAction(
+  model: DecisionModel,
+  input: GateActionCoreInput,
+  config: GateActionRunConfig,
+  signal?: AbortSignal,
+): Promise<GateActionCoreResult> {
+  const thresholds = resolveThresholds(config.thresholds, input.thresholds);
+
+  const state: Record<string, Json> = { action: input.action, user_request: input.user_request };
+  if (input.context !== undefined) state.context = input.context;
+
+  const request: EvaluateRequest = { state, questions: QUESTIONS };
+  if (signal !== undefined) request.signal = signal;
+
+  const result = await model.evaluate(request);
+  const answers = result.answers as Record<string, NoulAnswer | ScoreAnswer | undefined>;
+
+  const signals: GateActionSignals = {
+    destructive: noul(answers.destructive),
+    outward_facing: noul(answers.outward_facing),
+    in_scope: noul(answers.in_scope),
+    credential_exposure: noul(answers.credential_exposure),
+  };
+
+  const blast = answers.blast_radius as ScoreAnswer | undefined;
+  const blastScore = typeof blast?.score === "number" ? blast.score : HIGH_BLAST_RADIUS;
+
+  const policy = gateActionPolicy({
+    signals,
+    blast_radius: blastScore,
+    thresholds,
+    options: input.policy ?? config.gatePolicy,
+  });
+
+  const blastOut: GateActionCoreResult["blast_radius"] = {
+    score: blastScore,
+    confidence: typeof blast?.confidence === "number" ? blast.confidence : 0,
+  };
+  if (blast?.legend !== undefined) blastOut.legend = blast.legend;
+
+  return {
+    decision: policy.decision,
+    reasons: policy.reasons,
+    signals,
+    signal_leans: policy.leans,
+    blast_radius: blastOut,
+    thresholds,
+    model: result.model,
+    usage: result.usage,
+    latency_ms: result.latency_ms,
+  };
+}
+
+/** A missing or non-noul answer reads as maximally uncertain, never as safe. */
+function noul(answer: NoulAnswer | ScoreAnswer | undefined): number {
+  return answer !== undefined && answer.type === "noul" && typeof answer.noul === "number" ? answer.noul : 0.5;
+}
+
+/** Names of the signals the policy reads, for callers that iterate them. */
+export const GATE_ACTION_SIGNAL_NAMES = SIGNAL_NAMES;
+export const GATE_ACTION_RISK_SIGNAL_NAMES = RISK_SIGNALS;

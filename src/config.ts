@@ -1,0 +1,86 @@
+/**
+ * Environment parsing.
+ *
+ * The server must boot without an API key: an MCP client typically starts the
+ * server before the user has finished configuring it, and a process that exits
+ * at startup gives them a transport error instead of an explanation. So a
+ * missing key is recorded here (`apiKey: null`) and surfaced as an `isError`
+ * tool result that says what to set.
+ */
+
+import type { GateThresholds } from "./decision/types.js";
+
+export interface Config {
+  /** `null` when TYPESAFE_API_KEY is unset — the server still starts. */
+  apiKey: string | null;
+  baseUrl: string;
+  model: string;
+  timeoutMs: number;
+  maxRetries: number;
+  thresholds: GateThresholds;
+  maxConcurrency: number;
+}
+
+export const DEFAULTS = {
+  baseUrl: "https://api.typesafe.ai",
+  model: "jev-latest",
+  timeoutMs: 30_000,
+  maxRetries: 3,
+  autoThreshold: 0.85,
+  reviewThreshold: 0.6,
+  maxConcurrency: 4,
+} as const;
+
+/** Message used wherever a call needs a key that was never configured. */
+export const MISSING_API_KEY_MESSAGE =
+  "TYPESAFE_API_KEY is not set, so this server cannot reach the Jev API. " +
+  "Set it in the MCP server's environment (for example: " +
+  "`claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jev-mcp`) and restart the server. " +
+  "Keys are issued at https://typesafe.ai.";
+
+export type Env = Record<string, string | undefined>;
+
+function readString(env: Env, key: string, fallback: string): string {
+  const raw = env[key];
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  return trimmed === "" ? fallback : trimmed;
+}
+
+function readNumber(env: Env, key: string, fallback: number, min: number, max: number): number {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min || value > max) {
+    throw new Error(
+      `${key}=${JSON.stringify(raw)} is not usable: expected a number between ${min} and ${max}.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Build a `Config` from an environment. Throws only on a *malformed* value —
+ * a missing API key is represented, not thrown.
+ */
+export function loadConfig(env: Env = process.env): Config {
+  const apiKeyRaw = env.TYPESAFE_API_KEY?.trim();
+  const auto = readNumber(env, "JEV_AUTO_THRESHOLD", DEFAULTS.autoThreshold, 0, 1);
+  const review = readNumber(env, "JEV_REVIEW_THRESHOLD", DEFAULTS.reviewThreshold, 0, 1);
+
+  if (review > auto) {
+    throw new Error(
+      `JEV_REVIEW_THRESHOLD (${review}) must not exceed JEV_AUTO_THRESHOLD (${auto}).`,
+    );
+  }
+
+  return {
+    apiKey: apiKeyRaw === undefined || apiKeyRaw === "" ? null : apiKeyRaw,
+    baseUrl: readString(env, "TYPESAFE_BASE_URL", DEFAULTS.baseUrl).replace(/\/+$/, ""),
+    model: readString(env, "JEV_MODEL", DEFAULTS.model),
+    timeoutMs: readNumber(env, "JEV_TIMEOUT_MS", DEFAULTS.timeoutMs, 1, 600_000),
+    maxRetries: readNumber(env, "JEV_MAX_RETRIES", DEFAULTS.maxRetries, 0, 10),
+    thresholds: { auto, review },
+    maxConcurrency: readNumber(env, "JEV_MAX_CONCURRENCY", DEFAULTS.maxConcurrency, 1, 32),
+  };
+}
