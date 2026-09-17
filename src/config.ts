@@ -36,6 +36,8 @@ export const MISSING_API_KEY_MESSAGE =
   "TYPESAFE_API_KEY is not set, so this server cannot reach the Jev API. " +
   "Set it in the MCP server's environment (for example: " +
   "`claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jev-mcp`) and restart the server. " +
+  "If this is the Claude Code plugin, either set the API key in the plugin's settings or export " +
+  "TYPESAFE_API_KEY before starting Claude Code, then run /reload-plugins. " +
   "Keys are issued at https://typesafe.ai.";
 
 export type Env = Record<string, string | undefined>;
@@ -60,11 +62,25 @@ function readNumber(env: Env, key: string, fallback: number, min: number, max: n
 }
 
 /**
+ * The plugin manifest passes its `api_key` option as JEV_PLUGIN_API_KEY rather
+ * than as TYPESAFE_API_KEY: when the option is left empty, a manifest entry
+ * named TYPESAFE_API_KEY would overwrite a key the user exported in their shell
+ * with an empty string. An empty or unsubstituted (`${…}`) value is skipped.
+ */
+function firstKey(...candidates: (string | undefined)[]): string | undefined {
+  for (const candidate of candidates) {
+    const value = candidate?.trim();
+    if (value !== undefined && value !== "" && !value.includes("${")) return value;
+  }
+  return undefined;
+}
+
+/**
  * Build a `Config` from an environment. Throws only on a *malformed* value —
  * a missing API key is represented, not thrown.
  */
 export function loadConfig(env: Env = process.env): Config {
-  const apiKeyRaw = env.TYPESAFE_API_KEY?.trim();
+  const apiKeyRaw = firstKey(env.JEV_PLUGIN_API_KEY, env.CLAUDE_PLUGIN_OPTION_API_KEY, env.TYPESAFE_API_KEY);
   const auto = readNumber(env, "JEV_AUTO_THRESHOLD", DEFAULTS.autoThreshold, 0, 1);
   const review = readNumber(env, "JEV_REVIEW_THRESHOLD", DEFAULTS.reviewThreshold, 0, 1);
 

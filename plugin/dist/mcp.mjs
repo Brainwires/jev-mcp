@@ -28515,7 +28515,7 @@ var DEFAULTS = {
   reviewThreshold: 0.6,
   maxConcurrency: 4
 };
-var MISSING_API_KEY_MESSAGE = "TYPESAFE_API_KEY is not set, so this server cannot reach the Jev API. Set it in the MCP server's environment (for example: `claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jev-mcp`) and restart the server. Keys are issued at https://typesafe.ai.";
+var MISSING_API_KEY_MESSAGE = "TYPESAFE_API_KEY is not set, so this server cannot reach the Jev API. Set it in the MCP server's environment (for example: `claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jev-mcp`) and restart the server. If this is the Claude Code plugin, either set the API key in the plugin's settings or export TYPESAFE_API_KEY before starting Claude Code, then run /reload-plugins. Keys are issued at https://typesafe.ai.";
 function readString(env, key, fallback) {
   const raw = env[key];
   if (raw === void 0) return fallback;
@@ -28533,8 +28533,15 @@ function readNumber(env, key, fallback, min, max) {
   }
   return value;
 }
+function firstKey(...candidates) {
+  for (const candidate of candidates) {
+    const value = candidate?.trim();
+    if (value !== void 0 && value !== "" && !value.includes("${")) return value;
+  }
+  return void 0;
+}
 function loadConfig(env = process.env) {
-  const apiKeyRaw = env.TYPESAFE_API_KEY?.trim();
+  const apiKeyRaw = firstKey(env.JEV_PLUGIN_API_KEY, env.CLAUDE_PLUGIN_OPTION_API_KEY, env.TYPESAFE_API_KEY);
   const auto = readNumber(env, "JEV_AUTO_THRESHOLD", DEFAULTS.autoThreshold, 0, 1);
   const review = readNumber(env, "JEV_REVIEW_THRESHOLD", DEFAULTS.reviewThreshold, 0, 1);
   if (review > auto) {
@@ -37839,7 +37846,7 @@ function normalizeVerdict(choice) {
 
 // src/server.ts
 var SERVER_NAME = "jev-mcp";
-var SERVER_VERSION = "0.1.3";
+var SERVER_VERSION = "0.1.4";
 var ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 function ok(output2) {
   return {

@@ -66,3 +66,22 @@ describe("loadConfig", () => {
     ).toThrow(/must not exceed/);
   });
 });
+
+describe("loadConfig — API key sources", () => {
+  it("prefers the plugin option over the shell variable", () => {
+    expect(loadConfig({ JEV_PLUGIN_API_KEY: "sk-plugin", TYPESAFE_API_KEY: "sk-shell" }).apiKey).toBe("sk-plugin");
+  });
+
+  // The plugin manifest always sets JEV_PLUGIN_API_KEY. When the user left the
+  // option empty and exported the key in their shell instead, that empty value
+  // must not mask it.
+  it("falls through an empty or unsubstituted plugin option to the shell variable", () => {
+    expect(loadConfig({ JEV_PLUGIN_API_KEY: "", TYPESAFE_API_KEY: "sk-shell" }).apiKey).toBe("sk-shell");
+    expect(loadConfig({ JEV_PLUGIN_API_KEY: "  ", TYPESAFE_API_KEY: "sk-shell" }).apiKey).toBe("sk-shell");
+    expect(loadConfig({ JEV_PLUGIN_API_KEY: "${user_config.api_key}", TYPESAFE_API_KEY: "sk-shell" }).apiKey).toBe("sk-shell");
+  });
+
+  it("reports no key when every source is empty", () => {
+    expect(loadConfig({ JEV_PLUGIN_API_KEY: "", TYPESAFE_API_KEY: "" }).apiKey).toBeNull();
+  });
+});

@@ -8,6 +8,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 /** Kept in step with `scripts/build-plugin.ts`, which fails the build on these. */
@@ -57,5 +58,16 @@ describe("plugin/dist", () => {
     expect(patterns).toContain("/dist/");
     expect(patterns).not.toContain("dist/");
     expect(patterns).not.toContain("plugin/dist/");
+  });
+});
+
+describe("plugin manifest", () => {
+  it("never maps the plugin option onto TYPESAFE_API_KEY, which would mask a shell-exported key when the option is empty", () => {
+    const manifest = JSON.parse(readFileSync(join(process.cwd(), "plugin/.claude-plugin/plugin.json"), "utf8")) as {
+      mcpServers: Record<string, { env?: Record<string, string> }>;
+    };
+    for (const server of Object.values(manifest.mcpServers)) {
+      expect(Object.keys(server.env ?? {})).not.toContain("TYPESAFE_API_KEY");
+    }
   });
 });
