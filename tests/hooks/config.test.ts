@@ -25,6 +25,18 @@ describe("loadHookConfig", () => {
     expect(config.warnings).toEqual([]);
   });
 
+  /**
+   * 0.5.0 pins the model. The hooks' thresholds are tuned against one model's
+   * calibration and `/jev:calibrate` replays a log captured from it, so an
+   * alias that moves under both is not a default anyone chose.
+   */
+  it("pins the model version rather than following the alias", () => {
+    expect(HOOK_DEFAULTS.model).toBe("jev-1.13.0");
+    expect(loadHookConfig({}).model).toBe("jev-1.13.0");
+    expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_MODEL: "jev-latest" }).model).toBe("jev-latest");
+    expect(loadHookConfig({ JEV_MODEL: "jev-1.12.0" }).model).toBe("jev-1.12.0");
+  });
+
   it("prefers a plugin option over the env fallback", () => {
     const config = loadHookConfig({
       CLAUDE_PLUGIN_OPTION_API_KEY: "sk-from-plugin",
@@ -126,6 +138,26 @@ describe("loadHookConfig", () => {
     const bad = loadHookConfig({ CLAUDE_PLUGIN_OPTION_AUTO_THRESHOLD: "7" });
     expect(bad.autoThreshold).toBe(0.85);
     expect(bad.warnings.join(" ")).toContain("auto_threshold");
+  });
+
+  /**
+   * A Choice's `confidence` is a peakedness statistic, not a probability of a
+   * binary event, so it has its own bar rather than sharing `auto_threshold`.
+   */
+  it("reads confidence_threshold, separately from the certainty threshold", () => {
+    expect(loadHookConfig({}).confidenceThreshold).toBe(0.85);
+    expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_CONFIDENCE_THRESHOLD: "0.6" }).confidenceThreshold).toBe(0.6);
+    expect(loadHookConfig({ JEV_CONFIDENCE_THRESHOLD: "0.95" }).confidenceThreshold).toBe(0.95);
+    // Changing one leaves the other exactly where it was.
+    const tuned = loadHookConfig({ CLAUDE_PLUGIN_OPTION_AUTO_THRESHOLD: "0.7" });
+    expect(tuned.autoThreshold).toBe(0.7);
+    expect(tuned.confidenceThreshold).toBe(0.85);
+  });
+
+  it("warns and falls back on a confidence_threshold outside its range", () => {
+    const bad = loadHookConfig({ JEV_CONFIDENCE_THRESHOLD: "0.2" });
+    expect(bad.confidenceThreshold).toBe(0.85);
+    expect(bad.warnings.join(" ")).toContain("confidence_threshold");
   });
 
   it("never lets the review threshold exceed the auto threshold", () => {

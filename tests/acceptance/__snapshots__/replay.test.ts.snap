@@ -1,0 +1,19 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`captured fixtures > before-0.5.0.jsonl > replays to the same numbers, so a policy change shows its size 1`] = `
+{
+  "allowed_in_scope_median": 0.26,
+  "gate_records": 200,
+  "notes": 18,
+  "screen_contradicts": 0,
+  "screen_flagged": 0,
+  "screen_records": 31,
+  "silent": 176,
+  "silent_by_reason": 43,
+  "silent_scope": 40,
+  "silent_scope_share_pct": 20,
+  "stop_blocks": 0,
+  "stop_records": 12,
+  "trips": 6,
+}
+`;

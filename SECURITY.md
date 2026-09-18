@@ -9,10 +9,20 @@ When a hook decides Jev needs to judge something, or when an MCP tool is pointed
 this plugin sends data to TypeSafe's API at `api.typesafe.ai`. Concretely:
 
 - **Tool inputs and tool results.** The `PreToolUse` gate sends the tool name and a redacted,
-  truncated excerpt of its arguments. The `PostToolUse` injection screen sends an excerpt of a
-  `WebFetch`/`WebSearch`/MCP tool result (up to the first 12k and last 4k characters).
+  truncated excerpt of its arguments, as fields rather than as one line. A Bash call's
+  `description` is deliberately *not* among them. The `PostToolUse` injection screen sends a
+  `WebFetch`/`WebSearch`/MCP tool result in overlapping 16,000-character chunks, one request each:
+  since 0.5.0 that is **the whole result** up to about 128,000 characters, where 0.4.x sent only a
+  12k head and a 4k tail. Past that cap the first chunk, the last, and evenly spaced middles are
+  sent, and the local log records how many chunks there were and how many were judged.
 - **Your last few prompts.** Kept in the session file so the gate can judge whether an action is
   in scope, and sent as part of that judgment when a request is known.
+- **The task a subagent was given.** When Claude spawns a subagent, the prompt it wrote for that
+  subagent is kept in the session file for up to 30 minutes and sent as the request that the
+  subagent's own tool calls are judged against — the alternative is judging them against a prompt
+  the subagent never saw. It is Claude's own text, not a file and not a tool result, and it is
+  redacted and clamped like a user prompt. The spawn itself is never judged: no model call, no
+  output.
 - **Not the affirmation marker.** When Claude answers a tripwire with `# jev:intended <reason>`, the
   marker is stripped from the action *before* anything is sent, precisely so that text Claude wrote
   cannot move the `in_scope` signal. It is written to the local log and shown by `/jev:why`, and it
@@ -28,9 +38,10 @@ Everything sent is **redacted before logging and before sending**: values that l
 (`sk-…`, `ghp_…`, `AKIA…`, `Bearer …`, `password=…`, PEM blocks, long hex or base64 following
 `key`/`token`/`secret=`) are masked in both the outbound request and the local log entry. This is a
 net, not a guarantee — it catches known shapes, not every secret. Everything sent is also
-**size-clamped**: tool-input excerpts are capped at 4,000 characters, tool-result excerpts at 16k
-characters (12k head + 4k tail), prompts at 2,000 characters each (last 3 kept), and the `Stop`
-check's final message at 6,000 characters (tail). File reads for `jev_rank`/`jev_verify` are capped
+**size-clamped**: tool-input excerpts are capped at 4,000 characters, a tool result at 8 chunks of
+16,000 characters, prompts at 2,000 characters each (last 3 kept), a captured subagent task at
+2,000 characters, and the `Stop` check's final message at 6,000 characters (tail). File reads for
+`jev_rank`/`jev_verify` are capped
 by the file-access layer's own per-file (512 KB) and per-call (3M estimated input tokens, about
 $0.13) limits — see below.
 
@@ -132,8 +143,9 @@ kinds of file live there:
   into a marker would land in the log.
 - `sessions/<session_id>.json` — per-session bookkeeping: your last few prompts, the verification
   ledger, the block count used to cap `Stop` blocks at one per prompt, open tripwires (each with its
-  reason, its signals and any affirmation, expiring after 30 minutes), and the note counters used
-  for the per-prompt cap and the duplicate check. Pruned opportunistically after about 7 days.
+  reason, its signals and any affirmation, expiring after 30 minutes), the tasks Claude handed any
+  running subagents (redacted, expiring after 30 minutes), and the note counters used for the
+  per-prompt cap and the duplicate check. Pruned opportunistically after about 7 days.
 
 Deleting this directory is safe. It contains no configuration and nothing needed for the plugin to
 keep working — the only thing you lose is calibration history (`/jev:calibrate`, `/jev:why`) and

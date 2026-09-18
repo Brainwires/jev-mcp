@@ -22,14 +22,15 @@
  */
 
 import { gateOutcome, bands, NOTE_DEDUPE_TTL_MS } from "../advisory.js";
-import { runGateAction } from "../../tools/gate-action-core.js";
-import { prefilter } from "../prefilter.js";
-import { compactJson, redactAndClamp } from "../redact.js";
-import { modelCost, requestText } from "../store.js";
+import { runGateAction, type GateAction, type GateContext, type GateRequest } from "../../tools/gate-action-core.js";
+import { prefilter, SPAWN_TOOLS, structuredAction } from "../prefilter.js";
+import { compactJson, redact, redactAndClamp } from "../redact.js";
+import { modelCost, MAX_PROMPT_CHARS } from "../store.js";
 import type { DecisionRecord } from "../store.js";
 import { fingerprint, tripIdOf, MAX_REASON_CHARS, type Trip } from "../tripwire.js";
 import {
   actionSubject,
+  blastLabel,
   modelTripText,
   noteText,
   patternTripText,
@@ -40,6 +41,8 @@ import type { Deps, EscalatingDecision, HookInput, HookOutput } from "../types.j
 
 /** Longest tool input we will pay to have judged. */
 const MAX_ACTION_CHARS = 4000;
+/** The free-text fields of the judged action, longest-lived first. */
+const ACTION_TEXT_FIELDS = ["command", "content_head", "old_string", "new_string", "text"] as const;
 /** Longest `subject` written to the decision log. */
 const MAX_LOG_SUBJECT_CHARS = 300;
 /** Modes with no prompt to show, so `ask_on_trip` cannot apply. */
@@ -71,6 +74,55 @@ function tripOutput(channel: EscalatingDecision, reason: string): HookOutput {
 /** A note: delivered with the tool result, with no permission decision at all. */
 function noteOutput(text: string): HookOutput {
   return { hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: text } };
+}
+
+/**
+ * Redact every string in the judged action, and keep the whole of it inside
+ * `max`.
+ *
+ * The per-field caps in `structuredAction` already bound each tool's own
+ * shape; this is the guard that holds whatever mix of fields a future tool
+ * populates, trimming the longest-lived fields first in one pass.
+ */
+function boundAction(action: GateAction, max: number): GateAction {
+  const out: GateAction = { ...action, target_paths: [...action.target_paths] };
+  for (const field of ACTION_TEXT_FIELDS) {
+    const value = out[field];
+    if (typeof value === "string") out[field] = redactAndClamp(value, max);
+  }
+  if (out.input !== undefined) out.input = JSON.parse(redact(compactJson(out.input))) as typeof out.input;
+  out.target_paths = out.target_paths.map((path) => redact(path));
+
+  let over = compactJson(out).length - max;
+  for (const field of ACTION_TEXT_FIELDS) {
+    if (over <= 0) break;
+    const value = out[field];
+    if (typeof value !== "string" || value.length === 0) continue;
+    const keep = Math.max(0, value.length - over);
+    over -= value.length - keep;
+    out[field] = value.slice(0, keep);
+  }
+  return out;
+}
+
+/**
+ * The user's request, split into the one that is current and the ones before
+ * it, within a total character budget.
+ *
+ * Filled from the newest backwards, like `requestText` before it: what gets
+ * cut is the oldest context and never the instruction the user just gave.
+ */
+export function gateRequest(prompts: readonly string[], max: number): GateRequest {
+  const latest = redactAndClamp(prompts[prompts.length - 1] ?? "", max);
+  const previous: string[] = [];
+  let used = latest.length;
+  for (let index = prompts.length - 2; index >= 0; index -= 1) {
+    const room = max - used;
+    if (room <= 0) break;
+    previous.unshift(redactAndClamp(prompts[index] as string, room));
+    used += (previous[0] as string).length;
+  }
+  return { latest, previous };
 }
 
 export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<HookOutput | undefined> {
@@ -114,6 +166,23 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
     }
     store.affirmTrip(sessionId, trip.id, affirmation, now);
     store.append({ ...base, decision: "affirm", trip_id: trip.id, fingerprint: trip.fingerprint, affirmation });
+    return undefined;
+  }
+
+  // A subagent spawn. Bookkeeping only: the parent's `prompt` here is the task
+  // the subagent is about to work on, and without it every call that subagent
+  // makes is judged against what the *user* last asked for — which is how four
+  // of the five model trips in the first live week happened.
+  if (SPAWN_TOOLS.has(toolName)) {
+    const agentType = toolInput.subagent_type;
+    const prompt = toolInput.prompt;
+    if (typeof agentType === "string" && agentType !== "" && typeof prompt === "string" && prompt !== "") {
+      store.rememberSubagentTask(
+        sessionId,
+        { agent_type: agentType, prompt: redactAndClamp(prompt, MAX_PROMPT_CHARS), ts: now },
+        now,
+      );
+    }
     return undefined;
   }
 
@@ -214,12 +283,36 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
   if (deps.model === null) return undefined;
 
   const session = store.readSession(sessionId);
-  const knownRequest = session.prompts.length > 0;
-  const userRequest = knownRequest ? requestText(session.prompts, MAX_ACTION_CHARS) : "(unknown)";
 
-  const contextParts = [`Working directory: ${cwd}`];
-  if (input.agent_type !== undefined) contextParts.push(`Running inside subagent: ${input.agent_type}`);
-  if (input.permission_mode !== undefined) contextParts.push(`Permission mode: ${input.permission_mode}`);
+  /**
+   * What stands in for the user's request.
+   *
+   * Inside a subagent it is the task the parent handed it, not the user's last
+   * prompt — judging a subagent's work against a prompt it never saw is what
+   * made every instrumental file rewrite read as out of scope. When two
+   * same-type subagents are running there is no way to tell which one is
+   * calling, so scope is ignored rather than judged against the wrong task.
+   */
+  const subagent = input.agent_type;
+  const task = subagent === undefined ? undefined : store.takeSubagentTask(sessionId, subagent, now);
+  const userRequest: GateRequest | undefined =
+    task !== undefined
+      ? {
+          latest: task.prompt,
+          previous: session.prompts.length > 0 ? [redactAndClamp(session.prompts[session.prompts.length - 1] as string, MAX_ACTION_CHARS)] : [],
+        }
+      : subagent !== undefined
+        ? undefined
+        : session.prompts.length > 0
+          ? gateRequest(session.prompts, MAX_ACTION_CHARS)
+          : undefined;
+  const knownRequest = userRequest !== undefined;
+  const scopeSource: NonNullable<DecisionRecord["scope_source"]> =
+    task !== undefined ? "subagent_task" : knownRequest ? "prompts" : "none";
+
+  const context: GateContext = { cwd };
+  if (subagent !== undefined) context.subagent = subagent;
+  if (input.permission_mode !== undefined) context.permission_mode = input.permission_mode;
 
   const strict = config.gate === "strict";
   const policyOptions = {
@@ -238,9 +331,9 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
     const result = await runGateAction(
       deps.model,
       {
-        action: redactAndClamp(`${toolName} ${compactJson(action)}`, MAX_ACTION_CHARS),
-        user_request: redactAndClamp(userRequest, MAX_ACTION_CHARS),
-        context: contextParts.join(". "),
+        action: boundAction(structuredAction(toolName, action, cwd), MAX_ACTION_CHARS),
+        user_request: userRequest ?? { latest: "(unknown)", previous: [] },
+        context,
         policy: policyOptions,
       },
       {
@@ -251,7 +344,17 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
       controller.signal,
     );
 
-    const signals = { ...result.signals, blast_radius: result.blast_radius.score };
+    const { scope } = result;
+    const signals = {
+      ...result.signals,
+      blast_radius: result.blast_radius.score,
+      scope_unrelated: scope.unrelated,
+      scope_step: scope.step,
+      scope_requested: scope.requested,
+      mentions_target: scope.mentions_target,
+      same_task_area: scope.same_task_area,
+      ...(result.blast_radius.p_high !== undefined ? { blast_p_high: result.blast_radius.p_high } : {}),
+    };
     const record: DecisionRecord = {
       ...base,
       decision: result.decision,
@@ -264,6 +367,14 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
         trust_requested: policyOptions.trustRequested,
         corroborate_uncertain: policyOptions.corroborateUncertain,
       },
+      thresholds: {
+        auto: result.thresholds.auto,
+        review: result.thresholds.review,
+        confidence: config.confidenceThreshold,
+      },
+      blast_source: result.blast_radius.source,
+      scope_source: scopeSource,
+      ...(subagent !== undefined ? { subagent } : {}),
       reasons: result.reasons,
       ...modelCost(result),
     };
@@ -273,12 +384,16 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
       decision: result.decision,
       signals: result.signals,
       blast_radius: result.blast_radius.score,
+      ...(result.blast_radius.p_high !== undefined ? { blast_p_high: result.blast_radius.p_high } : {}),
+      mentions_target: scope.mentions_target,
       thresholds: result.thresholds,
       strict,
       duplicate: store.wasNoted(sessionId, fp, NOTE_DEDUPE_TTL_MS, now),
       notes_this_prompt: session.notes_this_prompt ?? 0,
     });
     const firm: string[] = [...outcome.firm];
+    /** How many requests the scope judgment actually had to read. */
+    const prompts = userRequest === undefined ? 0 : 1 + userRequest.previous.length;
 
     if (outcome.outcome === "trip") {
       const id = tripIdOf(fp);
@@ -287,7 +402,8 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
         id,
         tool: toolName,
         signals: result.signals,
-        prompts: session.prompts.length,
+        prompts,
+        p_unrelated: scope.unrelated,
         sidecar: toolName !== "Bash",
       });
       store.openTrip(
@@ -317,14 +433,28 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
     }
 
     if (outcome.outcome === "note") {
-      const { requestedish } = bands(result.signals, result.blast_radius.score, result.thresholds);
+      const { requestedish } = bands({
+        signals: result.signals,
+        blast_radius: result.blast_radius.score,
+        ...(result.blast_radius.p_high !== undefined ? { blast_p_high: result.blast_radius.p_high } : {}),
+        mentions_target: scope.mentions_target,
+        thresholds: result.thresholds,
+      });
       const text = noteText({
         tool: toolName,
         subject: actionSubject(toolName, action),
         signals: result.signals,
-        blast_radius: result.blast_radius.score,
-        prompts: session.prompts.length,
-        requestedish,
+        blast: {
+          label: blastLabel(result.blast_radius.level),
+          p_level: result.blast_radius.p_level,
+          p_high: result.blast_radius.p_high,
+        },
+        prompts,
+        scope: {
+          requestedish,
+          p_unrelated: scope.unrelated,
+          mentions_target: scope.mentions_target,
+        },
         firm: outcome.firm,
       });
       store.noteEmitted(sessionId, fp, now);

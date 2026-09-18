@@ -280,14 +280,41 @@ describe("node plugin/dist/hook.mjs", () => {
     expect(run.stderr).toBe("");
   });
 
-  it("starts fast enough for a hook on every tool call", async () => {
+  /**
+   * Measured against a bare `node -e ""`, not against the wall clock.
+   *
+   * The absolute version of this test was flaky, and for a reason that had
+   * nothing to do with the bundle: most of the time it measured was Node's own
+   * start, which on a loaded machine is most of the budget. What this release
+   * can be held to is the *difference* — bundle parse, the prefilter, and one
+   * small session read — so that is what is asserted, with the absolute
+   * ceiling kept as a backstop for a catastrophic regression.
+   */
+  it("adds little over a bare node start", async () => {
+    const bare = async (): Promise<number> => {
+      const started = Date.now();
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(process.execPath, ["-e", ""], {
+          env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+          stdio: ["ignore", "ignore", "ignore"],
+        });
+        child.on("error", reject);
+        child.on("close", () => resolve());
+      });
+      return Date.now() - started;
+    };
+
+    // Twice, taking the minimum: the first spawn pays for warming the page
+    // cache, and so would the hook if it went first.
+    const baseline = Math.min(await bare(), await bare());
+
     const started = Date.now();
     await runHook(["PreToolUse"], JSON.stringify(PRE), env);
-    // Wall clock for a skip case, including node's own start. Loose enough not
-    // to be flaky on a loaded machine, tight enough to catch a regression that
-    // pulls a large dependency back in.
-    expect(Date.now() - started).toBeLessThan(1500);
-  });
+    const hook = Date.now() - started;
+
+    expect(hook - baseline, `hook ${hook} ms, bare node ${baseline} ms`).toBeLessThan(700);
+    expect(hook, "absolute ceiling").toBeLessThan(6000);
+  }, 20_000);
 });
 
 describe("node plugin/dist/mcp.mjs", () => {

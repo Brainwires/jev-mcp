@@ -8,7 +8,7 @@
  */
 
 import { z } from "zod";
-import type { GateThresholds, Instructions, Json, Question, State } from "../decision/types.js";
+import type { EntryType, GateThresholds, Instructions, Json, Question, State } from "../decision/types.js";
 import type { FileAccessOptions } from "../files/index.js";
 
 // --------------------------------------------------------------- zod fragments
@@ -61,59 +61,88 @@ export function toInstructions(value: string | unknown[] | Record<string, unknow
   return value as Instructions;
 }
 
+/** One entry of a rubric: an alias, so the three arms stay in step. */
+type EntryInput = string | unknown[] | Record<string, unknown> | null;
+
 export type QuestionInput =
   | {
       type: "choice";
       instructions: string | unknown[] | Record<string, unknown>;
-      criteria: Record<string, string | null>;
+      criteria: Record<string, EntryInput>;
     }
   | {
       type: "score";
       instructions: string | unknown[] | Record<string, unknown>;
-      criteria: string[];
+      criteria: EntryInput[];
     }
   | {
       type: "noul";
       instructions: string | unknown[] | Record<string, unknown>;
-      criteria?: { true?: string | undefined; false?: string | undefined } | undefined;
+      criteria?: { true?: EntryInput | undefined; false?: EntryInput | undefined } | undefined;
     };
+
+function toEntry(value: EntryInput): EntryType {
+  return value as EntryType;
+}
 
 /** Turn a parsed tool input question into a contract `Question`. */
 export function toQuestion(input: QuestionInput): Question {
   switch (input.type) {
-    case "choice":
-      return { type: "choice", instructions: toInstructions(input.instructions), criteria: input.criteria };
+    case "choice": {
+      const criteria: Record<string, EntryType> = {};
+      for (const [option, entry] of Object.entries(input.criteria)) criteria[option] = toEntry(entry);
+      return { type: "choice", instructions: toInstructions(input.instructions), criteria };
+    }
     case "score":
-      return { type: "score", instructions: toInstructions(input.instructions), criteria: input.criteria };
+      return {
+        type: "score",
+        instructions: toInstructions(input.instructions),
+        criteria: input.criteria.map((entry) => toEntry(entry)),
+      };
     case "noul": {
-      const criteria: { true?: string; false?: string } = {};
-      if (input.criteria?.true !== undefined) criteria.true = input.criteria.true;
-      if (input.criteria?.false !== undefined) criteria.false = input.criteria.false;
+      // `null` is an entry, not an absence, so the test is against `undefined`
+      // rather than truthiness.
+      const criteria: { true?: EntryType; false?: EntryType } = {};
+      if (input.criteria?.true !== undefined) criteria.true = toEntry(input.criteria.true);
+      if (input.criteria?.false !== undefined) criteria.false = toEntry(input.criteria.false);
       const question: Question = { type: "noul", instructions: toInstructions(input.instructions) };
       return Object.keys(criteria).length === 0 ? question : { ...question, criteria };
     }
   }
 }
 
+/**
+ * A rubric entry, prose or structure.
+ *
+ * Non-recursive on purpose: `z.unknown()` inside the array and record arms
+ * means zod 4 inlines the whole union, so the JSON Schema the MCP client sees
+ * carries no `$ref` — and a `$ref` is what some clients silently drop.
+ */
+const entrySchema = z
+  .union([z.string(), z.array(z.unknown()), z.record(z.string(), z.unknown()), z.null()])
+  .describe(
+    "A rubric entry: a string, or JSON structure such as {what, not_for, examples} / {summary, signals}.",
+  );
+
 export const choiceQuestionSchema = z.object({
   type: z.literal("choice"),
   instructions: instructionsSchema,
   criteria: z
-    .record(z.string(), z.string().nullable())
+    .record(z.string(), entrySchema)
     .describe("option -> rubric. Use null when the option name says it all. At least 2 options; add an 'other'/'none' escape hatch."),
 });
 
 export const scoreQuestionSchema = z.object({
   type: z.literal("score"),
   instructions: instructionsSchema,
-  criteria: z.array(z.string()).describe("Ordered level descriptions, lowest first. At least 2."),
+  criteria: z.array(entrySchema).min(2).describe("Ordered level descriptions, lowest first. At least 2."),
 });
 
 export const noulQuestionSchema = z.object({
   type: z.literal("noul"),
   instructions: instructionsSchema,
   criteria: z
-    .object({ true: z.string().optional(), false: z.string().optional() })
+    .object({ true: entrySchema.optional(), false: entrySchema.optional() })
     .optional()
     .describe("Optional clarification of what yes and no mean. Keep them aligned with the instructions."),
 });

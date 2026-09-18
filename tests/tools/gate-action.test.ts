@@ -289,7 +289,7 @@ describe("jev_gate_action", () => {
     blast_radius: score(blast, ["none", "local", "shared", "production"], 0.8),
   });
 
-  it("asks five questions in one request and reports every raw probability", async () => {
+  it("asks seven questions in one request and reports every raw probability", async () => {
     const model = new FakeModel(() => answers(0.96, 0.03, 0.94, 0.01, 1.1));
 
     const result = await gateActionTool.run(
@@ -306,18 +306,23 @@ describe("jev_gate_action", () => {
       "blast_radius",
       "credential_exposure",
       "destructive",
-      "in_scope",
+      "mentions_target",
       "outward_facing",
+      "same_task_area",
+      "scope",
     ]);
+    // A string action and a string request are normalized into the shapes the
+    // questions name their paths in.
     expect(model.calls[0]!.state).toEqual({
-      action: "Bash(rm -rf ./build)",
-      user_request: "clean the build directory",
+      action: { tool: "(unspecified)", text: "Bash(rm -rf ./build)", target_paths: [] },
+      request: { latest: "clean the build directory", previous: [] },
     });
 
     expect(result.decision).toBe("confirm");
     expect(result.signals).toEqual({
       destructive: 0.96,
       outward_facing: 0.03,
+      // No `scope` answer came back, so the legacy `in_scope` Noul stands in.
       in_scope: 0.94,
       credential_exposure: 0.01,
     });
@@ -335,10 +340,36 @@ describe("jev_gate_action", () => {
   it("includes optional context in the state only when given", async () => {
     const model = new FakeModel(() => answers(NO, NO, YES, NO, 0));
     await gateActionTool.run(model, { action: "a", user_request: "r" }, testConfig);
-    expect(model.calls[0]!.state).toEqual({ action: "a", user_request: "r" });
+    expect(model.calls[0]!.state).toEqual({
+      action: { tool: "(unspecified)", text: "a", target_paths: [] },
+      request: { latest: "r", previous: [] },
+    });
 
     await gateActionTool.run(model, { action: "a", user_request: "r", context: "c" }, testConfig);
-    expect(model.calls[1]!.state).toEqual({ action: "a", user_request: "r", context: "c" });
+    expect(model.calls[1]!.state).toMatchObject({ context: { notes: "c" } });
+
+    await gateActionTool.run(
+      model,
+      { action: "a", user_request: "r", context: { cwd: "/p", subagent: "Explore" } },
+      testConfig,
+    );
+    expect(model.calls[2]!.state).toMatchObject({ context: { cwd: "/p", subagent: "Explore" } });
+  });
+
+  it("passes a structured action and request through untouched", async () => {
+    const model = new FakeModel(() => answers(NO, NO, YES, NO, 0));
+    await gateActionTool.run(
+      model,
+      {
+        action: { tool: "Edit", file_path: "src/a.ts", old_string: "x", new_string: "y", target_paths: ["src/a.ts"] },
+        user_request: { latest: "rename x to y in a.ts", previous: ["read src/a.ts"] },
+      },
+      testConfig,
+    );
+    expect(model.calls[0]!.state).toEqual({
+      action: { tool: "Edit", file_path: "src/a.ts", old_string: "x", new_string: "y", target_paths: ["src/a.ts"] },
+      request: { latest: "rename x to y in a.ts", previous: ["read src/a.ts"] },
+    });
   });
 
   it("blocks an out-of-scope destructive action", async () => {
@@ -395,6 +426,138 @@ describe("jev_gate_action", () => {
   it("validates its input", () => {
     expect(gateActionTool.inputSchema.safeParse({ action: "", user_request: "r" }).success).toBe(false);
     expect(gateActionTool.inputSchema.safeParse({ action: "a" }).success).toBe(false);
+  });
+});
+
+describe("scopeFromAnswer", () => {
+  const scored = (value: number, probabilities?: Record<string, number>) => ({
+    type: "score" as const,
+    score: value,
+    legend: {},
+    confidence: 0.9,
+    ...(probabilities !== undefined ? { probabilities } : {}),
+  });
+
+  it("splits the three level masses and derives in_scope from them", () => {
+    const split = gateActionTool.scopeFromAnswer(scored(1.7, { "0": 0.05, "1": 0.2, "2": 0.75 }));
+    expect(split).toEqual({ unrelated: 0.05, step: 0.2, requested: 0.75, in_scope: 0.95, source: "probabilities" });
+  });
+
+  /**
+   * The case the level-mass rule exists for: a bimodal answer averages to the
+   * middle level the model never chose. `in_scope` still reads it correctly at
+   * 0.5, where rounding the score would have called it an ordinary step.
+   */
+  it("does not let a bimodal answer read as the middle level", () => {
+    const split = gateActionTool.scopeFromAnswer(scored(1, { "0": 0.5, "2": 0.5 }));
+    expect(split.unrelated).toBe(0.5);
+    expect(split.step).toBe(0);
+    expect(split.in_scope).toBe(0.5);
+  });
+
+  it("falls back to the expectation, read over two adjacent levels", () => {
+    expect(gateActionTool.scopeFromAnswer(scored(0.25))).toMatchObject({
+      unrelated: 0.75,
+      step: 0.25,
+      requested: 0,
+      in_scope: 0.25,
+      source: "expectation",
+    });
+    expect(gateActionTool.scopeFromAnswer(scored(1.6))).toMatchObject({
+      unrelated: 0,
+      requested: 0.6000000000000001,
+      source: "expectation",
+    });
+  });
+
+  it("uses the legacy in_scope Noul when there is no scope answer at all", () => {
+    expect(gateActionTool.scopeFromAnswer(undefined, 0.9)).toEqual({
+      unrelated: 0.09999999999999998,
+      step: 0.9,
+      requested: 0,
+      in_scope: 0.9,
+      source: "expectation",
+    });
+  });
+
+  it("reads a missing answer as maximally uncertain, never as in scope", () => {
+    expect(gateActionTool.scopeFromAnswer(undefined)).toMatchObject({ in_scope: 0.5, unrelated: 0.5 });
+  });
+});
+
+describe("isWide", () => {
+  it("prefers the level mass and falls back to the expectation", () => {
+    expect(gateActionTool.isWide(2.4, undefined, 0.85)).toBe(true);
+    expect(gateActionTool.isWide(1.9, undefined, 0.85)).toBe(false);
+    expect(gateActionTool.isWide(1.9, 0.9, 0.85)).toBe(true);
+    expect(gateActionTool.isWide(2.4, 0.7, 0.85)).toBe(false);
+  });
+});
+
+describe("the mentions_target veto", () => {
+  const destructiveOutOfScope = signals(YES, NO, NO, NO);
+
+  it("turns a row-7 trip into something the table can only note", () => {
+    const withoutVeto = gateActionTool.gateActionPolicy({
+      signals: destructiveOutOfScope,
+      blast_radius: 1,
+      thresholds: T,
+    });
+    expect(withoutVeto.decision).toBe("block");
+    expect(withoutVeto.out_of_scope).toBe(true);
+
+    const vetoed = gateActionTool.gateActionPolicy({
+      signals: destructiveOutOfScope,
+      blast_radius: 1,
+      mentions_target: 0.95,
+      thresholds: T,
+    });
+    expect(vetoed.decision).toBe("confirm");
+    expect(vetoed.out_of_scope).toBe(false);
+    expect(vetoed.reasons.join(" ")).not.toContain("does not look like something the user asked for");
+  });
+
+  it("needs the firm bar: an uncertain match vetoes nothing", () => {
+    for (const mentions of [0.5, 0.84]) {
+      expect(
+        gateActionTool.gateActionPolicy({
+          signals: destructiveOutOfScope,
+          blast_radius: 1,
+          mentions_target: mentions,
+          thresholds: T,
+        }).decision,
+        `mentions_target ${mentions}`,
+      ).toBe("block");
+    }
+  });
+
+  it("is absent by default, so an old record replays exactly as it decided", () => {
+    expect(
+      gateActionTool.gateActionPolicy({ signals: destructiveOutOfScope, blast_radius: 1, thresholds: T }).out_of_scope,
+    ).toBe(true);
+  });
+});
+
+describe("blast_p_high in the policy", () => {
+  it("decides wide on the mass when it is there, and on the expectation when it is not", () => {
+    const quiet = signals(NO, NO, YES, NO);
+    expect(gateActionTool.gateActionPolicy({ signals: quiet, blast_radius: 1.9, thresholds: T }).wide_blast).toBe(false);
+    expect(
+      gateActionTool.gateActionPolicy({ signals: quiet, blast_radius: 1.9, blast_p_high: 0.9, thresholds: T })
+        .wide_blast,
+    ).toBe(true);
+    expect(
+      gateActionTool.gateActionPolicy({ signals: quiet, blast_radius: 2.4, blast_p_high: 0.5, thresholds: T })
+        .wide_blast,
+    ).toBe(false);
+  });
+
+  it("names whichever quantity it actually fired on", () => {
+    expect(
+      gateActionTool
+        .gateActionPolicy({ signals: signals(NO, NO, YES, NO), blast_radius: 1.9, blast_p_high: 0.93, thresholds: T })
+        .reasons.join(" "),
+    ).toContain("wide (p=0.93 on its top two levels)");
   });
 });
 

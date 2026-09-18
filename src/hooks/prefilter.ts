@@ -14,7 +14,9 @@
  * Pure functions only. No I/O, no clock, no model.
  */
 
-import { isAbsolute, resolve, sep } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import type { GateAction } from "../tools/gate-action-core.js";
+import type { Json } from "../decision/types.js";
 import { isSensitivePath } from "../util/sensitive-path.js";
 import { isSidecarBody, parseMarker, type AffirmationMarker } from "./tripwire.js";
 
@@ -1171,6 +1173,192 @@ export function prefilterFileWrite(path: string | undefined, options: FilePrefil
   return { kind: "skip", reason: "ordinary file inside the working directory", writesInProject: true };
 }
 
+// ------------------------------------------------------- the judged action
+
+/** Longest `content_head` a Write sends. */
+const MAX_CONTENT_HEAD_CHARS = 1500;
+/** Longest `old_string`/`new_string` an Edit sends. */
+const MAX_EDIT_STRING_CHARS = 1000;
+/** Longest serialized `input` an MCP or notebook call sends. */
+const MAX_TOOL_INPUT_CHARS = 2500;
+/** Longest single target path. A longer one is a path plus noise. */
+const MAX_TARGET_PATH_CHARS = 200;
+/** Beyond this many targets, more paths cost tokens and add no scope. */
+export const MAX_TARGET_PATHS = 10;
+
+/**
+ * A `sed`/`awk` script operand looks like a path because it is full of
+ * slashes. `s/a/b/` is not a file, and listing it as a target would have
+ * `mentions_target` looking for it in the user's prompts.
+ */
+const SCRIPT_OPERAND = /^[sy][|/,#:].*[|/,#:]/;
+
+/**
+ * Does this argument name a file or a directory?
+ *
+ * Deliberately generous about URLs: `mentions_target` asks whether a request
+ * named the file, command, branch, package, URL or service being acted on, and
+ * a posted endpoint is exactly the kind of target the user either typed or did
+ * not.
+ */
+export function isPathLike(token: string): boolean {
+  if (token === "" || token.startsWith("-")) return false;
+  if (/\s/.test(token)) return false;
+  if (SCRIPT_OPERAND.test(token)) return false;
+  if (token.includes("/")) return true;
+  return /^[\w@][\w.@-]*\.[A-Za-z0-9]{1,8}$/.test(token);
+}
+
+/** A path as the user would recognize it: relative to the cwd when it is inside. */
+function relativize(cwd: string, path: string): string {
+  if (!isAbsolute(path)) return path;
+  if (!resolvesInside(cwd, path)) return path;
+  const inside = relative(resolve(cwd), resolve(path));
+  return inside === "" ? "." : inside;
+}
+
+function targetPaths(cwd: string, raw: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const token of raw) {
+    const path = relativize(cwd, token).slice(0, MAX_TARGET_PATH_CHARS);
+    if (path !== "" && !out.includes(path)) out.push(path);
+    if (out.length >= MAX_TARGET_PATHS) break;
+  }
+  return out;
+}
+
+/** Everything a Bash command names a file: operands, redirects, `sed -i`, `tee`. */
+function bashTargets(command: string, cwd: string): string[] {
+  const scan = scanBash(command);
+  const raw: string[] = [];
+  for (const redirect of scan.redirects) {
+    if (!redirect.special && redirect.target !== "") raw.push(redirect.target);
+  }
+  for (const segment of scan.segments) {
+    const args = argsOf(segment);
+    const writes = writeTargetsOf(commandOf(segment), args);
+    if (writes !== undefined) raw.push(...writes.filter((target) => target !== "-"));
+    for (const arg of args) {
+      if (isPathLike(arg)) raw.push(arg);
+    }
+  }
+  return targetPaths(cwd, raw);
+}
+
+/** Path-shaped strings anywhere in a tool input, for MCP calls. */
+function inputTargets(value: unknown, cwd: string, depth = 0): string[] {
+  if (depth > 3) return [];
+  if (typeof value === "string") return isPathLike(value) ? targetPaths(cwd, [value]) : [];
+  if (Array.isArray(value)) return value.flatMap((item) => inputTargets(item, cwd, depth + 1));
+  if (typeof value === "object" && value !== null) {
+    return Object.values(value as Record<string, unknown>).flatMap((item) => inputTargets(item, cwd, depth + 1));
+  }
+  return [];
+}
+
+/** The tool input as JSON, with its serialized size bounded. */
+function boundedInput(value: unknown, max: number): Record<string, Json> {
+  let json: unknown;
+  try {
+    json = JSON.parse(JSON.stringify(value ?? null)) as unknown;
+  } catch {
+    return {};
+  }
+  if (json === null || typeof json !== "object" || Array.isArray(json)) return {};
+  const record = json as Record<string, Json>;
+  const serialized = JSON.stringify(record);
+  if (serialized.length <= max) return record;
+  // Too long to send as structure. The head as one string still answers the
+  // questions, and the budget still holds.
+  return { truncated_json: serialized.slice(0, max) };
+}
+
+function stringField(toolInput: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = toolInput[key];
+    if (typeof value === "string") return value;
+  }
+  return undefined;
+}
+
+/**
+ * The action, as the fields the gate questions name.
+ *
+ * Only what the model reads changes: the fingerprint, the memo key and the
+ * prefilter all still see the raw tool input, so a tripwire and its re-issue
+ * hash identically across this release.
+ *
+ * Bash `description` is excluded on purpose. It is text the agent wrote about
+ * its own call — framing, not evidence — and the jaggedness notes are explicit
+ * that self-arguing text moves answers. `mentions_target` and `same_task_area`
+ * recover the context it carried from the prompts side instead.
+ */
+export function structuredAction(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  cwd: string,
+): GateAction {
+  const action: GateAction = { tool: toolName, target_paths: [] };
+
+  if (toolName === "Bash" || toolName === "PowerShell") {
+    const command = stringField(toolInput, "command");
+    if (command !== undefined) {
+      action.command = command;
+      action.target_paths = bashTargets(command, cwd);
+    }
+    return action;
+  }
+
+  if (toolName === "Write") {
+    const path = stringField(toolInput, "file_path", "path");
+    const content = stringField(toolInput, "content") ?? "";
+    if (path !== undefined) {
+      action.file_path = relativize(cwd, path);
+      action.target_paths = targetPaths(cwd, [path]);
+    }
+    action.content_head = content.slice(0, MAX_CONTENT_HEAD_CHARS);
+    action.content_chars = content.length;
+    return action;
+  }
+
+  if (toolName === "Edit" || toolName === "Update") {
+    const path = stringField(toolInput, "file_path", "path");
+    if (path !== undefined) {
+      action.file_path = relativize(cwd, path);
+      action.target_paths = targetPaths(cwd, [path]);
+    }
+    action.old_string = (stringField(toolInput, "old_string") ?? "").slice(0, MAX_EDIT_STRING_CHARS);
+    action.new_string = (stringField(toolInput, "new_string") ?? "").slice(0, MAX_EDIT_STRING_CHARS);
+    return action;
+  }
+
+  if (toolName === "MultiEdit") {
+    const path = stringField(toolInput, "file_path", "path");
+    if (path !== undefined) {
+      action.file_path = relativize(cwd, path);
+      action.target_paths = targetPaths(cwd, [path]);
+    }
+    const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
+    action.input = boundedInput({ edits: edits.length, first: edits[0] ?? null }, MAX_TOOL_INPUT_CHARS);
+    return action;
+  }
+
+  if (toolName === "NotebookEdit") {
+    const path = stringField(toolInput, "notebook_path", "file_path", "path");
+    if (path !== undefined) {
+      action.file_path = relativize(cwd, path);
+      action.target_paths = targetPaths(cwd, [path]);
+    }
+    action.input = boundedInput(toolInput, MAX_TOOL_INPUT_CHARS);
+    return action;
+  }
+
+  // MCP, and anything else with no shape this code knows.
+  action.input = boundedInput(toolInput, MAX_TOOL_INPUT_CHARS);
+  action.target_paths = inputTargets(toolInput, cwd).slice(0, MAX_TARGET_PATHS);
+  return action;
+}
+
 // ----------------------------------------------------------------- mcp tools
 
 const READ_VERBS = /^(get|list|read|search|query|fetch|describe|find|show|view|inspect|count|resolve)/;
@@ -1228,9 +1416,17 @@ export function readBashMarker(command: string): { command: string; marker?: Aff
   return { command: parsed.stripped, marker: parsed.marker };
 }
 
+/** Spawning a subagent. Not judged; captured, so the subagent has a request. */
+export const SPAWN_TOOLS = new Set(["Agent", "Task"]);
+
 export function prefilter(input: PrefilterInput): Prefilter {
   const { toolName } = input;
   if (isOwnTool(toolName)) return { kind: "skip", reason: "this plugin's own tool" };
+
+  // A spawn is bookkeeping, never a judgment: the handler records the task the
+  // parent just handed the subagent so the subagent's own calls have something
+  // to be in scope *of*. No model, no output.
+  if (SPAWN_TOOLS.has(toolName)) return { kind: "skip", reason: "subagent spawn" };
 
   if (toolName === "Bash" || toolName === "PowerShell") {
     const command = input.toolInput.command;

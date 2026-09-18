@@ -216,7 +216,7 @@ export function statusReport(
     `  gate: ${config.gate}`,
     `  ask_on_trip: ${config.askOnTrip}${config.askOnTrip ? "" : " (a tripwire denies to Claude; the user is not prompted)"}`,
     `  stop_check: ${config.stopCheck}   screen_results: ${config.screenResults}   route_prompts: ${config.routePrompts}`,
-    `  thresholds: auto ${config.autoThreshold}, review ${config.reviewThreshold}`,
+    `  thresholds: auto ${config.autoThreshold}, review ${config.reviewThreshold}, choice confidence ${config.confidenceThreshold}`,
     `  per-call timeout: ${config.timeoutMs} ms, retries: ${config.maxRetries}`,
     `  data dir: ${config.dataDir}`,
     `  hooks disabled by env: ${config.disabled}`,
@@ -309,19 +309,19 @@ export function whyReport(store: Store, limit = 3, filter: WhyFilter = "all"): s
       // Every option in force, because "why did this fire" usually turns out
       // to be "which leniency was or was not switched on".
       const options = [
-        `uncertain=${record.policy.uncertain}`,
-        `in_scope ${record.policy.ignore_scope ? "ignored" : "used"}`,
+        `uncertain=${String(record.policy.uncertain)}`,
+        `in_scope ${flag(record, "ignore_scope") === true ? "ignored" : "used"}`,
       ];
-      const flags: [string, boolean | undefined][] = [
-        ["lenient_scope", record.policy.lenient_scope],
-        ["trust_requested", record.policy.trust_requested],
-        ["corroborate_uncertain", record.policy.corroborate_uncertain],
-      ];
-      for (const [name, value] of flags) {
+      for (const name of ["lenient_scope", "trust_requested", "corroborate_uncertain"]) {
+        const value = flag(record, name);
         if (value !== undefined) options.push(`${name}=${value}`);
       }
       lines.push(`  policy: ${options.join(", ")}`);
     }
+    if (record.scope_source !== undefined) {
+      lines.push(`  scope read from: ${record.scope_source}${record.subagent === undefined ? "" : ` (${record.subagent})`}`);
+    }
+    if (record.unfinished_by !== undefined) lines.push(`  unfinished by: ${record.unfinished_by}`);
     for (const reason of record.reasons ?? []) lines.push(`  - ${reason}`);
     if (record.error !== undefined) lines.push(`  error: ${record.error}`);
     if (record.model !== undefined) {
@@ -346,6 +346,23 @@ function histogram(values: number[]): string {
 
 const GATE_SIGNALS = ["destructive", "outward_facing", "in_scope", "credential_exposure"] as const;
 
+/** Signals 0.5.0 added to a judged gate record. Absent on an older one. */
+const SCOPE_SIGNALS = ["scope_unrelated", "scope_step", "scope_requested", "mentions_target", "blast_p_high"] as const;
+
+/** The three Nouls that replaced the 0.4.x compound `admits_unfinished`. */
+const UNFINISHED_SIGNALS = ["says_part_not_done", "says_step_deferred", "says_check_failing"] as const;
+
+/** A boolean policy option, when the log actually recorded one. */
+function flag(record: DecisionRecord, name: string): boolean | undefined {
+  const value = record.policy?.[name];
+  return typeof value === "boolean" ? value : undefined;
+}
+
+/** One numeric signal off a record, when the log has it. */
+function signal(record: DecisionRecord, name: string): number | undefined {
+  const value = record.signals?.[name];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
 
 /** Signals kept in the log for a judged gate decision. */
 interface LoggedSignals {
@@ -368,37 +385,80 @@ function loggedSignals(record: DecisionRecord): LoggedSignals {
 }
 
 /**
- * Re-run one logged decision through the policy and the advisory table.
+ * Re-run one logged gate decision through the policy and the advisory table.
  *
  * Exact, not an estimate: the signals, the blast radius and every policy option
  * in force were written to the log, so this is the same pure pair of functions
  * the hook ran, with one honest gap — the per-session duplicate check and the
  * per-prompt cap are session state, not log state, so the replay counts what
  * the table called for before those two suppressions.
+ *
+ * `blast_p_high` and `mentions_target` are passed only when the record carries
+ * them. A record written before 0.5.0 has neither, and then the expectation
+ * rule and the un-vetoed out-of-scope reading apply — which is what that record
+ * actually decided on.
  */
-function replay(record: DecisionRecord, auto: number, review: number): "note" | "trip" | "silent" {
+function replayGate(record: DecisionRecord, auto: number, review: number): "note" | "trip" | "silent" {
   const { blast_radius, ...signals } = loggedSignals(record);
   const thresholds = { auto, review: Math.min(review, auto) };
   const strict = record.policy?.uncertain === "confirm";
+  const pHigh = signal(record, "blast_p_high");
+  const mentions = signal(record, "mentions_target");
+  const zeroFive = {
+    ...(pHigh !== undefined ? { blast_p_high: pHigh } : {}),
+    ...(mentions !== undefined ? { mentions_target: mentions } : {}),
+  };
   const policy = gateActionPolicy({
     signals: signals satisfies GateActionSignals,
     blast_radius,
+    ...zeroFive,
     thresholds,
     options: {
-      ignoreScope: record.policy?.ignore_scope ?? false,
+      ignoreScope: flag(record, "ignore_scope") ?? false,
       uncertain: strict ? "confirm" : "risky-lean",
-      lenientScope: record.policy?.lenient_scope ?? false,
-      trustRequested: record.policy?.trust_requested ?? false,
-      corroborateUncertain: record.policy?.corroborate_uncertain ?? false,
+      lenientScope: flag(record, "lenient_scope") ?? false,
+      trustRequested: flag(record, "trust_requested") ?? false,
+      corroborateUncertain: flag(record, "corroborate_uncertain") ?? false,
     },
   });
   return gateOutcome({
     decision: policy.decision,
     signals,
     blast_radius,
+    ...zeroFive,
     thresholds,
     strict,
   }).outcome;
+}
+
+/**
+ * Re-run one logged Stop decision.
+ *
+ * The three 0.5.0 Nouls when they are there, the 0.4.x compound
+ * `admits_unfinished` when they are not. The verification-ledger rule is
+ * deliberately not replayed: what the last check command did is session state,
+ * not log state, so a replay of it would be a guess dressed as an exact count.
+ */
+function replayStop(record: DecisionRecord, auto: number): "block" | "allow" {
+  const split = UNFINISHED_SIGNALS.map((name) => signal(record, name)).filter(
+    (value): value is number => value !== undefined,
+  );
+  const unfinished = split.length > 0 ? Math.max(...split) : signal(record, "admits_unfinished");
+  if (unfinished === undefined) return "allow";
+  const asksUser = signal(record, "asks_user") ?? 0;
+  return unfinished >= auto && !(asksUser > 1 - auto) ? "block" : "allow";
+}
+
+/** Re-run one logged PostToolUse screen, in the cascade's order. */
+function replayScreen(record: DecisionRecord, auto: number): "flagged" | "contradicts" | "clean" {
+  if ((signal(record, "injection") ?? 0) >= auto) return "flagged";
+  if ((signal(record, "contradicts_premise") ?? 0) >= auto) return "contradicts";
+  return "clean";
+}
+
+/** Re-run one logged prompt classification at another confidence bar. */
+function replayKind(record: DecisionRecord, confidence: number): "printed" | "low-confidence" {
+  return (signal(record, "kind_confidence") ?? 0) >= confidence ? "printed" : "low-confidence";
 }
 
 /** The signal that drove a note or a trip, for the by-signal tallies. */
@@ -518,69 +578,118 @@ export function calibrateReport(config: HookConfig, store: Store): string {
     "  The first line is the reflex metric: a marker only ever answers a specific tripwire.",
   );
 
-  // Sections 4 and 5 are about signals, so they need model judgments. Section 6
-  // is about how to read the rest, and a pattern trip is worth reading whether
-  // or not the model was ever called — so the report does not stop here.
-  if (judged.length === 0) {
-    lines.push(
-      "",
-      "4. Signal distributions, by what the gate did",
-      "  Nothing judged by the model yet. Run a few sessions with gate=advisory and try again.",
-      "",
-      "5. Replay at other auto thresholds",
-      "  Nothing to replay yet.",
-    );
-    return [...lines, "", ...evidenceSection(tripById, notReissued, reissues, affirms)].join("\n");
-  }
-
-  // ----------------------------------------- 4. histograms, split by outcome
-  lines.push("", "4. Signal distributions, by what the gate did");
+  // Section 4 is about gate signals, so it needs gate judgments. Section 5
+  // replays four events and only 5a is the gate's, so it runs either way; and
+  // section 6 is worth reading whether or not the model was ever called.
   const buckets: [string, DecisionRecord[]][] = [
     ["note", judged.filter((r) => r.decision === "note")],
     ["trip", judged.filter((r) => r.decision === "trip")],
     ["silent", judged.filter((r) => r.decision === "allow" || (r.decision ?? "").startsWith("silent-"))],
   ];
-  for (const [name, records] of buckets) {
+
+  // ----------------------------------------- 4. histograms, split by outcome
+  lines.push("", "4. Signal distributions, by what the gate did");
+  if (judged.length === 0) {
+    lines.push("  Nothing judged by the model yet. Run a few sessions with gate=advisory and try again.");
+  }
+  for (const [name, records] of judged.length === 0 ? [] : buckets) {
     lines.push(`  ${name} (${records.length})`);
     if (records.length === 0) {
       lines.push("    (no samples)");
       continue;
     }
-    for (const signal of GATE_SIGNALS) {
-      const values = records.map((r) => r.signals?.[signal]).filter((n): n is number => typeof n === "number");
-      lines.push(`    ${signal.padEnd(20)} ${histogram(values)}`);
+    for (const name of [...GATE_SIGNALS, ...SCOPE_SIGNALS]) {
+      const values = records.map((r) => signal(r, name)).filter((n): n is number => n !== undefined);
+      // A 0.5.0-only signal is simply absent from an older record; a row of
+      // "(no samples)" for every one of them would be noise on an old log.
+      if (values.length === 0 && (SCOPE_SIGNALS as readonly string[]).includes(name)) continue;
+      lines.push(`    ${name.padEnd(20)} ${histogram(values)}`);
     }
-    const blast = records.map((r) => r.signals?.blast_radius).filter((n): n is number => typeof n === "number");
+    const blast = records.map((r) => signal(r, "blast_radius")).filter((n): n is number => n !== undefined);
     if (blast.length > 0) {
       const mean = blast.reduce((a, b) => a + b, 0) / blast.length;
       lines.push(`    blast_radius         mean ${mean.toFixed(2)} of 3, p95 ${percentile(blast, 95).toFixed(2)}`);
     }
+    // `same_task_area` is logged and not consumed in 0.5.0. It is a
+    // corroborator for `scope_step`, and this line is the evidence for
+    // promoting it to policy, or for dropping it.
+    const pairs = records
+      .map((r) => [signal(r, "same_task_area"), signal(r, "scope_step")] as const)
+      .filter((pair): pair is readonly [number, number] => pair[0] !== undefined && pair[1] !== undefined);
+    if (pairs.length > 0) {
+      const agree = pairs.filter(([area, step]) => area >= 0.5 === step >= 0.5).length;
+      lines.push(
+        `    same_task_area agrees with scope_step on ${agree}/${pairs.length} (both read at 0.5)`,
+      );
+    }
   }
 
   // --------------------------------------------------- 5. threshold replay
+  const stops = log.filter((r) => (r.event === "Stop" || r.event === "SubagentStop") && r.signals !== undefined);
+  const screens = log.filter((r) => r.event === "PostToolUse" && signal(r, "injection") !== undefined);
+  const kinds = log.filter((r) => r.event === "UserPromptSubmit" && signal(r, "kind_confidence") !== undefined);
+
+  lines.push("", "5. Replay at other thresholds, over your own log");
+
   const outputsNow = judged.filter((r) => r.decision === "note" || r.decision === "trip").length;
-  lines.push(
-    "",
-    `5. Replay at other auto thresholds (currently ${config.autoThreshold}; ${outputsNow} notes+trips)`,
-  );
-  for (const auto of [0.75, 0.8, 0.85, 0.9, 0.95]) {
-    let noted = 0;
-    let tripped = 0;
-    for (const record of judged) {
-      const outcome = replay(record, auto, config.reviewThreshold);
-      if (outcome === "note") noted += 1;
-      if (outcome === "trip") tripped += 1;
+  lines.push(`  5a gate (currently auto ${config.autoThreshold}; ${outputsNow} notes+trips of ${judged.length})`);
+  if (judged.length === 0) {
+    lines.push("    no records");
+  } else {
+    for (const auto of [0.75, 0.8, 0.85, 0.9, 0.95]) {
+      let noted = 0;
+      let tripped = 0;
+      for (const record of judged) {
+        const outcome = replayGate(record, auto, config.reviewThreshold);
+        if (outcome === "note") noted += 1;
+        if (outcome === "trip") tripped += 1;
+      }
+      const total = noted + tripped;
+      const delta = outputsNow === 0 ? 0 : Math.round(((outputsNow - total) / outputsNow) * 100);
+      // A zero delta is "0%", not "-0%".
+      const change = delta === 0 ? "0%" : `${delta > 0 ? "-" : "+"}${Math.abs(delta)}%`;
+      lines.push(`    auto ${auto.toFixed(2)}: ${noted} notes + ${tripped} trips = ${total} (${change} vs now)`);
     }
-    const total = noted + tripped;
-    const delta = outputsNow === 0 ? 0 : Math.round(((outputsNow - total) / outputsNow) * 100);
-    // A zero delta is "0%", not "-0%".
-    const change = delta === 0 ? "0%" : `${delta > 0 ? "-" : "+"}${Math.abs(delta)}%`;
-    lines.push(`  auto ${auto.toFixed(2)}: ${noted} notes + ${tripped} trips = ${total} (${change} vs now)`);
+    lines.push(
+      "    Exact for the table's rows; the per-session duplicate check and the five-note",
+      "    cap are session state rather than log state, so the replay counts before them.",
+    );
   }
-  lines.push(
-    "  Exact for the table's rows; the per-session duplicate check and the five-note",
-    "  cap are session state rather than log state, so the replay counts before them.",
-  );
+
+  lines.push(`  5b stop (${stops.length} judged)`);
+  if (stops.length === 0) {
+    lines.push("    no records");
+  } else {
+    for (const auto of [0.75, 0.8, 0.85, 0.9, 0.95]) {
+      const blocks = stops.filter((record) => replayStop(record, auto) === "block").length;
+      lines.push(`    auto ${auto.toFixed(2)}: ${blocks} blocks of ${stops.length}`);
+    }
+    lines.push(
+      "    The unfinished rule only. The verification-ledger rule compares a claim against",
+      "    what the last check command did, which is session state and not in this log.",
+    );
+  }
+
+  lines.push(`  5c screen (${screens.length} judged)`);
+  if (screens.length === 0) {
+    lines.push("    no records");
+  } else {
+    for (const auto of [0.75, 0.8, 0.85, 0.9, 0.95]) {
+      const flagged = screens.filter((record) => replayScreen(record, auto) === "flagged").length;
+      const contradicts = screens.filter((record) => replayScreen(record, auto) === "contradicts").length;
+      lines.push(`    auto ${auto.toFixed(2)}: ${flagged} flagged + ${contradicts} contradictions of ${screens.length}`);
+    }
+  }
+
+  lines.push(`  5d prompt kind (currently confidence ${config.confidenceThreshold}; ${kinds.length} judged)`);
+  if (kinds.length === 0) {
+    lines.push("    no records — route_prompts is off unless you turned it on");
+  } else {
+    for (const confidence of [0.6, 0.7, 0.8, 0.85, 0.9, 0.95]) {
+      const printed = kinds.filter((record) => replayKind(record, confidence) === "printed").length;
+      lines.push(`    confidence ${confidence.toFixed(2)}: ${printed} printed of ${kinds.length}`);
+    }
+  }
 
   return [...lines, "", ...evidenceSection(tripById, notReissued, reissues, affirms)].join("\n");
 }

@@ -31,7 +31,13 @@ export interface Config {
 
 export const DEFAULTS = {
   baseUrl: "https://api.typesafe.ai",
-  model: "jev-latest",
+  /**
+   * Pinned: an alias move would shift every probability under thresholds the
+   * caller has tuned. `JEV_MODEL=jev-latest` opts back into following
+   * releases. The library's own default (`src/jev/client.ts`) stays the alias —
+   * a library user picks their own policy.
+   */
+  model: "jev-1.13.0",
   timeoutMs: 30_000,
   maxRetries: 3,
   autoThreshold: 0.85,
@@ -101,7 +107,10 @@ export function loadConfig(env: Env = process.env): Config {
   return {
     apiKey: apiKeyRaw === undefined || apiKeyRaw === "" ? null : apiKeyRaw,
     baseUrl: readString(env, "TYPESAFE_BASE_URL", DEFAULTS.baseUrl).replace(/\/+$/, ""),
-    model: readString(env, "JEV_MODEL", DEFAULTS.model),
+    // The plugin manifest exports its `model` option here too, so the setting
+    // means the same thing to the server as it does to the hooks. An empty or
+    // unsubstituted option falls through to the env var and then the default.
+    model: firstKey(env.CLAUDE_PLUGIN_OPTION_MODEL) ?? readString(env, "JEV_MODEL", DEFAULTS.model),
     timeoutMs: readNumber(env, "JEV_TIMEOUT_MS", DEFAULTS.timeoutMs, 1, 600_000),
     maxRetries: readNumber(env, "JEV_MAX_RETRIES", DEFAULTS.maxRetries, 0, 10),
     thresholds: { auto, review },

@@ -14,6 +14,8 @@ import type { FirmReason } from "../../src/hooks/advisory.js";
 import {
   actionSubject,
   BANNED_IMPERATIVES,
+  blastLabel,
+  contradictionNoteText,
   injectionNoteText,
   modelTripText,
   MAX_SUBJECT_CHARS,
@@ -23,15 +25,23 @@ import {
 } from "../../src/hooks/wording.js";
 
 const SIGNALS = { destructive: 0.94, outward_facing: 0.91, in_scope: 0.12, credential_exposure: 0.88 };
+/** The same call, but one the last prompts plainly asked for. */
+const REQUESTED = { ...SIGNALS, in_scope: 0.9 };
+
+const BLAST = { label: blastLabel(2), p_level: 0.71, p_high: 0.93 };
 
 function note(firm: FirmReason[], requestedish = false): string {
   return noteText({
     tool: "Bash",
     subject: "rm -rf build",
-    signals: SIGNALS,
-    blast_radius: 2.4,
+    signals: requestedish ? REQUESTED : SIGNALS,
+    blast: BLAST,
     prompts: 3,
-    requestedish,
+    scope: {
+      requestedish,
+      p_unrelated: requestedish ? 0.08 : 0.86,
+      mentions_target: requestedish ? 0.92 : 0.04,
+    },
     firm,
   });
 }
@@ -47,11 +57,18 @@ const EVERY_NOTE: [string, string][] = [
 ];
 
 const EVERY_TRIP: [string, string][] = [
-  ["model trip, Bash", modelTripText({ id: "t-1a2b3c4d", tool: "Bash", signals: SIGNALS, prompts: 3, sidecar: false })],
-  ["model trip, Write", modelTripText({ id: "t-1a2b3c4d", tool: "Write", signals: SIGNALS, prompts: 3, sidecar: true })],
+  [
+    "model trip, Bash",
+    modelTripText({ id: "t-1a2b3c4d", tool: "Bash", signals: SIGNALS, prompts: 3, p_unrelated: 0.86, sidecar: false }),
+  ],
+  [
+    "model trip, Write",
+    modelTripText({ id: "t-1a2b3c4d", tool: "Write", signals: SIGNALS, prompts: 3, p_unrelated: 0.86, sidecar: true }),
+  ],
   ["pattern trip", patternTripText({ id: "t-1a2b3c4d", pattern: "rm-rf-wide", reason: "recursive delete of a home path" })],
   ["repeat", tripRepeatText({ id: "t-1a2b3c4d", attempt: 2, seconds: 12.4 })],
   ["injection", injectionNoteText({ tool: "WebFetch", p: 0.96 })],
+  ["contradiction", contradictionNoteText({ tool: "WebFetch", p: 0.91 })],
 ];
 
 describe("no agent-facing text is an instruction", () => {
@@ -92,9 +109,33 @@ describe("noteText", () => {
     expect(text).toContain("did not see the workspace");
   });
 
-  it("names the prompts when scope is thin, and the radius when it is not", () => {
-    expect(note(["destructive"])).toContain("not mentioned in the last 3 user prompts (in_scope=0.12)");
-    expect(note(["destructive"], true)).toContain("blast radius was scored 2.40 of 3");
+  it("names the prompts when scope is thin, and the reach when it is not", () => {
+    expect(note(["destructive"])).toContain(
+      "The last 3 user prompts were scored as not asking for it (scope: unrelated p=0.86).",
+    );
+    expect(note(["destructive"], true)).toContain("Its reach was scored as shared project state (p=0.71).");
+  });
+
+  /**
+   * The 0.4.x wording bug, live in the log: a note about an outward-facing call
+   * the user had plainly asked for (`in_scope` 0.90) still said it was "not
+   * named in the last N user prompts", because the scope clause was emitted on
+   * the latch alone.
+   */
+  it("does not claim the prompts are silent about work they asked for", () => {
+    for (const firm of [["outward"], ["wide"], ["outward", "wide"], ["destructive", "wide"]] as FirmReason[][]) {
+      const text = note(firm, true);
+      expect(text, firm.join("+")).not.toContain("not asking");
+      expect(text, firm.join("+")).not.toContain("scope: unrelated");
+    }
+  });
+
+  it("names the reach by level rather than as a number out of three", () => {
+    for (const [name, text] of EVERY_NOTE) {
+      expect(text, name).not.toMatch(/\d\.\d\d of 3/);
+    }
+    expect(note(["wide"])).toContain("as reaching shared project state (p=0.93)");
+    expect(note(["outward"])).toContain("with its reach scored as shared project state (p=0.71)");
   });
 
   it("states plainly that a credential note is about output already in context", () => {
@@ -118,7 +159,7 @@ describe("noteText", () => {
       ["destructive", "wide"],
     ] as FirmReason[][]) {
       const text = note(firm);
-      expect(text.match(/in_scope=/g)?.length, text).toBe(1);
+      expect(text.match(/scope: unrelated p=/g)?.length, text).toBe(1);
     }
   });
 
@@ -134,13 +175,20 @@ describe("noteText", () => {
 });
 
 describe("trip text", () => {
-  const bash = modelTripText({ id: "t-1a2b3c4d", tool: "Bash", signals: SIGNALS, prompts: 3, sidecar: false });
+  const bash = modelTripText({
+    id: "t-1a2b3c4d",
+    tool: "Bash",
+    signals: SIGNALS,
+    prompts: 3,
+    p_unrelated: 0.86,
+    sidecar: false,
+  });
 
   it("carries the four facts the agent decides on", () => {
     expect(bash).toContain("tripwire t-1a2b3c4d");
     expect(bash).toContain("was not run");
     expect(bash).toContain("destructive (p=0.94)");
-    expect(bash).toContain("in_scope=0.12");
+    expect(bash).toContain("(scope: unrelated p=0.86)");
     expect(bash).toContain("can be wrong");
     expect(bash).toContain("# jev:intended <the sentence of the user's request that requires this exact action>");
     expect(bash).toContain("Claude Code's own permission rules still apply");
@@ -150,9 +198,16 @@ describe("trip text", () => {
 
   it("offers the sidecar form only for tools with no comment syntax", () => {
     expect(bash).not.toContain("true # jev:intended");
-    expect(modelTripText({ id: "t-1a2b3c4d", tool: "Write", signals: SIGNALS, prompts: 3, sidecar: true })).toContain(
-      "true # jev:intended t-1a2b3c4d: <that sentence>",
-    );
+    expect(
+      modelTripText({
+        id: "t-1a2b3c4d",
+        tool: "Write",
+        signals: SIGNALS,
+        prompts: 3,
+        p_unrelated: 0.86,
+        sidecar: true,
+      }),
+    ).toContain("true # jev:intended t-1a2b3c4d: <that sentence>");
   });
 
   it("names whichever finding was stronger", () => {
@@ -161,6 +216,7 @@ describe("trip text", () => {
       tool: "Bash",
       signals: { ...SIGNALS, destructive: 0.1 },
       prompts: 1,
+      p_unrelated: 0.86,
       sidecar: false,
     });
     expect(outward).toContain("reaching outside this machine (p=0.91)");

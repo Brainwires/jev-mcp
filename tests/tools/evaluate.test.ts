@@ -119,6 +119,83 @@ describe("jev_evaluate", () => {
     });
   });
 
+  /**
+   * Structured criteria, 0.5.0. The whole point is that the structure survives
+   * the schema and `toQuestion` untouched: Jev reads `not_for` on the side a
+   * lookalike case would wrongly land on, and a stringified rubric loses that.
+   */
+  describe("structured criteria", () => {
+    const CHOICE_ENTRY = { what: "Payments, refunds", not_for: "An outage", examples: ["a double charge"] };
+    const SCORE_ENTRY = { summary: "Calm", signals: ["no exclamation marks"] };
+    const NOUL_ENTRY = { what: "Time-sensitive", not_for: "A deadline already passed", examples: ["today"] };
+
+    it("round-trips JSON entries through all three question types", async () => {
+      const model = new FakeModel(() => ({
+        a: noul(0.9),
+        b: choice("billing", { billing: 0.9, other: 0.1 }, 0.9),
+        c: score(0.5, ["Calm", "Angry"], 0.5),
+      }));
+      await evaluateTool.run(
+        model,
+        {
+          state: "s",
+          questions: {
+            a: { type: "noul", instructions: "Is it urgent?", criteria: { true: NOUL_ENTRY, false: null } },
+            b: {
+              type: "choice",
+              instructions: "Which team?",
+              criteria: { billing: CHOICE_ENTRY, other: null },
+            },
+            c: { type: "score", instructions: "How frustrated?", criteria: [SCORE_ENTRY, "Angry"] },
+          },
+        },
+        testConfig,
+      );
+
+      expect(model.calls[0]!.questions).toEqual({
+        a: { type: "noul", instructions: "Is it urgent?", criteria: { true: NOUL_ENTRY, false: null } },
+        b: { type: "choice", instructions: "Which team?", criteria: { billing: CHOICE_ENTRY, other: null } },
+        c: { type: "score", instructions: "How frustrated?", criteria: [SCORE_ENTRY, "Angry"] },
+      });
+    });
+
+    it("keeps a `null` noul side, which is a value rather than an absence", async () => {
+      const model = new FakeModel(() => ({ q: noul(0.5) }));
+      await evaluateTool.run(
+        model,
+        { state: "s", questions: { q: { type: "noul", instructions: "Is it urgent?", criteria: { false: null } } } },
+        testConfig,
+      );
+      expect(model.calls[0]!.questions.q).toEqual({
+        type: "noul",
+        instructions: "Is it urgent?",
+        criteria: { false: null },
+      });
+    });
+
+    it("is accepted by the input schema in every arm", () => {
+      const ok = evaluateTool.inputSchema.safeParse({
+        state: "s",
+        questions: {
+          a: { type: "noul", instructions: "q", criteria: { true: NOUL_ENTRY } },
+          b: { type: "choice", instructions: "q", criteria: { x: CHOICE_ENTRY, y: null } },
+          c: { type: "score", instructions: "q", criteria: [SCORE_ENTRY, { summary: "Angry", signals: [] }] },
+          d: { type: "score", instructions: "q", criteria: [["a", "b"], "plain"] },
+        },
+      });
+      expect(ok.success, JSON.stringify(ok.error?.issues)).toBe(true);
+    });
+
+    it("still rejects a score with fewer than two levels", () => {
+      expect(
+        evaluateTool.inputSchema.safeParse({
+          state: "s",
+          questions: { c: { type: "score", instructions: "q", criteria: [SCORE_ENTRY] } },
+        }).success,
+      ).toBe(false);
+    });
+  });
+
   it("validates its own input schema", () => {
     expect(evaluateTool.inputSchema.safeParse({ state: "s", questions: {} }).success).toBe(true);
     expect(evaluateTool.inputSchema.safeParse({ state: 42, questions: {} }).success).toBe(false);

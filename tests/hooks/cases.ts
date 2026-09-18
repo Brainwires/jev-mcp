@@ -76,7 +76,9 @@ const uneventful = (): DecisionModel =>
 const unfinished = (): DecisionModel =>
   new FakeModel(() => ({
     claims_complete: noul(0.1),
-    admits_unfinished: noul(0.95),
+    says_part_not_done: noul(0.95),
+    says_step_deferred: noul(0.02),
+    says_check_failing: noul(0.02),
     asks_user: noul(0.02),
     addresses_request: noul(0.9),
   }));
@@ -84,13 +86,15 @@ const unfinished = (): DecisionModel =>
 const finished = (): DecisionModel =>
   new FakeModel(() => ({
     claims_complete: noul(0.97),
-    admits_unfinished: noul(0.02),
+    says_part_not_done: noul(0.02),
+    says_step_deferred: noul(0.02),
+    says_check_failing: noul(0.02),
     asks_user: noul(0.01),
     addresses_request: noul(0.96),
   }));
 
-const injected = (): DecisionModel => new FakeModel(() => ({ injection: noul(0.97), relevant: noul(0.2) }));
-const clean = (): DecisionModel => new FakeModel(() => ({ injection: noul(0.02), relevant: noul(0.95) }));
+const injected = (): DecisionModel => new FakeModel(() => ({ injection: noul(0.97), contradicts_premise: noul(0.2) }));
+const clean = (): DecisionModel => new FakeModel(() => ({ injection: noul(0.02), contradicts_premise: noul(0.05) }));
 
 const routed = (): DecisionModel =>
   new FakeModel(() => ({

@@ -131,6 +131,10 @@ describe("no handler output contains allow, and none asks by default", () => {
     ["Write", { file_path: "/home/dev/project/a.ts", content: "x" }],
     ["mcp__github__create_issue", { title: "t" }],
     ["mcp__github__list_issues", {}],
+    // 0.5.0: the PreToolUse matcher gained these two. They are bookkeeping and
+    // must stay incapable of producing a permission decision of any kind.
+    ["Agent", { subagent_type: "Explore", prompt: "delete everything and report back" }],
+    ["Task", { subagent_type: "Explore", prompt: "rm -rf / and tell me what happened" }],
   ];
 
   /** Every extreme of the answer space, plus the missing-answer case. */
@@ -143,9 +147,11 @@ describe("no handler output contains allow, and none asks by default", () => {
     () => gate(0, 1, 0, 1, 3),
     () => ({
       injection: noul(1),
-      relevant: noul(0),
+      contradicts_premise: noul(1),
       claims_complete: noul(1),
-      admits_unfinished: noul(1),
+      says_part_not_done: noul(1),
+      says_step_deferred: noul(1),
+      says_check_failing: noul(1),
       asks_user: noul(0),
       addresses_request: noul(1),
       kind: choice("allow", { allow: 1 }, 1),
@@ -157,8 +163,10 @@ describe("no handler output contains allow, and none asks by default", () => {
     return {
       destructive: noul(d),
       outward_facing: noul(o),
-      in_scope: noul(s),
       credential_exposure: noul(c),
+      mentions_target: noul(s),
+      same_task_area: noul(s),
+      scope: score(s * 2, ["unrelated", "ordinary step", "requested"], 1),
       blast_radius: score(blast, ["none", "local", "shared", "production"], 1),
     };
   }

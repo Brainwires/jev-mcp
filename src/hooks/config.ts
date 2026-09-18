@@ -54,6 +54,16 @@ export interface HookConfig {
   autoThreshold: number;
   reviewThreshold: number;
   /**
+   * The bar a Choice answer's `confidence` has to clear.
+   *
+   * Separate from `autoThreshold` because it is a different kind of quantity.
+   * A Noul's `P(yes)` and a Score level's mass are both probabilities of a
+   * binary event, so they share `auto`/`review`; a Choice's `confidence` is a
+   * peakedness statistic over the option distribution, and holding it to a
+   * probability threshold is a category error that happens to compile.
+   */
+  confidenceThreshold: number;
+  /**
    * Loopback port the daemon listens on.
    *
    * `hooks.json` can interpolate environment variables into *headers* only, so
@@ -74,7 +84,14 @@ export interface HookConfig {
 
 export const HOOK_DEFAULTS = {
   baseUrl: "https://api.typesafe.ai",
-  model: "jev-latest",
+  /**
+   * Pinned, not an alias. `jev-latest` re-points silently when a release
+   * ships, and every probability the thresholds here are tuned against moves
+   * with it — including the ones `/jev:calibrate` replays over a log captured
+   * from a different model. A user who wants to follow releases sets
+   * `jev-latest` deliberately.
+   */
+  model: "jev-1.13.0",
   timeoutMs: 1500,
   maxRetries: 0,
   gate: "advisory" as GateLevel,
@@ -84,6 +101,7 @@ export const HOOK_DEFAULTS = {
   routePrompts: false,
   autoThreshold: 0.85,
   reviewThreshold: 0.6,
+  confidenceThreshold: 0.85,
   daemonPort: DEFAULT_PORT,
   daemonIdleMs: DEFAULT_IDLE_MS,
 } as const;
@@ -217,6 +235,15 @@ export function loadHookConfig(env: Env = process.env): HookConfig {
     routePrompts: readBool(env, "route_prompts", HOOK_DEFAULTS.routePrompts, warnings, "JEV_ROUTE_PROMPTS"),
     autoThreshold: auto,
     reviewThreshold: Math.min(review, auto),
+    confidenceThreshold: readNumber(
+      env,
+      "confidence_threshold",
+      HOOK_DEFAULTS.confidenceThreshold,
+      0.5,
+      0.99,
+      warnings,
+      "JEV_CONFIDENCE_THRESHOLD",
+    ),
     // Port 0 is allowed and means "ask the OS": the tests use it so they never
     // touch the real port, and nothing in a normal install sets it.
     daemonPort: readNumber(env, "daemon_port", HOOK_DEFAULTS.daemonPort, 0, 65_535, warnings, "JEV_DAEMON_PORT"),

@@ -65,6 +65,40 @@ function patternTrip(prefilter: string, overrides: Partial<DecisionRecord> = {})
   return base;
 }
 
+/** A judged Stop record, with whichever signals the case is about. */
+function stopRecord(signals: Record<string, number>): DecisionRecord {
+  return {
+    ts: new Date(NOW - 60_000).toISOString(),
+    session_id: "s1",
+    event: "Stop",
+    decision: "allow",
+    signals: { claims_complete: 0.5, addresses_request: 0.9, claims_verified: 0.02, ...signals },
+  };
+}
+
+/** A judged PostToolUse screen. */
+function screenRecord(signals: Record<string, number>): DecisionRecord {
+  return {
+    ts: new Date(NOW - 60_000).toISOString(),
+    session_id: "s1",
+    event: "PostToolUse",
+    tool_name: "WebFetch",
+    decision: "clean",
+    signals,
+  };
+}
+
+/** A judged prompt classification. */
+function kindRecord(confidence: number): DecisionRecord {
+  return {
+    ts: new Date(NOW - 60_000).toISOString(),
+    session_id: "s1",
+    event: "UserPromptSubmit",
+    decision: confidence >= 0.85 ? "multi_file_implementation" : "low-confidence",
+    signals: { kind_confidence: confidence, ambiguity: 0.4 },
+  };
+}
+
 function prompt(offsetMs: number): DecisionRecord {
   return {
     ts: new Date(NOW - offsetMs).toISOString(),
@@ -380,10 +414,134 @@ describe("calibrateReport", () => {
       }),
     );
     const report = calibrateReport(testConfig(dir), store);
-    expect(report).toContain("5. Replay at other auto thresholds");
+    expect(report).toContain("5. Replay at other thresholds, over your own log");
+    expect(report).toContain("5a gate");
     expect(report).toMatch(/auto 0\.85: 1 notes \+ 0 trips = 1/);
     expect(report).toMatch(/auto 0\.95: 1 notes \+ 0 trips = 1/);
     expect(report).toContain("the per-session duplicate check and the five-note");
+  });
+
+  /**
+   * Section 5 replays four events now, not one. The point of each of the three
+   * new ones is the same as the gate's: the log carries what the decision was
+   * made from, so the report re-runs the pure function rather than estimating.
+   */
+  describe("the four replays", () => {
+    it("says plainly when an event has no records to replay", () => {
+      store.append(record());
+      const report = calibrateReport(testConfig(dir), store);
+      expect(report).toContain("5b stop (0 judged)");
+      expect(report).toContain("5c screen (0 judged)");
+      expect(report).toContain("5d prompt kind");
+      expect(report).toContain("route_prompts is off unless you turned it on");
+    });
+
+    it("replays the stop check over the three unfinished Nouls", () => {
+      store.append(stopRecord({ says_part_not_done: 0.9, asks_user: 0.02 }));
+      store.append(stopRecord({ says_check_failing: 0.99, asks_user: 0.02 }));
+      store.append(stopRecord({ says_part_not_done: 0.2, asks_user: 0.02 }));
+      const report = calibrateReport(testConfig(dir), store);
+      expect(report).toContain("5b stop (3 judged)");
+      expect(report).toContain("auto 0.85: 2 blocks of 3");
+      expect(report).toContain("auto 0.95: 1 blocks of 3");
+      expect(report).toContain("which is session state and not in this log");
+    });
+
+    /** A record written before 0.5.0 has the compound question, and only that. */
+    it("replays a legacy stop record off admits_unfinished", () => {
+      store.append(stopRecord({ admits_unfinished: 0.95, asks_user: 0.02 }));
+      store.append(stopRecord({ admits_unfinished: 0.95, asks_user: 0.9 }));
+      const report = calibrateReport(testConfig(dir), store);
+      expect(report).toContain("auto 0.85: 1 blocks of 2");
+    });
+
+    it("replays the screen in the cascade's order", () => {
+      store.append(screenRecord({ injection: 0.96 }));
+      store.append(screenRecord({ injection: 0.1, contradicts_premise: 0.93 }));
+      store.append(screenRecord({ injection: 0.02, contradicts_premise: 0.02 }));
+      const report = calibrateReport(testConfig(dir), store);
+      expect(report).toContain("5c screen (3 judged)");
+      expect(report).toContain("auto 0.85: 1 flagged + 1 contradictions of 3");
+    });
+
+    it("replays the prompt kind against the confidence bar, not the auto bar", () => {
+      store.append(kindRecord(0.97));
+      store.append(kindRecord(0.72));
+      const report = calibrateReport(testConfig(dir), store);
+      expect(report).toContain("5d prompt kind (currently confidence 0.85; 2 judged)");
+      expect(report).toContain("confidence 0.70: 2 printed of 2");
+      expect(report).toContain("confidence 0.85: 1 printed of 2");
+    });
+
+    /**
+     * A record logged before 0.5.0 carries neither `blast_p_high` nor
+     * `mentions_target`, and has to replay on the rules it actually decided
+     * on: the expectation, and an un-vetoed out-of-scope reading.
+     */
+    it("replays a legacy gate record on the expectation rule", () => {
+      // A wide-radius note: unrequested, nothing else firing.
+      store.append(
+        record({
+          decision: "note",
+          firm: ["wide"],
+          signals: {
+            destructive: 0.02,
+            outward_facing: 0.02,
+            in_scope: 0.3,
+            credential_exposure: 0.01,
+            blast_radius: 2.4,
+          },
+        }),
+      );
+      expect(calibrateReport(testConfig(dir), store)).toMatch(/auto 0\.85: 1 notes \+ 0 trips = 1/);
+    });
+
+    it("uses blast_p_high when the record has it", () => {
+      store.append(
+        record({
+          decision: "note",
+          firm: ["wide"],
+          signals: {
+            destructive: 0.02,
+            outward_facing: 0.02,
+            in_scope: 0.3,
+            credential_exposure: 0.01,
+            blast_radius: 2.4,
+            // The same expectation, with most of its mass on the narrow
+            // levels: not wide, so the note the 0.3 rule called for goes away.
+            blast_p_high: 0.3,
+          },
+        }),
+      );
+      expect(calibrateReport(testConfig(dir), store)).toMatch(/auto 0\.85: 0 notes \+ 0 trips = 0/);
+    });
+
+    it("shows the 0.5.0 scope histograms only when a record carries them", () => {
+      store.append(record());
+      expect(calibrateReport(testConfig(dir), store)).not.toContain("scope_unrelated");
+
+      store.append(
+        record({
+          fingerprint: "3333",
+          signals: {
+            destructive: 0.95,
+            outward_facing: 0.02,
+            in_scope: 0.9,
+            credential_exposure: 0.01,
+            blast_radius: 1.2,
+            scope_unrelated: 0.1,
+            scope_step: 0.8,
+            scope_requested: 0.1,
+            mentions_target: 0.7,
+            same_task_area: 0.9,
+          },
+        }),
+      );
+      const report = calibrateReport(testConfig(dir), store);
+      expect(report).toContain("scope_unrelated");
+      expect(report).toContain("mentions_target");
+      expect(report).toContain("same_task_area agrees with scope_step on 1/1");
+    });
   });
 
   it("writes a zero delta as 0%, not -0%", () => {

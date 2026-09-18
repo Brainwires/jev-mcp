@@ -29096,7 +29096,13 @@ function enforceSelection(selection, options = {}) {
 // src/config.ts
 var DEFAULTS = {
   baseUrl: "https://api.typesafe.ai",
-  model: "jev-latest",
+  /**
+   * Pinned: an alias move would shift every probability under thresholds the
+   * caller has tuned. `JEV_MODEL=jev-latest` opts back into following
+   * releases. The library's own default (`src/jev/client.ts`) stays the alias —
+   * a library user picks their own policy.
+   */
+  model: "jev-1.13.0",
   timeoutMs: 3e4,
   maxRetries: 3,
   autoThreshold: 0.85,
@@ -29140,7 +29146,10 @@ function loadConfig(env = process.env) {
   return {
     apiKey: apiKeyRaw === void 0 || apiKeyRaw === "" ? null : apiKeyRaw,
     baseUrl: readString(env, "TYPESAFE_BASE_URL", DEFAULTS.baseUrl).replace(/\/+$/, ""),
-    model: readString(env, "JEV_MODEL", DEFAULTS.model),
+    // The plugin manifest exports its `model` option here too, so the setting
+    // means the same thing to the server as it does to the hooks. An empty or
+    // unsubstituted option falls through to the env var and then the default.
+    model: firstKey(env.CLAUDE_PLUGIN_OPTION_MODEL) ?? readString(env, "JEV_MODEL", DEFAULTS.model),
     timeoutMs: readNumber(env, "JEV_TIMEOUT_MS", DEFAULTS.timeoutMs, 1, 6e5),
     maxRetries: readNumber(env, "JEV_MAX_RETRIES", DEFAULTS.maxRetries, 0, 10),
     thresholds: { auto, review },
@@ -29178,7 +29187,14 @@ var GATE_MODE_MIGRATION = {
 };
 var HOOK_DEFAULTS = {
   baseUrl: "https://api.typesafe.ai",
-  model: "jev-latest",
+  /**
+   * Pinned, not an alias. `jev-latest` re-points silently when a release
+   * ships, and every probability the thresholds here are tuned against moves
+   * with it — including the ones `/jev:calibrate` replays over a log captured
+   * from a different model. A user who wants to follow releases sets
+   * `jev-latest` deliberately.
+   */
+  model: "jev-1.13.0",
   timeoutMs: 1500,
   maxRetries: 0,
   gate: "advisory",
@@ -29188,6 +29204,7 @@ var HOOK_DEFAULTS = {
   routePrompts: false,
   autoThreshold: 0.85,
   reviewThreshold: 0.6,
+  confidenceThreshold: 0.85,
   daemonPort: DEFAULT_PORT,
   daemonIdleMs: DEFAULT_IDLE_MS
 };
@@ -29287,6 +29304,15 @@ function loadHookConfig(env = process.env) {
     routePrompts: readBool(env, "route_prompts", HOOK_DEFAULTS.routePrompts, warnings, "JEV_ROUTE_PROMPTS"),
     autoThreshold: auto,
     reviewThreshold: Math.min(review, auto),
+    confidenceThreshold: readNumber2(
+      env,
+      "confidence_threshold",
+      HOOK_DEFAULTS.confidenceThreshold,
+      0.5,
+      0.99,
+      warnings,
+      "JEV_CONFIDENCE_THRESHOLD"
+    ),
     // Port 0 is allowed and means "ask the OS": the tests use it so they never
     // touch the real port, and nothing in a normal install sets it.
     daemonPort: readNumber2(env, "daemon_port", HOOK_DEFAULTS.daemonPort, 0, 65535, warnings, "JEV_DAEMON_PORT"),
@@ -29452,7 +29478,7 @@ function openLog(dataDir) {
 }
 
 // src/hooks/version.ts
-var HOOK_VERSION = "0.4.1";
+var HOOK_VERSION = "0.5.0";
 
 // src/hooks/daemon/control.ts
 function isAlive(pid) {
@@ -38154,6 +38180,35 @@ function gate(value, thresholds = DEFAULT_THRESHOLDS) {
 function gateChoice(answer, thresholds = DEFAULT_THRESHOLDS) {
   return gate(answer.confidence, thresholds);
 }
+function levelMass(answer, levels) {
+  const probabilities = answer.probabilities;
+  if (probabilities === null || typeof probabilities !== "object") return void 0;
+  const keys = Object.keys(probabilities);
+  if (keys.length === 0) return void 0;
+  let mass = 0;
+  for (const level of levels) {
+    const value = probabilities[String(level)];
+    if (typeof value === "number" && Number.isFinite(value)) mass += value;
+  }
+  return Math.round(Math.min(1, Math.max(0, mass)) * 1e4) / 1e4;
+}
+function topLevel(answer) {
+  const probabilities = answer.probabilities;
+  if (probabilities !== null && typeof probabilities === "object") {
+    let best;
+    for (const [key, value] of Object.entries(probabilities)) {
+      const level2 = Number(key);
+      if (!Number.isInteger(level2) || typeof value !== "number" || !Number.isFinite(value)) continue;
+      if (best === void 0 || value > best.p || value === best.p && level2 < best.level) {
+        best = { level: level2, p: value };
+      }
+    }
+    if (best !== void 0) return best;
+  }
+  const score = typeof answer.score === "number" && Number.isFinite(answer.score) ? answer.score : 0;
+  const level = Math.round(score);
+  return { level, p: Math.min(1, Math.max(0, 1 - Math.abs(score - level))) };
+}
 function gateNoul(noul3, thresholds = DEFAULT_THRESHOLDS) {
   const certainty = Math.max(noul3, 1 - noul3);
   const direction = noul3 >= 0.5 ? "yes" : "no";
@@ -38196,35 +38251,48 @@ function toState(value) {
 function toInstructions(value) {
   return value;
 }
+function toEntry(value) {
+  return value;
+}
 function toQuestion(input2) {
   switch (input2.type) {
-    case "choice":
-      return { type: "choice", instructions: toInstructions(input2.instructions), criteria: input2.criteria };
+    case "choice": {
+      const criteria = {};
+      for (const [option, entry] of Object.entries(input2.criteria)) criteria[option] = toEntry(entry);
+      return { type: "choice", instructions: toInstructions(input2.instructions), criteria };
+    }
     case "score":
-      return { type: "score", instructions: toInstructions(input2.instructions), criteria: input2.criteria };
+      return {
+        type: "score",
+        instructions: toInstructions(input2.instructions),
+        criteria: input2.criteria.map((entry) => toEntry(entry))
+      };
     case "noul": {
       const criteria = {};
-      if (input2.criteria?.true !== void 0) criteria.true = input2.criteria.true;
-      if (input2.criteria?.false !== void 0) criteria.false = input2.criteria.false;
+      if (input2.criteria?.true !== void 0) criteria.true = toEntry(input2.criteria.true);
+      if (input2.criteria?.false !== void 0) criteria.false = toEntry(input2.criteria.false);
       const question = { type: "noul", instructions: toInstructions(input2.instructions) };
       return Object.keys(criteria).length === 0 ? question : { ...question, criteria };
     }
   }
 }
+var entrySchema = external_exports.union([external_exports.string(), external_exports.array(external_exports.unknown()), external_exports.record(external_exports.string(), external_exports.unknown()), external_exports.null()]).describe(
+  "A rubric entry: a string, or JSON structure such as {what, not_for, examples} / {summary, signals}."
+);
 var choiceQuestionSchema = external_exports.object({
   type: external_exports.literal("choice"),
   instructions: instructionsSchema,
-  criteria: external_exports.record(external_exports.string(), external_exports.string().nullable()).describe("option -> rubric. Use null when the option name says it all. At least 2 options; add an 'other'/'none' escape hatch.")
+  criteria: external_exports.record(external_exports.string(), entrySchema).describe("option -> rubric. Use null when the option name says it all. At least 2 options; add an 'other'/'none' escape hatch.")
 });
 var scoreQuestionSchema = external_exports.object({
   type: external_exports.literal("score"),
   instructions: instructionsSchema,
-  criteria: external_exports.array(external_exports.string()).describe("Ordered level descriptions, lowest first. At least 2.")
+  criteria: external_exports.array(entrySchema).min(2).describe("Ordered level descriptions, lowest first. At least 2.")
 });
 var noulQuestionSchema = external_exports.object({
   type: external_exports.literal("noul"),
   instructions: instructionsSchema,
-  criteria: external_exports.object({ true: external_exports.string().optional(), false: external_exports.string().optional() }).optional().describe("Optional clarification of what yes and no mean. Keep them aligned with the instructions.")
+  criteria: external_exports.object({ true: entrySchema.optional(), false: entrySchema.optional() }).optional().describe("Optional clarification of what yes and no mean. Keep them aligned with the instructions.")
 });
 var questionSchema = external_exports.discriminatedUnion("type", [
   choiceQuestionSchema,
@@ -38259,17 +38327,15 @@ function sumUsage(parts) {
 // src/tools/evaluate.ts
 var name = "jev_evaluate";
 var description = [
-  "Ask Jev \u2014 a fast, calibrated judgment model \u2014 many typed questions about one shared state; returns probabilities plus a gate computed in code.",
-  "Use it for any judgment you want to branch on when no other jev_* tool fits.",
+  "Ask Jev \u2014 a fast, calibrated judgment model \u2014 many typed questions about one shared state; returns probabilities plus a gate computed in code. Use it when no other jev_* tool fits.",
   "Writing questions (Jev reads literally):",
-  "- State the exact condition in `instructions`; put boundary cases in `criteria`. If you would have to explain what you really meant, that explanation belongs in the instruction.",
+  "- State the exact condition in `instructions`; put boundary cases in `criteria`.",
+  "- Criteria accept JSON: Choice options and Noul sides as {what, not_for, examples}; Score levels as {summary, signals}. Put lookalike cases under not_for on the side they would wrongly land on.",
   "- One judgment per question; split compound ones and combine in code.",
   "- Batch every question sharing a state into ONE call. They run in parallel and cost only their own tokens, so speculative questions are nearly free.",
   "- Send only the state the question needs; point at parts by path, e.g. `ticket.messages[0].text`.",
-  "- Choice: list every option, plus an `other`/`none` escape hatch.",
   "- Never ask it to count, do arithmetic, or compare dates/numbers \u2014 compute those in code and pass the result in.",
-  "- It selects from your options; it never generates text.",
-  "Answers: `noul` is P(yes), ~0.5 means unsure; choice/score carry `confidence`; `gate` is auto/review/escalate.",
+  "Answers: it selects from your options and never generates text; `noul` is P(yes), ~0.5 means unsure; choice/score carry `confidence`; `gate` is auto/review/escalate.",
   "Budget: ~64k tokens state + all questions, ~32k state + longest question."
 ].join("\n");
 var inputShape = {
@@ -38343,51 +38409,283 @@ function augment(answer, thresholds) {
 var name2 = "jev_gate_action";
 var DECISIONS = ["allow", "confirm", "block"];
 var HIGH_BLAST_RADIUS = 2;
-var BLAST_RADIUS_LEVELS = [
-  "No effect outside this conversation: reading, listing, searching, or computing something.",
-  "Affects only files or state the user is directly working on, and the change is easy to undo.",
-  "Affects shared project state or many files at once: a commit, a dependency change, a schema migration, a bulk edit.",
-  "Affects production, other people, or anything beyond this machine: a deploy, a sent message, a payment, published data, deleted history."
-];
 var QUESTIONS = {
   destructive: {
     type: "noul",
-    instructions: "Does `action` delete, overwrite, or irreversibly change data or state that already exists?",
+    instructions: {
+      question: "Does `action` delete, overwrite, or irreversibly change a file, a git ref, a database, or other state that existed before it ran?",
+      inspect: "action",
+      focus: "Judge the command or edit as written. Creating something new, or a change that git, an undo, or a re-run can put back, is not destructive."
+    },
     criteria: {
-      true: "Running `action` destroys or replaces something that exists, and getting it back would need a backup or a rewrite.",
-      false: "`action` only reads, lists, or adds something new, or any change it makes is trivially reversible."
+      true: {
+        what: "Something that existed before is removed or replaced, and getting it back would need a backup, a reflog, or a rewrite.",
+        examples: [
+          "rm -rf dist",
+          "git reset --hard HEAD~3",
+          "git push --force origin main",
+          "git branch -D feature",
+          "DROP TABLE users",
+          "Write replacing the whole content of an existing tracked file",
+          "sed -i 's/a/b/' src/app.ts",
+          "echo '' > app.log"
+        ]
+      },
+      false: {
+        what: "Only reads, lists, searches, builds, or computes; or creates something new; or changes something that is easy to put back.",
+        not_for: "Replacing the whole content of a file that already exists.",
+        examples: [
+          "cat config.json",
+          "git status",
+          "npm test",
+          "mkdir -p out",
+          "Write to a path that does not exist yet",
+          "Edit that replaces one passage and keeps the rest of the file",
+          "git commit -m 'fix'",
+          "rm -rf node_modules && npm install"
+        ]
+      }
     }
   },
   outward_facing: {
     type: "noul",
-    instructions: "Does `action` send, publish, spend, or otherwise affect other people or systems outside the machine it runs on?",
+    instructions: {
+      question: "Does `action` send data, publish, deploy, spend money, or change anything that people or systems outside this machine can see?",
+      inspect: "action",
+      focus: "Look at where the effect lands, not at whether the network is used. Downloading, fetching, and cloning only bring data in."
+    },
     criteria: {
-      true: "`action` transmits something outward, spends money, or changes state that other people can see.",
-      false: "`action`'s effects stay on the local machine. Read-only network fetches count as false."
-    }
-  },
-  in_scope: {
-    type: "noul",
-    instructions: "Does `user_request` ask for `action`, or plainly require it as a step?",
-    criteria: {
-      true: "`action` is something `user_request` asked for, or an obvious step towards it.",
-      false: "`action` goes beyond `user_request`, or is about something `user_request` never mentioned."
+      true: {
+        what: "Something leaves this machine or changes a shared remote: a push, a publish, a deploy, a message, an email, a payment, a pull request, an issue comment, a DNS or cloud change.",
+        examples: [
+          "git push origin main",
+          "npm publish",
+          "gh pr create",
+          "curl -X POST https://api.example.com/deploy",
+          "aws s3 cp build s3://prod-bucket",
+          "sending a Slack message"
+        ]
+      },
+      false: {
+        what: "The effect stays on this machine, or the network is used only to read.",
+        not_for: "Pushing, publishing, deploying, or posting.",
+        examples: [
+          "git fetch",
+          "npm install",
+          "curl https://example.com/docs",
+          "git commit -m 'wip'",
+          "docker build ."
+        ]
+      }
     }
   },
   credential_exposure: {
     type: "noul",
-    instructions: "Does `action` read, transmit, or print a secret such as an API key, password, access token, private key, or credentials file?",
+    instructions: {
+      question: "Does `action` read, print, copy, or send a secret value, or a file whose purpose is to hold secrets?",
+      inspect: "action",
+      focus: "The secret has to be exposed, not merely named. Checking that a variable is set, or measuring its length, does not expose it."
+    },
     criteria: {
-      true: "A secret value, or a file whose purpose is holding secrets, is read, sent somewhere, or written into output.",
-      false: "`action` does not touch secret values."
+      true: {
+        what: "A password, API key, token, private key, or a secrets file is printed, copied, uploaded, or written somewhere other than where it lives.",
+        not_for: "Checking that a secret is set, or measuring its length, without printing it.",
+        examples: [
+          "cat ~/.aws/credentials",
+          "echo $TYPESAFE_API_KEY",
+          "printenv | grep KEY",
+          "cat .env",
+          "curl -H 'Authorization: Bearer sk-live-\u2026' with the key written into the command",
+          "Write .env with an API key in the content"
+        ]
+      },
+      false: {
+        what: "No secret value is exposed, even when a secret's name appears.",
+        examples: [
+          'test -n "$API_KEY" && echo set',
+          "printenv TYPESAFE_API_KEY | wc -c",
+          "grep -c KEY .env",
+          "ls ~/.ssh",
+          "git status"
+        ]
+      }
     }
   },
   blast_radius: {
     type: "score",
-    instructions: "How far do the effects of `action` reach?",
-    criteria: BLAST_RADIUS_LEVELS
+    instructions: {
+      question: "How far does the effect of `action` reach?",
+      inspect: "action",
+      focus: "Pick the level that describes the widest thing the action changes. Reading and computing reach nowhere."
+    },
+    criteria: [
+      {
+        summary: "Nothing outside this conversation changes.",
+        signals: [
+          "reads, lists, searches, or computes something",
+          "builds or tests in place without deploying",
+          "output goes to the terminal only"
+        ]
+      },
+      {
+        summary: "Only files or state inside the working directory, easy to put back.",
+        signals: [
+          "an edit, a write, or a delete inside the project",
+          "a git commit on a local branch",
+          "a temp file or a scratch directory"
+        ]
+      },
+      {
+        summary: "Shared project state, or many files at once.",
+        signals: [
+          "a dependency added, removed, or upgraded",
+          "a schema migration",
+          "a bulk find-and-replace across the tree",
+          "git rebase, reset --hard, or a branch delete",
+          "a global config, dotfile, or install under the home directory"
+        ]
+      },
+      {
+        summary: "Production, other people, or anything beyond this machine.",
+        signals: [
+          "a deploy, publish, or push to a shared remote",
+          "a sent message, email, or comment",
+          "a payment or a cloud resource change",
+          "history deleted on a remote",
+          "data other people rely on"
+        ]
+      }
+    ]
+  },
+  mentions_target: {
+    type: "noul",
+    instructions: {
+      question: "Does `request.latest`, or any entry of `request.previous`, name the file, directory, command, branch, package, URL, or service that `action` acts on?",
+      compare: ["action.target_paths", "action.command", "action.file_path", "request.latest", "request.previous"],
+      focus: "A match is the same name, path, or command word appearing on both sides."
+    },
+    criteria: {
+      true: {
+        what: "A name that appears in `action` also appears in a request.",
+        not_for: "A general phrase such as 'the tests' or 'the plugin' standing in for a name.",
+        examples: [
+          "request: 'fix tests/hooks/wording.test.ts'; action edits tests/hooks/wording.test.ts",
+          "request: 'push it'; action: git push",
+          "request: 'bump vitest'; action: npm install vitest@latest",
+          "request: 'delete the build folder'; action: rm -rf build"
+        ]
+      },
+      false: {
+        what: "Nothing `action` acts on is named in any request.",
+        examples: [
+          "request: 'why does the build fail?'; action: git push origin main",
+          "request: 'update the README'; action edits src/server.ts",
+          "request: 'run the tests'; action: rm -rf ~/.cache"
+        ]
+      }
+    }
+  },
+  same_task_area: {
+    type: "noul",
+    instructions: {
+      question: "Does `action` touch the same part of the project that `request.latest` is about: the same files, directory, tool, or subsystem?",
+      compare: ["action", "request.latest"],
+      focus: "Judge the area, not the operation. Reading, editing, or running things in the area the request is about all count."
+    },
+    criteria: {
+      true: {
+        what: "`action` operates in the files, directory, or subsystem the request is about.",
+        examples: [
+          "request: 'fix the wording tests'; action: npx vitest run tests/hooks/wording.test.ts",
+          "request: 'fix the daemon startup'; action reads src/hooks/daemon/control.ts",
+          "request: 'the README install section is stale'; action edits README.md"
+        ]
+      },
+      false: {
+        what: "`action` operates somewhere the request does not concern.",
+        examples: [
+          "request: 'fix the wording tests'; action edits ~/.zshrc",
+          "request: 'explain how the tripwire works'; action: git push",
+          "request: 'rename a variable in store.ts'; action: npm publish"
+        ]
+      }
+    }
+  },
+  scope: {
+    type: "score",
+    instructions: {
+      question: "How does `action` relate to the work `request.latest` asks for?",
+      compare: ["action", "request.latest", "request.previous"],
+      focus: "Read the latest request first; earlier requests are context for it. Judge the operation and its target together."
+    },
+    criteria: [
+      {
+        summary: "Unrelated: no request asks for this action, and the requested work does not need it.",
+        signals: [
+          "a different file, directory, repository, or service from anything the requests mention",
+          "an operation the requests do not call for: pushing when asked to fix a test, deleting when asked to read, installing when asked to explain",
+          "work on a task the user has not brought up"
+        ]
+      },
+      {
+        summary: "An ordinary step of the requested work, not named in any request.",
+        signals: [
+          "reading, listing, or searching files in order to do the requested work",
+          "running the tests, the build, or the type-check after a requested change",
+          "editing a file in the area the request is about",
+          "writing a scratch or temp file while working",
+          "a git commit of the requested change"
+        ]
+      },
+      {
+        summary: "Explicitly requested: a request asks for this action, or names its target and this operation.",
+        signals: [
+          "the request names the command, file, or change, and this action does exactly that",
+          "`request.latest` is a short go-ahead such as 'yes', 'go', or 'ship it' and an entry of `request.previous` describes this action",
+          "the request says to delete, push, publish, install, or deploy the thing this action deletes, pushes, publishes, installs, or deploys"
+        ]
+      }
+    ]
   }
 };
+var SCOPE_UNRELATED = 0;
+var SCOPE_STEP = 1;
+var SCOPE_REQUESTED = 2;
+var WIDE_BLAST_LEVELS = [2, 3];
+function scopeFromAnswer(answer, legacyNoul) {
+  if (answer !== void 0 && answer.type === "score") {
+    const unrelated = levelMass(answer, [SCOPE_UNRELATED]);
+    if (unrelated !== void 0) {
+      const step2 = levelMass(answer, [SCOPE_STEP]) ?? 0;
+      const requested = levelMass(answer, [SCOPE_REQUESTED]) ?? 0;
+      return {
+        unrelated,
+        step: step2,
+        requested,
+        in_scope: levelMass(answer, [SCOPE_STEP, SCOPE_REQUESTED]) ?? 0,
+        source: "probabilities"
+      };
+    }
+    if (typeof answer.score === "number" && Number.isFinite(answer.score)) {
+      const score = Math.min(SCOPE_REQUESTED, Math.max(SCOPE_UNRELATED, answer.score));
+      const unrelatedMass = Math.max(0, 1 - score);
+      const requestedMass = Math.max(0, score - 1);
+      const stepMass = Math.max(0, 1 - unrelatedMass - requestedMass);
+      return {
+        unrelated: unrelatedMass,
+        step: stepMass,
+        requested: requestedMass,
+        in_scope: stepMass + requestedMass,
+        source: "expectation"
+      };
+    }
+  }
+  const p = typeof legacyNoul === "number" && Number.isFinite(legacyNoul) ? legacyNoul : 0.5;
+  return { unrelated: 1 - p, step: p, requested: 0, in_scope: p, source: "expectation" };
+}
+function isWide(blastRadius, pHigh, auto) {
+  return pHigh !== void 0 ? pHigh >= auto : blastRadius >= HIGH_BLAST_RADIUS;
+}
 var RISK_SIGNALS = ["destructive", "outward_facing", "credential_exposure"];
 var SIGNAL_NAMES = ["destructive", "outward_facing", "in_scope", "credential_exposure"];
 function leansRisky(signal, p) {
@@ -38401,7 +38699,7 @@ function gateActionPolicy(input2) {
   const { signals } = input2;
   const corroborateUncertain = input2.options?.corroborateUncertain === true;
   const requested = input2.options?.trustRequested === true && !ignoreScope && signals.in_scope >= input2.thresholds.review && signals.destructive < 0.5 && signals.credential_exposure < 0.5;
-  const wideBlast = input2.blast_radius >= HIGH_BLAST_RADIUS;
+  const wideBlast = isWide(input2.blast_radius, input2.blast_p_high, auto);
   const corroborated = corroborateUncertain ? wideBlast || RISK_SIGNALS.some((name7) => signals[name7] >= auto) : wideBlast || RISK_SIGNALS.some((name7) => signals[name7] >= 0.5);
   const leans = {
     destructive: lean(input2.signals.destructive, auto),
@@ -38416,9 +38714,12 @@ function gateActionPolicy(input2) {
   }
   if (leans.credential_exposure === "yes") reasons.push("The action touches credentials or secret values.");
   if (wideBlast && !requested) {
-    reasons.push(`The blast radius is wide (${input2.blast_radius.toFixed(2)} of 3).`);
+    reasons.push(
+      input2.blast_p_high === void 0 ? `The blast radius is wide (${input2.blast_radius.toFixed(2)} of 3).` : `The blast radius is wide (p=${input2.blast_p_high.toFixed(2)} on its top two levels).`
+    );
   }
-  const outOfScope = !ignoreScope && leans.in_scope === "no";
+  const namedTarget = input2.mentions_target !== void 0 && input2.mentions_target >= auto;
+  const outOfScope = !ignoreScope && leans.in_scope === "no" && !namedTarget;
   if (outOfScope) reasons.push("The action does not look like something the user asked for.");
   const uncertainSignals = SIGNAL_NAMES.filter((signal) => {
     if (leans[signal] !== "uncertain") return false;
@@ -38460,29 +38761,54 @@ function gateActionPolicy(input2) {
 }
 async function runGateAction(model, input2, config2, signal) {
   const thresholds = resolveThresholds(config2.thresholds, input2.thresholds);
-  const state = { action: input2.action, user_request: input2.user_request };
-  if (input2.context !== void 0) state.context = input2.context;
+  const state = {
+    action: actionState(input2.action),
+    request: requestState(input2.user_request)
+  };
+  const context = contextState(input2.context);
+  if (context !== void 0) state.context = context;
   const request2 = { state, questions: QUESTIONS };
   if (signal !== void 0) request2.signal = signal;
   const result = await model.evaluate(request2);
   const answers = result.answers;
+  const legacy = answers.in_scope;
+  const split = scopeFromAnswer(
+    answers.scope !== void 0 && answers.scope.type === "score" ? answers.scope : void 0,
+    legacy !== void 0 && legacy.type === "noul" ? legacy.noul : void 0
+  );
+  const scope = {
+    unrelated: split.unrelated,
+    step: split.step,
+    requested: split.requested,
+    mentions_target: noul(answers.mentions_target),
+    same_task_area: noul(answers.same_task_area),
+    source: split.source
+  };
   const signals = {
     destructive: noul(answers.destructive),
     outward_facing: noul(answers.outward_facing),
-    in_scope: noul(answers.in_scope),
+    in_scope: split.in_scope,
     credential_exposure: noul(answers.credential_exposure)
   };
-  const blast = answers.blast_radius;
+  const blast = answers.blast_radius !== void 0 && answers.blast_radius.type === "score" ? answers.blast_radius : void 0;
   const blastScore = typeof blast?.score === "number" ? blast.score : HIGH_BLAST_RADIUS;
+  const blastPHigh = blast === void 0 ? void 0 : levelMass(blast, WIDE_BLAST_LEVELS);
+  const top = blast === void 0 ? { level: HIGH_BLAST_RADIUS, p: 0 } : topLevel(blast);
   const policy = gateActionPolicy({
     signals,
     blast_radius: blastScore,
+    ...blastPHigh !== void 0 ? { blast_p_high: blastPHigh } : {},
+    mentions_target: scope.mentions_target,
     thresholds,
     options: input2.policy ?? config2.gatePolicy
   });
   const blastOut = {
     score: blastScore,
-    confidence: typeof blast?.confidence === "number" ? blast.confidence : 0
+    confidence: typeof blast?.confidence === "number" ? blast.confidence : 0,
+    level: top.level,
+    p_level: top.p,
+    ...blastPHigh !== void 0 ? { p_high: blastPHigh } : {},
+    source: blastPHigh === void 0 ? "expectation" : "probabilities"
   };
   if (blast?.legend !== void 0) blastOut.legend = blast.legend;
   return {
@@ -38491,6 +38817,7 @@ async function runGateAction(model, input2, config2, signal) {
     signals,
     signal_leans: policy.leans,
     blast_radius: blastOut,
+    scope,
     thresholds,
     model: result.model,
     usage: result.usage,
@@ -38501,19 +38828,78 @@ async function runGateAction(model, input2, config2, signal) {
 function noul(answer) {
   return answer !== void 0 && answer.type === "noul" && typeof answer.noul === "number" ? answer.noul : 0.5;
 }
+function compact(record2) {
+  const out = {};
+  for (const [key, value] of Object.entries(record2)) {
+    if (value !== void 0) out[key] = value;
+  }
+  return out;
+}
+function actionState(action) {
+  if (typeof action === "string") return { tool: "(unspecified)", text: action, target_paths: [] };
+  return compact({
+    tool: action.tool,
+    command: action.command,
+    file_path: action.file_path,
+    old_string: action.old_string,
+    new_string: action.new_string,
+    content_head: action.content_head,
+    content_chars: action.content_chars,
+    input: action.input,
+    target_paths: action.target_paths,
+    text: action.text
+  });
+}
+function requestState(request2) {
+  if (typeof request2 === "string") return { latest: request2, previous: [] };
+  return { latest: request2.latest, previous: request2.previous };
+}
+function contextState(context) {
+  if (context === void 0) return void 0;
+  if (typeof context === "string") return { notes: context };
+  const compacted = compact({
+    cwd: context.cwd,
+    subagent: context.subagent,
+    permission_mode: context.permission_mode,
+    notes: context.notes
+  });
+  return Object.keys(compacted).length === 0 ? void 0 : compacted;
+}
 
 // src/tools/gate-action.ts
 var description2 = [
-  "Advisory pre-flight check on an action you are about to take: judges whether it is destructive, outward-facing, in scope for what the user asked, and whether it touches credentials, plus how wide its blast radius is \u2014 then returns allow / confirm / block from a deterministic policy in code.",
+  "Advisory pre-flight check on an action you are about to take: judges whether it is destructive, outward-facing or credential-touching, how far it reaches, and how it relates to what the user asked for \u2014 then returns allow / confirm / block from a deterministic policy in code.",
   "NOT A SECURITY BOUNDARY. It is a judgment layer that catches plausible mistakes, and Jev is not hardened against adversarial text: an action or context written to argue for its own approval can shift the result. Never rely on it to contain untrusted input, and never let `allow` stand in for a real permission check.",
-  "Use it just before something you cannot cheaply undo: deleting or overwriting files, git history rewrites, installs, deploys, sending messages, spending money, anything touching an external system.",
-  "Pass `action` as the concrete thing you are about to do, including tool name and arguments \u2014 not a paraphrase. Pass `user_request` in the user's own words.",
-  "`confirm` means ask the user first. `block` means it looks both out of scope and consequential; re-read the request rather than retrying."
+  "Use it just before something you cannot cheaply undo: deleting or overwriting files, git history rewrites, installs, deploys, messages, payments, anything touching an external system.",
+  "Pass `action` as the concrete call, not a paraphrase: one line with the tool name and arguments, or the fields `{tool, command, file_path, target_paths, \u2026}`, which scores scope better. Pass `user_request` in the user's own words, as a string or `{latest, previous}`.",
+  "`confirm` means ask the user first. `block` means it looks both unrelated to the request and consequential; re-read the request rather than retrying."
 ].join("\n");
+var actionObjectSchema = external_exports.object({
+  tool: external_exports.string().min(1).describe("The tool name, e.g. Bash, Write, or an mcp__ tool."),
+  command: external_exports.string().optional().describe("Bash: the command as written."),
+  file_path: external_exports.string().optional(),
+  old_string: external_exports.string().optional(),
+  new_string: external_exports.string().optional(),
+  content_head: external_exports.string().optional().describe("Write: the head of the content."),
+  content_chars: external_exports.number().optional(),
+  input: external_exports.record(external_exports.string(), external_exports.unknown()).optional().describe("Anything else the tool was given."),
+  target_paths: external_exports.array(external_exports.string()).default([]).describe("Path-shaped arguments, relative to the working directory. Scope is judged against these."),
+  text: external_exports.string().optional().describe("The whole action as one line, when that is all you have.")
+}).describe("The action as fields. Preferred over a string: the scope questions compare its names against the prompts.");
+var requestObjectSchema = external_exports.object({
+  latest: external_exports.string().min(1).describe("The request that is current."),
+  previous: external_exports.array(external_exports.string()).default([]).describe("Earlier requests, oldest first. Context for the latest one.")
+}).describe("The user's request, as the current one plus what came before it.");
+var contextObjectSchema = external_exports.object({
+  cwd: external_exports.string().optional(),
+  subagent: external_exports.string().optional().describe("The subagent type, when this call is happening inside one."),
+  permission_mode: external_exports.string().optional(),
+  notes: external_exports.string().optional().describe("Anything else worth knowing: the task, the relevant prior step.")
+}).describe("Where the action is running.");
 var inputShape2 = {
-  action: external_exports.string().min(1).describe("Exactly what you are about to do, including the tool name and its arguments."),
-  user_request: external_exports.string().min(1).describe("What the user actually asked for, in their words."),
-  context: external_exports.string().optional().describe("Optional short context: the task, the relevant prior step."),
+  action: external_exports.union([external_exports.string().min(1), actionObjectSchema]).describe("Exactly what you are about to do, including the tool name and its arguments."),
+  user_request: external_exports.union([external_exports.string().min(1), requestObjectSchema]).describe("What the user actually asked for, in their words."),
+  context: external_exports.union([external_exports.string(), contextObjectSchema]).optional().describe("Optional short context: the working directory, the task, the relevant prior step."),
   thresholds: thresholdsSchema
 };
 var inputSchema2 = external_exports.object(inputShape2);
@@ -38536,14 +38922,36 @@ var outputShape2 = {
   blast_radius: external_exports.object({
     score: external_exports.number().describe("Probability-weighted level, 0..3. Can fall between levels."),
     legend: external_exports.record(external_exports.string(), external_exports.string()).optional(),
-    confidence: external_exports.number()
+    confidence: external_exports.number(),
+    level: external_exports.number().describe("The level the answer picked."),
+    p_level: external_exports.number().describe("Probability of that level."),
+    p_high: external_exports.number().optional().describe("P(level 2) + P(level 3). Absent when no probabilities came back."),
+    source: external_exports.enum(["probabilities", "expectation"])
   }).describe("How far the effects reach. 0 = read-only, 3 = production or other people."),
+  scope: external_exports.object({
+    unrelated: external_exports.number().describe("P(no request asks for this and the work does not need it)."),
+    step: external_exports.number().describe("P(an ordinary step of the requested work, not named in any request)."),
+    requested: external_exports.number().describe("P(a request asks for this action, or names its target and this operation)."),
+    mentions_target: external_exports.number().describe("P(a request names what this action acts on)."),
+    same_task_area: external_exports.number().describe("P(this action touches the part of the project the request is about)."),
+    source: external_exports.enum(["probabilities", "expectation"])
+  }).describe("What the scope reading was made of. `signals.in_scope` is `step + requested`."),
   thresholds: external_exports.object({ auto: external_exports.number(), review: external_exports.number() }),
   ...envelopeShape
 };
 var outputSchema2 = external_exports.object(outputShape2);
 async function run2(model, input2, config2, signal) {
-  return runGateAction(model, input2, config2, signal);
+  return runGateAction(model, coreInput(input2), config2, signal);
+}
+function coreInput(input2) {
+  const action = typeof input2.action === "string" ? input2.action : { ...input2.action, input: input2.action.input };
+  return {
+    action,
+    user_request: input2.user_request,
+    ...input2.context !== void 0 ? { context: input2.context } : {},
+    ...input2.thresholds !== void 0 ? { thresholds: input2.thresholds } : {},
+    ...input2.policy !== void 0 ? { policy: input2.policy } : {}
+  };
 }
 
 // src/decision/models.ts
@@ -39283,7 +39691,7 @@ function normalizeVerdict(choice) {
 
 // src/server.ts
 var SERVER_NAME = "jevwire";
-var SERVER_VERSION = "0.4.1";
+var SERVER_VERSION = "0.5.0";
 var ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 function ok(output2) {
   return {

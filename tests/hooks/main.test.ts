@@ -39,7 +39,9 @@ describe("runEvent", () => {
   it("routes SubagentStop through the Stop handler", async () => {
     const model = new FakeModel(() => ({
       claims_complete: noul(0.1),
-      admits_unfinished: noul(0.95),
+      says_part_not_done: noul(0.95),
+      says_step_deferred: noul(0.02),
+      says_check_failing: noul(0.02),
       asks_user: noul(0.02),
       addresses_request: noul(0.9),
     }));

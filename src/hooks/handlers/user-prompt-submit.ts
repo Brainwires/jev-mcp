@@ -11,6 +11,7 @@
  * user prompt" mean what it says.
  */
 
+import { levelMass } from "../../decision/policy.js";
 import type { ChoiceAnswer, Question, ScoreAnswer } from "../../decision/types.js";
 import { MAX_PROMPT_CHARS, modelCost, nextPrompts } from "../store.js";
 import { redactAndClamp } from "../redact.js";
@@ -18,6 +19,18 @@ import type { Deps, HookInput, HookOutput } from "../types.js";
 
 /** Below this, a prompt is an acknowledgement and not worth classifying. */
 export const MIN_PROMPT_CHARS = 40;
+/**
+ * The top `ambiguity` level: "something is open that changes the result".
+ *
+ * The line fires on that level's own probability, not on the expectation.
+ * `score >= 1.5` was reachable by a 50/50 split between "nothing important is
+ * open" and "a wrong guess wastes the work" — two readings that disagree
+ * completely — and printing the advisory for that is printing it for a model
+ * that has not decided.
+ */
+const AMBIGUOUS_LEVEL = 2;
+/** The 0.4.x rule, kept for an answer that carries no per-level probabilities. */
+const AMBIGUOUS_SCORE = 1.5;
 
 const KINDS: Record<string, string> = {
   question: "The user is asking for an explanation or an answer, not for a change to the code.",
@@ -105,24 +118,42 @@ export async function handleUserPromptSubmit(input: HookInput, deps: Deps): Prom
     const kind = result.answers.kind as ChoiceAnswer | undefined;
     const ambiguity = result.answers.ambiguity as ScoreAnswer | undefined;
     const confidence = typeof kind?.confidence === "number" ? kind.confidence : 0;
+    const ambiguousMass = ambiguity === undefined ? undefined : levelMass(ambiguity, [AMBIGUOUS_LEVEL]);
 
     const signals: Record<string, number> = { kind_confidence: confidence };
     if (typeof ambiguity?.score === "number") signals.ambiguity = ambiguity.score;
+    if (ambiguousMass !== undefined) signals.ambiguity_p_high = ambiguousMass;
 
-    if (kind === undefined || confidence < config.autoThreshold) {
-      store.append({ ...base, decision: "low-confidence", signals, ...modelCost(result) });
+    const logged = {
+      signals,
+      policy: { confidence_threshold: config.confidenceThreshold },
+      thresholds: {
+        auto: config.autoThreshold,
+        review: config.reviewThreshold,
+        confidence: config.confidenceThreshold,
+      },
+    };
+
+    // A Choice's `confidence` is a peakedness statistic over the options, not
+    // the probability of a binary event, so it has its own bar.
+    if (kind === undefined || confidence < config.confidenceThreshold) {
+      store.append({ ...base, decision: "low-confidence", ...logged, ...modelCost(result) });
       return undefined;
     }
 
     const lines = [`[jev] task kind: ${kind.choice} (conf ${confidence.toFixed(2)})`];
-    if (typeof ambiguity?.score === "number" && ambiguity.score >= 1.5) {
+    const ambiguous =
+      ambiguousMass !== undefined
+        ? ambiguousMass >= config.autoThreshold
+        : typeof ambiguity?.score === "number" && ambiguity.score >= AMBIGUOUS_SCORE;
+    if (ambiguous) {
       lines.push("[jev] the request is ambiguous — consider asking one clarifying question before starting.");
     }
 
     store.append({
       ...base,
       decision: kind.choice,
-      signals,
+      ...logged,
       ...modelCost(result),
     });
 

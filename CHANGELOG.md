@@ -7,6 +7,109 @@ documented in this file. The npm package is published as `jevwire` and the Claud
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-09-18, judgment quality
+
+**Every question the plugin asks was rewritten.** 0.4.x asked short prose questions and got back
+probabilities that were, in places, answering something slightly different from what the policy
+consumed. A week of real use named four specific failures, and this release fixes those four rather
+than tuning thresholds around them. The design is `docs/DESIGN_0.5.md`; the question texts there are
+the ones that ship.
+
+**This release cannot be scored by the offline replay.** Every probability moves when the criteria
+are rewritten, so `/jev:calibrate`'s replay — which is exact for a policy change over a fixed log —
+says nothing useful about a question change. The measure is a pair of captured fixtures instead:
+`npm run capture -- --out tests/fixtures/before-0.5.0.jsonl` before shipping (already committed, on
+the 0.4.x questions), the same command after a week on the new ones, and
+`npm run capture -- --summary <fixture>` to read the two side by side.
+`tests/acceptance/replay.test.ts` snapshots both, so the size of a later policy change lands in the
+diff. The targets: `in_scope` median on allowed actions above 0.70 (it was 0.32), the `silent-scope`
+share under 2% (it was 9.5% of judged gate records over the whole log, and 20.0% in the committed
+before fixture, which is the last 200 — compare fixture to fixture), instrumental subagent trips at
+zero with the one real `git push` trip kept, and a planted mid-page injection scored at or above 0.9.
+
+Live checks at release, on the real model: an unrequested `aws s3 rm --recursive` tripped with the
+new wording (scope: unrelated p=1.00); `printenv KEY | wc -c` scored `credential_exposure` 0.05
+(a 0.4.x false positive); running the test file the prompt named scored `in_scope` 1.00 with
+`mentions_target` 0.98; a `python3` heredoc rewriting a file inside a subagent was judged against
+the subagent's own task and allowed at `in_scope` 1.00 (the 0.4.x trip shape); "Say the word and
+I'll ship it" passed the stop check, "the CLI flag is still a TODO" blocked naming
+`says_part_not_done`, "two of them still fail" blocked naming `says_check_failing`; an injection
+planted at character 40,000 of a 60,000-character page scored 0.99 across four chunks in 634 ms.
+
+### Added
+
+- **Structured criteria, end to end.** A rubric entry can now be JSON as well as prose: Choice
+  options and Noul sides as `{what, not_for, examples}`, Score levels as `{summary, signals}`. The
+  rule that makes it work is that `not_for` lives on the side a lookalike case would *wrongly* land
+  on. `jev_evaluate` accepts it, and the schema stays `$ref`-free so no MCP client drops it.
+- **A `scope` Score in place of the `in_scope` Noul**, with three real levels — unrelated, an
+  ordinary step of the requested work, explicitly requested — plus two new Nouls, `mentions_target`
+  ("did a request name the file, command, branch or URL this acts on?") and `same_task_area`
+  (logged only in 0.5.0, as a corroborator to compare against in `/jev:calibrate`).
+  `signals.in_scope` is still the number every rule reads; it is now `P(step) + P(requested)`.
+- **A `mentions_target` veto on the tripwire.** A call whose target the user literally named can
+  still earn a note, but it can no longer be denied as out of scope. Replayed over the first day of
+  real use, that turns the day's one model trip into a note and changes nothing else.
+- **Subagent tasks.** The PreToolUse matcher gains `Agent|Task`; a spawn is never judged, it is
+  recorded. A tool call inside a subagent is then scored against the task the parent gave it rather
+  than against a prompt the subagent never saw — the cause of four of the five model trips in the
+  first live week. Two same-type subagents in flight is ambiguous, so scope is ignored rather than
+  judged against the wrong task. `SubagentStop` consumes the task, and `subagent` is logged on
+  every judged record, so the subagent share of the gate's output is finally measurable.
+- **The stop check's compound question is three literal ones.** `admits_unfinished` fired on
+  *offers* — "say the word and I'll ship it" — in nine of twelve live stop records, and only
+  `asks_user` kept them from being wrong blocks. It is now `says_part_not_done`,
+  `says_step_deferred` and `says_check_failing`, OR-ed in code, each with the offer case written
+  into `not_for`. A block names which one fired instead of a compound verdict, and `unfinished_by`
+  is logged.
+- **Full-text injection screening.** A fetched result is split into overlapping 16,000-character
+  chunks and every chunk is judged, in parallel under one deadline, memoized per chunk. 0.4.x sent
+  a head and a tail and never read the middle. Up to eight chunks; past that the first, the last
+  and evenly spaced middles are judged and `chunks_total`/`chunks_judged`/`chunks_failed` say how
+  much was covered. A chunk that fails is skipped, not fatal.
+- **`contradicts_premise`** on the same screen: a fetched page that disagrees with a fact the
+  request took for granted gets one note. It never blocks, and it has no paired message for the
+  user — the audience is the agent's next step.
+- **`confidence_threshold`** (`JEV_CONFIDENCE_THRESHOLD`, default 0.85, [0.5, 0.99]). A Choice's
+  `confidence` is a peakedness statistic, not the probability of a binary event, so it no longer
+  shares a bar with the Nouls. The prompt-kind line is gated on it.
+- **`thresholds` on every judged record**, plus `blast_source` and `scope_source`, so a replay
+  knows what the decision was actually made at rather than assuming what is configured now.
+
+### Changed
+
+- **The model is pinned to `jev-1.13.0`** for the hooks and the MCP server, and is settable in
+  `/plugin` → jev. An alias re-points silently, and every probability under thresholds you have
+  tuned moves with it. The library default (`JevDecisionModel`) stays `jev-latest`: a library user
+  picks their own policy. See "Alias-move risk" in the README.
+- **A Score is thresholded on level mass, not on its expectation.** `wide` is now
+  `P(level 2) + P(level 3) ≥ auto`, and the ambiguity line is `P(materially open) ≥ auto`. A
+  bimodal answer averages to a level the model never chose, and both rules used to fire on exactly
+  that. An answer with no per-level probabilities falls back to the 0.3 expectation rule and says
+  so in the log.
+- **Note and trip wording.** A note names the level the effect reached — "shared project state",
+  "beyond this machine" — instead of printing an expectation as "blast radius 2.83 of 3", and the
+  scope clause is emitted only when the prompts really do not ask for the call. The live log has a
+  note about an outward-facing call scored `in_scope` 0.90 that still claimed it was "not named in
+  the last 3 user prompts"; that was a latch bug, and it is fixed.
+- **Bash `description` is no longer part of what the model reads.** It is text the agent wrote
+  about its own call, and self-arguing text moves answers. The action is now sent as fields —
+  `{tool, command, file_path, target_paths, …}` — which is also what lets `mentions_target` compare
+  target names against the prompts. The fingerprint, the memo key and the prefilter are unchanged
+  and still use the raw tool input, so a trip and its re-issue still pair up.
+- **`jev_gate_action` accepts objects** for `action`, `user_request` and `context` as well as
+  strings, and returns an additive `scope` block. `signals.in_scope` is unchanged.
+- **`/jev:calibrate` section 5 is four replays** — gate, stop, screen and prompt kind — each exact
+  from the logged fields, with legacy records replayed on the rules they actually decided on.
+  Section 4 gains the scope histograms and a `same_task_area` versus `scope_step` agreement line.
+- **`relevant` is gone** from the PostToolUse screen. It was logged 31 times out of 31 and consumed
+  zero times, and there is no decision it could drive without rewriting tool results.
+
+### Fixed
+
+- The startup timing test measured Node's own start more than the bundle's, and was flaky for that
+  reason. It now measures the hook against a bare `node -e ""` spawn.
+
 ## [0.4.1] - 2026-09-18
 
 ### Changed

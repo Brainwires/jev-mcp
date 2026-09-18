@@ -22,18 +22,22 @@ import {
 
 export const name = "jev_evaluate";
 
+/**
+ * Kept under the 1200-character cap `tests/server.test.ts` holds every tool
+ * description to. 0.5.0 spends some of that budget on the structured-criteria
+ * bullet; the Choice escape-hatch coaching it displaced now lives only on the
+ * `criteria` field's own schema description, where a caller writing one reads it.
+ */
 export const description = [
-  "Ask Jev — a fast, calibrated judgment model — many typed questions about one shared state; returns probabilities plus a gate computed in code.",
-  "Use it for any judgment you want to branch on when no other jev_* tool fits.",
+  "Ask Jev — a fast, calibrated judgment model — many typed questions about one shared state; returns probabilities plus a gate computed in code. Use it when no other jev_* tool fits.",
   "Writing questions (Jev reads literally):",
-  "- State the exact condition in `instructions`; put boundary cases in `criteria`. If you would have to explain what you really meant, that explanation belongs in the instruction.",
+  "- State the exact condition in `instructions`; put boundary cases in `criteria`.",
+  "- Criteria accept JSON: Choice options and Noul sides as {what, not_for, examples}; Score levels as {summary, signals}. Put lookalike cases under not_for on the side they would wrongly land on.",
   "- One judgment per question; split compound ones and combine in code.",
   "- Batch every question sharing a state into ONE call. They run in parallel and cost only their own tokens, so speculative questions are nearly free.",
   "- Send only the state the question needs; point at parts by path, e.g. `ticket.messages[0].text`.",
-  "- Choice: list every option, plus an `other`/`none` escape hatch.",
   "- Never ask it to count, do arithmetic, or compare dates/numbers — compute those in code and pass the result in.",
-  "- It selects from your options; it never generates text.",
-  "Answers: `noul` is P(yes), ~0.5 means unsure; choice/score carry `confidence`; `gate` is auto/review/escalate.",
+  "Answers: it selects from your options and never generates text; `noul` is P(yes), ~0.5 means unsure; choice/score carry `confidence`; `gate` is auto/review/escalate.",
   "Budget: ~64k tokens state + all questions, ~32k state + longest question.",
 ].join("\n");
 

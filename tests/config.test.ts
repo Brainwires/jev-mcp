@@ -18,6 +18,25 @@ describe("loadConfig", () => {
     });
   });
 
+  /**
+   * 0.5.0 pins the version the server sends. An alias that re-points silently
+   * moves every probability a caller has tuned thresholds against.
+   */
+  it("defaults to a pinned model version, not to the alias", () => {
+    expect(DEFAULTS.model).toBe("jev-1.13.0");
+    expect(loadConfig({ TYPESAFE_API_KEY: "k" }).model).toBe("jev-1.13.0");
+  });
+
+  it("reads the plugin's model option, and ignores an empty or unsubstituted one", () => {
+    expect(loadConfig({ TYPESAFE_API_KEY: "k", CLAUDE_PLUGIN_OPTION_MODEL: "jev-latest" }).model).toBe("jev-latest");
+    expect(
+      loadConfig({ TYPESAFE_API_KEY: "k", CLAUDE_PLUGIN_OPTION_MODEL: "  ", JEV_MODEL: "jev-1.12.0" }).model,
+    ).toBe("jev-1.12.0");
+    expect(loadConfig({ TYPESAFE_API_KEY: "k", CLAUDE_PLUGIN_OPTION_MODEL: "${user_config.model}" }).model).toBe(
+      DEFAULTS.model,
+    );
+  });
+
   it("confines the file tools to CLAUDE_PROJECT_DIR when the harness sets one", () => {
     const config = loadConfig({ TYPESAFE_API_KEY: "sk-abc", CLAUDE_PROJECT_DIR: process.cwd() });
     expect(config.projectRoot).toBe(process.cwd());

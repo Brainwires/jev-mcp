@@ -119,6 +119,32 @@ export interface NotedAction {
   ts: number;
 }
 
+/** Subagent spawns kept per session. Parallel fan-out is rarely wider. */
+export const MAX_SUBAGENT_TASKS = 8;
+/** A spawn recorded and never consumed stops standing in for a request. */
+export const SUBAGENT_TASK_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * The task a subagent was given, captured from the parent's `Agent` spawn.
+ *
+ * It exists because a tool call made inside a subagent is scored against the
+ * *user's* prompts today, and the subagent is not doing what the user last
+ * asked for — it is doing what the parent told it to. Four of the five model
+ * trips in the first live week were that mistake. The prompt here is the
+ * parent's own text, not a file and not a tool result.
+ */
+export interface SubagentTask {
+  agent_type: string;
+  /** Redacted and clamped by the caller. */
+  prompt: string;
+  ts: number;
+}
+
+/** Live spawns, expired ones dropped. */
+export function liveSubagentTasks(tasks: readonly SubagentTask[], now: number): SubagentTask[] {
+  return tasks.filter((task) => now - task.ts <= SUBAGENT_TASK_TTL_MS);
+}
+
 export interface SessionState {
   /** Last few user prompts, oldest first, each truncated. */
   prompts: string[];
@@ -136,6 +162,12 @@ export interface SessionState {
    * a moment before the user types "yes, do it" must still be affirmable.
    */
   trips?: Trip[];
+  /**
+   * Tasks handed to subagents that have not stopped yet. Deliberately NOT
+   * reset by a new user prompt: a subagent spawned before the user typed is
+   * still working on what the parent told it to do.
+   */
+  subagent_tasks?: SubagentTask[];
   /** Notes emitted since the last user prompt, for the per-prompt cap. */
   notes_this_prompt?: number;
   /** Fingerprints already noted, for the duplicate check. */
@@ -172,14 +204,20 @@ export interface DecisionRecord {
   subject?: string;
   prefilter?: string;
   signals?: Record<string, number>;
-  /** Policy options in force, so `/jev:calibrate` can replay the decision. */
-  policy?: {
-    ignore_scope: boolean;
-    uncertain: string;
-    lenient_scope?: boolean;
-    trust_requested?: boolean;
-    corroborate_uncertain?: boolean;
-  };
+  /**
+   * Policy options in force, so `/jev:calibrate` can replay the decision.
+   *
+   * Open-ended from 0.5.0: four events log a policy now, and pinning the
+   * shape here meant a handler that recorded one more switch had to widen a
+   * type in another module before the replay could read it.
+   */
+  policy?: Record<string, string | number | boolean>;
+  /**
+   * The thresholds the decision was actually made at, on every judged record.
+   * Without them a replay has to assume the ones configured *now*, which is
+   * wrong for exactly the log a threshold change is being judged on.
+   */
+  thresholds?: { auto: number; review: number; confidence: number };
   decision: string;
   reasons?: string[];
   /** 16 hex of the canonical action, so a trip and its re-issue can be paired. */
@@ -196,6 +234,25 @@ export interface DecisionRecord {
   suppressed?: string;
   /** The firm reasons behind a note or a trip, in priority order. */
   firm?: string[];
+  /** Gate: whether `wide` was decided on level probabilities or the expectation. */
+  blast_source?: "probabilities" | "expectation";
+  /**
+   * Gate: what stood in for the user's request. `subagent_task` is the task a
+   * parent handed this subagent; `none` means scope was ignored.
+   */
+  scope_source?: "prompts" | "subagent_task" | "none";
+  /**
+   * The `agent_type` this judgment happened inside, when it happened inside
+   * one. Logged on every judged record so the subagent share of the gate's
+   * output is measurable rather than a guess.
+   */
+  subagent?: string;
+  /** Stop: which of the three unfinished Nouls fired. */
+  unfinished_by?: string;
+  /** PostToolUse: how the result was chunked, and how much of it was judged. */
+  chunks_total?: number;
+  chunks_judged?: number;
+  chunks_failed?: number;
   model?: string;
   latency_ms?: number;
   input_tokens?: number;
@@ -351,6 +408,19 @@ export class Store {
         const trips = state.trips.map((raw) => readTrip(raw)).filter((trip): trip is Trip => trip !== undefined);
         if (trips.length > 0) session.trips = trips.slice(-MAX_TRIPS);
       }
+      // A task's prompt reaches the Jev API as the request a call is judged
+      // against, so every field is validated rather than trusted.
+      if (Array.isArray(state.subagent_tasks)) {
+        const tasks = state.subagent_tasks.filter(
+          (task): task is SubagentTask =>
+            typeof task === "object" &&
+            task !== null &&
+            typeof task.agent_type === "string" &&
+            typeof task.prompt === "string" &&
+            typeof task.ts === "number",
+        );
+        if (tasks.length > 0) session.subagent_tasks = tasks.slice(-MAX_SUBAGENT_TASKS);
+      }
       if (typeof state.notes_this_prompt === "number" && state.notes_this_prompt >= 0) {
         session.notes_this_prompt = Math.floor(state.notes_this_prompt);
       }
@@ -427,6 +497,54 @@ export class Store {
       pending_reissues: pending.filter((p) => p.tool_use_id !== toolUseId),
     });
     return found;
+  }
+
+  // ----------------------------------------------------------- subagent tasks
+
+  /** Record the task a parent just handed a subagent. */
+  rememberSubagentTask(sessionId: string, task: SubagentTask, now: number = Date.now()): void {
+    this.updateSession(
+      sessionId,
+      (state) => ({
+        ...state,
+        subagent_tasks: [...liveSubagentTasks(state.subagent_tasks ?? [], now), task].slice(-MAX_SUBAGENT_TASKS),
+      }),
+      now,
+    );
+  }
+
+  /**
+   * The live task for this agent type, when there is exactly one.
+   *
+   * Reads without consuming — a subagent makes many tool calls and every one
+   * of them is judged against the same task; `SubagentStop` is what removes
+   * it. Two live tasks of the same type means two same-type subagents are
+   * running in parallel and nothing here can say which one is calling, so the
+   * answer is "unknown" rather than a guess: the caller then ignores scope
+   * instead of judging against the wrong task.
+   */
+  takeSubagentTask(sessionId: string, agentType: string, now: number = Date.now()): SubagentTask | undefined {
+    const matching = liveSubagentTasks(this.readSession(sessionId).subagent_tasks ?? [], now).filter(
+      (task) => task.agent_type === agentType,
+    );
+    return matching.length === 1 ? matching[0] : undefined;
+  }
+
+  /** The subagent stopped: its task is no longer anybody's request. */
+  dropSubagentTask(sessionId: string, agentType: string, now: number = Date.now()): void {
+    this.updateSession(
+      sessionId,
+      (state) => {
+        const remaining = liveSubagentTasks(state.subagent_tasks ?? [], now).filter(
+          (task) => task.agent_type !== agentType,
+        );
+        const next: SessionState = { ...state };
+        if (remaining.length > 0) next.subagent_tasks = remaining;
+        else delete next.subagent_tasks;
+        return next;
+      },
+      now,
+    );
   }
 
   // --------------------------------------------------------------- tripwires

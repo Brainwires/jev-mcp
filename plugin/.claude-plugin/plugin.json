@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "jev",
   "displayName": "Jev",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Puts a fast calibrated classifier at the harness boundaries: hands Claude a note about a risky tool call, denies the two block-grade cases once with a reason Claude can answer, flags tool results that read like prompt injection, and catches a turn that stops short of the work it was asked to do. Advisory to the agent, never a prompt to you, and fail-open.",
   "author": {
     "name": "Brainwires"
@@ -66,6 +66,20 @@
       "default": 0.85,
       "min": 0.5,
       "max": 0.99
+    },
+    "confidence_threshold": {
+      "type": "number",
+      "title": "Choice confidence threshold",
+      "description": "How peaked a Choice answer's distribution has to be before the prompt-kind line is printed. This is a peakedness statistic, not a probability, so it has its own bar rather than sharing the certainty threshold. Only route_prompts uses it.",
+      "default": 0.85,
+      "min": 0.5,
+      "max": 0.99
+    },
+    "model": {
+      "type": "string",
+      "title": "Jev model",
+      "description": "Versioned id the hooks and MCP server send. Pinned so an alias move cannot shift every probability under thresholds you have tuned. Set jev-latest to follow releases.",
+      "default": "jev-1.13.0"
     }
   },
   "mcpServers": {
@@ -82,7 +96,9 @@
         "CLAUDE_PLUGIN_OPTION_STOP_CHECK": "${user_config.stop_check}",
         "CLAUDE_PLUGIN_OPTION_SCREEN_RESULTS": "${user_config.screen_results}",
         "CLAUDE_PLUGIN_OPTION_ROUTE_PROMPTS": "${user_config.route_prompts}",
-        "CLAUDE_PLUGIN_OPTION_AUTO_THRESHOLD": "${user_config.auto_threshold}"
+        "CLAUDE_PLUGIN_OPTION_AUTO_THRESHOLD": "${user_config.auto_threshold}",
+        "CLAUDE_PLUGIN_OPTION_CONFIDENCE_THRESHOLD": "${user_config.confidence_threshold}",
+        "CLAUDE_PLUGIN_OPTION_MODEL": "${user_config.model}"
       }
     }
   }

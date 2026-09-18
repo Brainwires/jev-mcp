@@ -161,6 +161,19 @@ describe("coverage", () => {
     ]);
   });
 
+  /**
+   * `Agent` and `Task` are matched but never judged. The hook records the task
+   * a subagent was given so the subagent's own calls have something to be in
+   * scope *of*; without the matcher the spawn never reaches the plugin and
+   * every call inside the subagent is scored against a prompt it never saw.
+   */
+  it("matches the subagent spawn tools on PreToolUse, so the task can be captured", () => {
+    const pre = manifest.hooks.PreToolUse as Matcher[];
+    expect(pre).toHaveLength(1);
+    expect(pre[0]?.matcher).toBe("Bash|Write|Edit|MultiEdit|NotebookEdit|Agent|Task|mcp__.*");
+    expect(manifest.description).toContain("Agent and Task");
+  });
+
   it("routes both post-tool matchers, one to the screen and one to the Approval label", () => {
     const post = manifest.hooks.PostToolUse as Matcher[];
     expect(post).toHaveLength(2);

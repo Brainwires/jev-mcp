@@ -296,6 +296,46 @@ describe(`day-one replay: ${RECORDS.length} judged records, ${RECORDED} escalati
     expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBe(RECORDS.length);
   });
 
+  /**
+   * 0.5.0's `mentions_target` veto, measured on the only trip in the fixture.
+   *
+   * The records predate the question, so the number is synthetic and the test
+   * is about the veto's *effect size*, not about what Jev would say: a firm
+   * "the user named this target" turns the day's one trip into a note, and
+   * changes nothing else. A veto that also moved a silent record, or that left
+   * the trip standing, would show up here.
+   */
+  it("the mentions_target veto turns the day's one trip into a note: 1 trip → 0, 9 notes → 10", () => {
+    const counts = { notes: 0, trips: 0, silent: 0 };
+    for (const record of RECORDS) {
+      const { blast_radius, ...signals } = record.signals;
+      // Only the record that actually tripped gets the synthetic answer, which
+      // is the point: the veto is a downgrade of a trip, never of a silence.
+      const tripped = advisoryOutcome(record) === "trip";
+      const vetoed = tripped ? { mentions_target: 0.95 } : {};
+      const policy = gateActionPolicy({
+        signals,
+        blast_radius,
+        ...vetoed,
+        thresholds: THRESHOLDS,
+        options: { ...STANDARD_0_2, ignoreScope: record.policy.ignore_scope },
+      });
+      const outcome = gateOutcome({
+        decision: policy.decision,
+        signals,
+        blast_radius,
+        ...vetoed,
+        thresholds: THRESHOLDS,
+      });
+      if (outcome.outcome === "note") counts.notes += 1;
+      else if (outcome.outcome === "trip") counts.trips += 1;
+      else counts.silent += 1;
+    }
+
+    expect(counts).toEqual({ notes: 10, trips: 0, silent: 22 });
+    expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBe(RECORDS.length);
+  });
+
   it("nothing in that day would have prompted the user", () => {
     // `ask` is reachable only through `ask_on_trip`, which is off by default,
     // and `gateOutcome` cannot express a prompt at all: the three outcomes are

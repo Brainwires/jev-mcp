@@ -19,24 +19,34 @@ export type State = string | Json[] | { [key: string]: Json };
 /** Instructions accept plain text or JSON structure. */
 export type Instructions = string | Json[] | { [key: string]: Json };
 
+/**
+ * What one rubric entry may be.
+ *
+ * Prose or JSON structure, because the same jaggedness that makes structured
+ * *instructions* work applies to criteria: `{what, not_for, examples}` on the
+ * side a lookalike case would wrongly land on moves answers that a paragraph
+ * does not. `null` is a value, not an absence — it says "the name says it all".
+ */
+export type EntryType = string | Json[] | { [key: string]: Json } | null;
+
 export interface ChoiceQuestion {
   type: "choice";
   instructions: Instructions;
-  /** option -> rubric description (null when the option name is self-explanatory). */
-  criteria: Record<string, string | null>;
+  /** option -> rubric entry (null when the option name is self-explanatory). */
+  criteria: Record<string, EntryType>;
 }
 
 export interface ScoreQuestion {
   type: "score";
   instructions: Instructions;
   /** Ordered level descriptions, lowest first. At least two. */
-  criteria: string[];
+  criteria: EntryType[];
 }
 
 export interface NoulQuestion {
   type: "noul";
   instructions: Instructions;
-  criteria?: { true?: string; false?: string };
+  criteria?: { true?: EntryType; false?: EntryType };
 }
 
 export type Question = ChoiceQuestion | ScoreQuestion | NoulQuestion;

@@ -61,6 +61,52 @@ describe("createServer", () => {
     }
   });
 
+  /**
+   * A `$ref` in a tool's input schema is dropped or mishandled by some MCP
+   * clients, so the structured-criteria union in `shared.ts` is deliberately
+   * non-recursive: zod 4 then inlines it. This is the test that says so.
+   */
+  it("publishes input schemas with no $ref in them", async () => {
+    const client = await connect(model, baseConfig);
+    const { tools } = await client.listTools();
+    for (const name of ["jev_evaluate", "jev_gate_action"]) {
+      const tool = tools.find((candidate) => candidate.name === name);
+      expect(tool, name).toBeDefined();
+      expect(JSON.stringify(tool!.inputSchema), name).not.toContain("$ref");
+    }
+  });
+
+  it("accepts jev_gate_action in both the string and the structured form", async () => {
+    const gateModel = new FakeModel(() => ({
+      destructive: noul(0.02),
+      outward_facing: noul(0.02),
+      credential_exposure: noul(0.01),
+      mentions_target: noul(0.9),
+      same_task_area: noul(0.9),
+      scope: score(2, ["unrelated", "ordinary step", "requested"], 0.9),
+      blast_radius: score(0, ["none", "local", "shared", "production"], 0.9),
+    }));
+    const client = await connect(gateModel, baseConfig);
+
+    const asStrings = await client.callTool({
+      name: "jev_gate_action",
+      arguments: { action: "Bash(ls src)", user_request: "list the files in src" },
+    });
+    expect(asStrings.isError).toBeFalsy();
+
+    const asObjects = await client.callTool({
+      name: "jev_gate_action",
+      arguments: {
+        action: { tool: "Bash", command: "ls src", target_paths: ["src"] },
+        user_request: { latest: "list the files in src", previous: ["what is in this repo?"] },
+        context: { cwd: "/home/dev/project" },
+      },
+    });
+    expect(asObjects.isError).toBeFalsy();
+    expect((asObjects.structuredContent as { decision: string }).decision).toBe("allow");
+    expect((asObjects.structuredContent as { scope: { requested: number } }).scope.requested).toBeGreaterThan(0.5);
+  });
+
   it("calls jev_evaluate and returns structuredContent plus a JSON text block", async () => {
     const client = await connect(model, baseConfig);
 

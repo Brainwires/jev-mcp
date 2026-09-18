@@ -36,6 +36,72 @@ export function gateScore(answer: ScoreAnswer, thresholds: GateThresholds = DEFA
   return gate(answer.confidence, thresholds);
 }
 
+/**
+ * Sum of the probabilities of the named levels, or `undefined` when the answer
+ * carries none.
+ *
+ * A level set's mass is the probability of a binary event — "the answer is one
+ * of these levels" — which is the same kind of quantity a Noul returns, so
+ * `auto`/`review` apply to it directly. The expectation (`score`) is not: a
+ * bimodal 0.5/0.5 over levels 0 and 2 averages to the middle level the model
+ * never chose, which is why policy reads mass rather than rounding.
+ *
+ * A level the answer does not mention contributes nothing. An empty
+ * distribution reads as absent rather than as zero, because zero would say
+ * "certainly not these levels" about an answer that said nothing at all.
+ */
+export function levelMass(
+  answer: Pick<ScoreAnswer, "probabilities">,
+  levels: readonly number[],
+): number | undefined {
+  const probabilities = answer.probabilities;
+  if (probabilities === null || typeof probabilities !== "object") return undefined;
+  const keys = Object.keys(probabilities);
+  if (keys.length === 0) return undefined;
+  let mass = 0;
+  for (const level of levels) {
+    const value = probabilities[String(level)];
+    if (typeof value === "number" && Number.isFinite(value)) mass += value;
+  }
+  // Four places: the provider reports two, and a sum such as 0.83 + 0.1 must
+  // not reach the log as 0.9299999999999999.
+  return Math.round(Math.min(1, Math.max(0, mass)) * 1e4) / 1e4;
+}
+
+/** The level a Score answer picked, and how much of the distribution sat on it. */
+export interface TopLevel {
+  level: number;
+  /** Probability of that level. */
+  p: number;
+}
+
+/**
+ * The most likely level of a Score answer.
+ *
+ * With `probabilities` it is the argmax, ties going to the lower level. Without
+ * them, the expectation is read the way the docs' no-interpolation rule allows:
+ * a score of 2.83 is a distribution over the two adjacent levels 2 and 3, so
+ * level 3 carries 0.83. That is the mass the expectation implies rather than an
+ * invented number, and it is all an answer without probabilities can say.
+ */
+export function topLevel(answer: Pick<ScoreAnswer, "score" | "probabilities">): TopLevel {
+  const probabilities = answer.probabilities;
+  if (probabilities !== null && typeof probabilities === "object") {
+    let best: TopLevel | undefined;
+    for (const [key, value] of Object.entries(probabilities)) {
+      const level = Number(key);
+      if (!Number.isInteger(level) || typeof value !== "number" || !Number.isFinite(value)) continue;
+      if (best === undefined || value > best.p || (value === best.p && level < best.level)) {
+        best = { level, p: value };
+      }
+    }
+    if (best !== undefined) return best;
+  }
+  const score = typeof answer.score === "number" && Number.isFinite(answer.score) ? answer.score : 0;
+  const level = Math.round(score);
+  return { level, p: Math.min(1, Math.max(0, 1 - Math.abs(score - level))) };
+}
+
 /** Which side of a Noul the probability falls on. `p >= 0.5` reads as yes. */
 export type NoulDirection = "yes" | "no";
 

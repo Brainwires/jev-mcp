@@ -14,7 +14,12 @@
 
 import { lean } from "../decision/policy.js";
 import type { GateThresholds } from "../decision/types.js";
-import { HIGH_BLAST_RADIUS, type ActionDecision, type GateActionSignals } from "../tools/gate-action-core.js";
+import {
+  isWide,
+  type ActionDecision,
+  type GateActionPolicyInput,
+  type GateActionSignals,
+} from "../tools/gate-action-core.js";
 
 /** Notes handed to the agent between two user prompts. */
 export const MAX_NOTES_PER_PROMPT = 5;
@@ -45,6 +50,10 @@ export interface GateOutcomeInput {
   signals: GateActionSignals;
   /** Probability-weighted blast-radius level, 0..3. */
   blast_radius: number;
+  /** `P(2) + P(3)` of the blast-radius Score; absent on a pre-0.5.0 record. */
+  blast_p_high?: number | undefined;
+  /** `P(a request named what this acts on)`; absent on a pre-0.5.0 record. */
+  mentions_target?: number | undefined;
   thresholds: GateThresholds;
   /** `gate: strict`: rows 13 and 14 become notes instead of silence. */
   strict?: boolean | undefined;
@@ -66,24 +75,31 @@ export interface Bands {
   requested: boolean;
   /** Scope is at least plausible: `in_scope >= review`. */
   requestedish: boolean;
-  /** Blast radius 2 of 3 or more: shared, external, or production state. */
+  /** Shared, external, or production state: see `isWide`. */
   wide: boolean;
-  /** A firm out-of-scope reading. */
+  /** A firm out-of-scope reading, with the `mentions_target` veto applied. */
   outOfScope: boolean;
 }
 
-/** The three derived predicates the table is written in terms of. Pure. */
-export function bands(
-  signals: GateActionSignals,
-  blastRadius: number,
-  thresholds: GateThresholds,
-): Bands {
+/**
+ * What `bands` needs, taken straight off the policy input so the two cannot
+ * read the same call differently.
+ */
+export type BandsInput = Pick<
+  GateActionPolicyInput,
+  "signals" | "blast_radius" | "blast_p_high" | "mentions_target" | "thresholds"
+>;
+
+/** The four derived predicates the table is written in terms of. Pure. */
+export function bands(input: BandsInput): Bands {
+  const { signals, thresholds } = input;
   const requestedish = signals.in_scope >= thresholds.review;
+  const namedTarget = input.mentions_target !== undefined && input.mentions_target >= thresholds.auto;
   return {
     requestedish,
     requested: requestedish && signals.destructive < 0.5 && signals.credential_exposure < 0.5,
-    wide: blastRadius >= HIGH_BLAST_RADIUS,
-    outOfScope: lean(signals.in_scope, thresholds.auto) === "no",
+    wide: isWide(input.blast_radius, input.blast_p_high, thresholds.auto),
+    outOfScope: lean(signals.in_scope, thresholds.auto) === "no" && !namedTarget,
   };
 }
 
@@ -98,7 +114,7 @@ export function bands(
 export function gateOutcome(input: GateOutcomeInput): GateOutcomeResult {
   const { signals, thresholds } = input;
   const auto = thresholds.auto;
-  const { requested, requestedish, wide, outOfScope } = bands(signals, input.blast_radius, thresholds);
+  const { requested, requestedish, wide, outOfScope } = bands(input);
 
   const firm: FirmReason[] = [];
   // Row 9.

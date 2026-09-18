@@ -12,13 +12,16 @@ import { describe, expect, it } from "vitest";
 import {
   isInside,
   isOwnTool,
+  isPathLike,
   isSensitivePath,
+  MAX_TARGET_PATHS,
   mcpToolSegment,
   prefilter,
   prefilterBash,
   prefilterFileWrite,
   prefilterMcp,
   scanBash,
+  structuredAction,
 } from "../../src/hooks/prefilter.js";
 
 type Kind = "skip" | "judge" | "escalate";
@@ -614,5 +617,86 @@ describe("prefilter and the affirmation marker", () => {
     });
     expect(verdict.kind).toBe("judge");
     expect(verdict.marker).toBeUndefined();
+  });
+});
+
+/**
+ * The action as the gate questions name it.
+ *
+ * `target_paths` is the field `mentions_target` compares against the prompts,
+ * so what lands in it is load-bearing: a path the user typed has to be
+ * recognizable as the same string on both sides.
+ */
+describe("structuredAction", () => {
+  const CWD = "/home/dev/project";
+
+  describe("isPathLike", () => {
+    it("takes anything with a slash, and a bare filename with an extension", () => {
+      for (const token of ["src/a.ts", "./out", "/etc/hosts", "a.ts", "https://example.com/deploy", "~/.ssh"]) {
+        expect(isPathLike(token), token).toBe(true);
+      }
+    });
+
+    it("rejects flags, whitespace, and a sed script that is only slashes", () => {
+      for (const token of ["-rf", "--force", "", "a b", "s/a/b/", "y/abc/xyz/"]) {
+        expect(isPathLike(token), JSON.stringify(token)).toBe(false);
+      }
+    });
+  });
+
+  it("pulls operands, redirect targets and sed -i files out of a Bash command", () => {
+    const action = structuredAction(
+      "Bash",
+      { command: "grep -n foo src/a.ts src/b.ts > out/hits.txt" },
+      CWD,
+    );
+    expect(action.tool).toBe("Bash");
+    expect(action.command).toBe("grep -n foo src/a.ts src/b.ts > out/hits.txt");
+    expect(action.target_paths).toEqual(["out/hits.txt", "src/a.ts", "src/b.ts"]);
+
+    expect(structuredAction("Bash", { command: "sed -i '' 's/a/b/' src/app.ts" }, CWD).target_paths).toEqual([
+      "src/app.ts",
+    ]);
+  });
+
+  it("makes an absolute path inside the working directory relative to it", () => {
+    expect(structuredAction("Bash", { command: "cat /home/dev/project/src/a.ts" }, CWD).target_paths).toEqual([
+      "src/a.ts",
+    ]);
+    // Outside the project it stays exactly as the user would have typed it.
+    expect(structuredAction("Bash", { command: "cat /etc/hosts" }, CWD).target_paths).toEqual(["/etc/hosts"]);
+  });
+
+  it("caps the targets, and does not repeat one", () => {
+    const many = Array.from({ length: 30 }, (_, index) => `src/f${index}.ts`).join(" ");
+    expect(structuredAction("Bash", { command: `cat ${many}` }, CWD).target_paths).toHaveLength(MAX_TARGET_PATHS);
+    expect(structuredAction("Bash", { command: "cat src/a.ts src/a.ts" }, CWD).target_paths).toEqual(["src/a.ts"]);
+  });
+
+  it("never carries a Bash description, which is the agent's own framing", () => {
+    const action = structuredAction("Bash", { command: "ls", description: "totally routine" }, CWD);
+    expect(JSON.stringify(action)).not.toContain("totally routine");
+  });
+
+  it("takes the path off every file tool, including the notebook spelling", () => {
+    expect(structuredAction("Write", { file_path: "src/a.ts", content: "x" }, CWD).target_paths).toEqual(["src/a.ts"]);
+    expect(structuredAction("Edit", { file_path: "src/a.ts" }, CWD).target_paths).toEqual(["src/a.ts"]);
+    expect(structuredAction("NotebookEdit", { notebook_path: "nb.ipynb" }, CWD).file_path).toBe("nb.ipynb");
+    expect(structuredAction("MultiEdit", { file_path: "src/a.ts", edits: [{ old_string: "a" }] }, CWD).input).toEqual({
+      edits: 1,
+      first: { old_string: "a" },
+    });
+  });
+
+  it("sends an MCP input as structure, with path-shaped values as targets", () => {
+    const action = structuredAction("mcp__fs__write", { path: "docs/a.md", body: "x", nested: { also: "src/b.ts" } }, CWD);
+    expect(action.input).toEqual({ path: "docs/a.md", body: "x", nested: { also: "src/b.ts" } });
+    expect(action.target_paths).toEqual(["docs/a.md", "src/b.ts"]);
+  });
+
+  it("keeps an oversized input inside its budget rather than sending all of it", () => {
+    const action = structuredAction("mcp__x__do", { blob: "y".repeat(10_000) }, CWD);
+    expect(JSON.stringify(action.input).length).toBeLessThanOrEqual(2600);
+    expect(action.input).toHaveProperty("truncated_json");
   });
 });

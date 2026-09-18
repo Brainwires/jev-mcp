@@ -80,6 +80,7 @@ export function readSessionConfig(raw: unknown, fallback: SessionConfig): Sessio
     routePrompts: bool(value.routePrompts, fallback.routePrompts),
     autoThreshold: auto,
     reviewThreshold: Math.min(num(value.reviewThreshold, fallback.reviewThreshold, 0, 1), auto),
+    confidenceThreshold: num(value.confidenceThreshold, fallback.confidenceThreshold, 0.5, 0.99),
     daemonPort: num(value.daemonPort, fallback.daemonPort, 0, 65_535),
     daemonIdleMs: num(value.daemonIdleMs, fallback.daemonIdleMs, 1000, 24 * 60 * 60 * 1000),
   };

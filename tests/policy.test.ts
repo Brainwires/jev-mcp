@@ -7,7 +7,9 @@ import {
   gateScore,
   isUncertain,
   lean,
+  levelMass,
   resolveThresholds,
+  topLevel,
 } from "../src/decision/policy.js";
 import type { ChoiceAnswer, ScoreAnswer } from "../src/decision/types.js";
 
@@ -106,6 +108,53 @@ describe("lean", () => {
     expect(isUncertain(0.5)).toBe(true);
     expect(isUncertain(0.99)).toBe(false);
     expect(isUncertain(0.01)).toBe(false);
+  });
+});
+
+/**
+ * A level set's mass is the probability of a binary event, which is what makes
+ * it a thing `auto`/`review` can be applied to. The expectation is not: a
+ * bimodal answer averages to a level the model never chose.
+ */
+describe("levelMass", () => {
+  const scored = (probabilities?: Record<string, number>): Pick<ScoreAnswer, "probabilities"> =>
+    probabilities === undefined ? {} : { probabilities };
+
+  it("sums the named levels", () => {
+    expect(levelMass(scored({ "0": 0.1, "1": 0.2, "2": 0.5, "3": 0.2 }), [2, 3])).toBeCloseTo(0.7);
+    expect(levelMass(scored({ "0": 0.1, "1": 0.9 }), [0])).toBeCloseTo(0.1);
+  });
+
+  it("is undefined when the answer carries no probabilities at all", () => {
+    expect(levelMass(scored(), [2, 3])).toBeUndefined();
+    expect(levelMass(scored({}), [2, 3])).toBeUndefined();
+  });
+
+  it("treats a level the answer never mentioned as contributing nothing", () => {
+    expect(levelMass(scored({ "0": 0.4, "1": 0.6 }), [2, 3])).toBe(0);
+    expect(levelMass(scored({ "1": 0.6, "3": 0.4 }), [2, 3])).toBeCloseTo(0.4);
+  });
+
+  it("ignores a value that is not a finite number", () => {
+    expect(levelMass(scored({ "2": Number.NaN, "3": 0.3 }), [2, 3])).toBeCloseTo(0.3);
+  });
+
+  it("stays inside 0..1 even when the distribution does not", () => {
+    expect(levelMass(scored({ "2": 0.9, "3": 0.9 }), [2, 3])).toBe(1);
+  });
+});
+
+describe("topLevel", () => {
+  it("is the argmax when there are probabilities, ties going to the lower level", () => {
+    expect(topLevel({ score: 2.1, probabilities: { "0": 0.1, "2": 0.6, "3": 0.3 } })).toEqual({ level: 2, p: 0.6 });
+    expect(topLevel({ score: 1.5, probabilities: { "1": 0.5, "2": 0.5 } })).toEqual({ level: 1, p: 0.5 });
+  });
+
+  it("reads an expectation as a split over the two adjacent levels", () => {
+    expect(topLevel({ score: 2.83 }).level).toBe(3);
+    expect(topLevel({ score: 2.83 }).p).toBeCloseTo(0.83);
+    expect(topLevel({ score: 2.4 })).toMatchObject({ level: 2 });
+    expect(topLevel({ score: 2.4 }).p).toBeCloseTo(0.6);
   });
 });
 

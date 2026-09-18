@@ -3,7 +3,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { endsWithQuestion, handleStop, MIN_MESSAGE_CHARS, stopPolicy } from "../../src/hooks/handlers/stop.js";
+import {
+  endsWithQuestion,
+  handleStop,
+  MIN_MESSAGE_CHARS,
+  stopPolicy,
+  unfinishedClause,
+  UNFINISHED_REASONS,
+  type StopSignals,
+} from "../../src/hooks/handlers/stop.js";
+import { BANNED_IMPERATIVES } from "../../src/hooks/wording.js";
 import type { HookInput } from "../../src/hooks/types.js";
 import { FakeModel, noul } from "../helpers/fake-model.js";
 import { cleanup, makeDeps, tempDir } from "./helpers.js";
@@ -28,6 +37,13 @@ function input(overrides: Partial<HookInput> = {}): HookInput {
   };
 }
 
+/**
+ * The seven Nouls, driven through the one the 0.4.x compound stood in for.
+ *
+ * `unfinished` lands on `says_part_not_done` — the literal question closest to
+ * what `admits_unfinished` was trying to ask — so every case below still reads
+ * as the case it was written as.
+ */
 function answers(
   complete: number,
   unfinished: number,
@@ -37,10 +53,26 @@ function answers(
 ): Record<string, ReturnType<typeof noul>> {
   return {
     claims_complete: noul(complete),
-    admits_unfinished: noul(unfinished),
+    says_part_not_done: noul(unfinished),
+    says_step_deferred: noul(NO),
+    says_check_failing: noul(NO),
     asks_user: noul(asks),
     addresses_request: noul(addresses),
     claims_verified: noul(verified),
+  };
+}
+
+/** The seven, as `StopSignals`, for the policy truth table. */
+function signals(overrides: Partial<StopSignals> = {}): StopSignals {
+  return {
+    claims_complete: NO,
+    says_part_not_done: NO,
+    says_step_deferred: NO,
+    says_check_failing: NO,
+    asks_user: NO,
+    addresses_request: YES,
+    claims_verified: NO,
+    ...overrides,
   };
 }
 
@@ -53,44 +85,113 @@ afterEach(() => {
 });
 
 describe("stopPolicy truth table", () => {
-  // complete, unfinished, asks_user, addresses -> block?
-  const cases: [number, number, number, number, boolean, string][] = [
-    [YES, NO, NO, YES, false, "a clean done is never second-guessed"],
-    [NO, YES, NO, YES, true, "says work remains and is not waiting on the user"],
-    [NO, YES, YES, YES, false, "says work remains but is waiting on the user"],
-    [NO, YES, MAYBE, YES, false, "unsure whether it is waiting on the user"],
-    [NO, MAYBE, NO, YES, false, "unsure whether work remains"],
-    [NO, NO, NO, NO, false, "nothing fired"],
-    [YES, YES, NO, YES, true, "claims done and also admits something is left"],
-    [YES, YES, YES, YES, false, "claims done, admits a gap, and asks the user"],
-    [NO, 0.84, NO, YES, false, "just below the threshold"],
-    [NO, 0.86, NO, YES, true, "just above the threshold"],
-    [NO, YES, 0.16, YES, false, "asks_user just above 1 - auto"],
-    [NO, YES, 0.15, YES, true, "asks_user exactly at 1 - auto"],
+  const cases: [Partial<StopSignals>, boolean, string][] = [
+    [{ claims_complete: YES }, false, "a clean done is never second-guessed"],
+    [{ says_part_not_done: YES }, true, "says a part of the requested work is not done"],
+    [{ says_step_deferred: YES }, true, "defers a requested step"],
+    [{ says_check_failing: YES }, true, "reports a check still failing"],
+    [{ says_part_not_done: YES, says_step_deferred: YES }, true, "two of the three at once"],
+    [{ says_part_not_done: YES, asks_user: YES }, false, "says work remains but is waiting on the user"],
+    [{ says_part_not_done: YES, asks_user: MAYBE }, false, "unsure whether it is waiting on the user"],
+    [{ says_part_not_done: MAYBE }, false, "unsure whether work remains"],
+    [{ addresses_request: NO }, false, "nothing fired"],
+    [{ claims_complete: YES, says_part_not_done: YES }, true, "claims done and also names a gap"],
+    [{ claims_complete: YES, says_part_not_done: YES, asks_user: YES }, false, "claims done, names a gap, asks"],
+    [{ says_part_not_done: 0.84 }, false, "just below the threshold"],
+    [{ says_part_not_done: 0.86 }, true, "just above the threshold"],
+    [{ says_step_deferred: 0.84, says_check_failing: 0.84 }, false, "two near misses do not add up"],
+    [{ says_part_not_done: YES, asks_user: 0.16 }, false, "asks_user just above 1 - auto"],
+    [{ says_part_not_done: YES, asks_user: 0.15 }, true, "asks_user exactly at 1 - auto"],
   ];
 
-  for (const [complete, unfinished, asks, addresses, expected, label] of cases) {
+  for (const [overrides, expected, label] of cases) {
     it(`${expected ? "block" : "allow"}: ${label}`, () => {
-      const result = stopPolicy(
-        {
-          claims_complete: complete,
-          admits_unfinished: unfinished,
-          asks_user: asks,
-          addresses_request: addresses,
-          claims_verified: NO,
-        },
-        AUTO,
-      );
-      expect(result.block).toBe(expected);
+      expect(stopPolicy(signals(overrides), AUTO).block).toBe(expected);
     });
   }
 
+  it("names the Noul that fired, so the block text can say which it was", () => {
+    expect(stopPolicy(signals({ says_part_not_done: YES }), AUTO).unfinished_by).toBe("says_part_not_done");
+    expect(stopPolicy(signals({ says_step_deferred: YES }), AUTO).unfinished_by).toBe("says_step_deferred");
+    expect(stopPolicy(signals({ says_check_failing: YES }), AUTO).unfinished_by).toBe("says_check_failing");
+    // Two fired: the stronger one gets to speak.
+    expect(
+      stopPolicy(signals({ says_part_not_done: 0.9, says_check_failing: 0.99 }), AUTO).unfinished_by,
+    ).toBe("says_check_failing");
+    expect(stopPolicy(signals(), AUTO).unfinished_by).toBeUndefined();
+  });
+
   it("explains itself when it blocks", () => {
-    const result = stopPolicy(
-      { claims_complete: NO, admits_unfinished: YES, asks_user: NO, addresses_request: YES, claims_verified: NO },
-      AUTO,
-    );
-    expect(result.reasons.join(" ")).toContain("still outstanding");
+    const result = stopPolicy(signals({ says_part_not_done: YES }), AUTO);
+    expect(result.reasons.join(" ")).toContain("names a part of the requested work as not done");
+  });
+
+  /**
+   * A stop block is agent-facing text like a note or a trip, so it is held to
+   * the same rule: imperative "system command" phrasing in injected context
+   * trips Claude's own injection defenses.
+   */
+  it("says what it found without giving orders, in all three shapes", () => {
+    for (const reason of UNFINISHED_REASONS) {
+      const clause = unfinishedClause(reason, 0.94);
+      const text = `[jev] Your final message ${clause} and is not waiting on the user. Continue with the remaining work, or state explicitly what blocks you.`;
+      const match = BANNED_IMPERATIVES.exec(text);
+      expect(match?.[0], `"${match?.[0]}" in: ${text}`).toBeUndefined();
+    }
+  });
+});
+
+/**
+ * The nine live offers, as fixtures.
+ *
+ * Every one of these is a shape that scored `admits_unfinished` at 0.85 or
+ * more in the first live week, and every one of them is an *offer* — extra work
+ * on top of what was asked for. Only `asks_user` stopped them being wrong
+ * blocks, and one record sat a threshold tick from one. Split into three
+ * literal Nouls with the offer written into `not_for`, `says_part_not_done`
+ * reads them low; and even if it did not, `asks_user` is high on all nine.
+ *
+ * The messages are what the shapes actually look like. The signals are the
+ * fixture: this is a test of the policy, not of the classifier.
+ */
+describe("the nine offer shapes stay allow", () => {
+  const OFFERS = [
+    "Done — the three handlers log the new field and the tests pass. Say the word and I'll ship it.",
+    "That's the parser fixed and green. I can also add a changelog entry if you want one.",
+    "All four files are updated. Want me to run the full suite before you commit?",
+    "The migration script is in place and tested. Happy to wire it into CI too — your call.",
+    "Everything you asked for is done. I could extract the shared helper as well, if that's useful.",
+    "Fix is in, type-check is clean. Let me know if you'd like the same treatment for the other module.",
+    "The README section now matches the code. I can do the same pass on the docs folder if you like.",
+    "Both hooks are wired up and passing. Shall I bump the version, or is that yours to do?",
+    "That's the refactor complete. I can follow it with the dead-code sweep whenever you want.",
+  ];
+
+  for (const [index, message] of OFFERS.entries()) {
+    it(`offer ${index + 1} is allowed: ${message.slice(0, 40)}…`, () => {
+      // An offer is not requested work left undone, and it asks the user.
+      const result = stopPolicy(
+        signals({ claims_complete: YES, says_part_not_done: 0.08, asks_user: 0.93 }),
+        AUTO,
+      );
+      expect(result.block, message).toBe(false);
+      expect(result.unfinished_by, message).toBeUndefined();
+    });
+  }
+
+  /**
+   * The record that was one tick away. `admits_unfinished` 0.96 with
+   * `asks_user` 0.24 blocked only because 0.24 > 0.15; at `auto` 0.80 it would
+   * have been a wrong block. With the split, `says_part_not_done` is what has
+   * to be high, and on an offer it is not.
+   */
+  it("does not depend on asks_user to get the near-miss record right", () => {
+    for (const auto of [0.75, 0.8, 0.85, 0.9]) {
+      expect(
+        stopPolicy(signals({ claims_complete: YES, says_part_not_done: 0.08, asks_user: 0.24 }), auto).block,
+        `auto ${auto}`,
+      ).toBe(false);
+    }
   });
 });
 
@@ -117,7 +218,31 @@ describe("handleStop", () => {
     const output = await handleStop(input(), deps);
     expect(output?.decision).toBe("block");
     expect(output?.reason).toContain("[jev]");
-    expect(output?.reason).toContain("unfinished");
+    // The block names the Noul that fired rather than a compound verdict.
+    expect(output?.reason).toContain("names a part of the requested work as not done (p=0.97)");
+    expect(output?.reason).toContain("is not waiting on the user");
+    expect(deps.store.readLog().at(-1)?.unfinished_by).toBe("says_part_not_done");
+  });
+
+  it("names a deferral or a failing check when that is what fired", () => {
+    const deferred = new FakeModel(() => ({
+      ...answers(NO, NO, NO, YES),
+      says_step_deferred: noul(YES),
+    }));
+    const depsA = makeDeps(dir, { model: deferred });
+    withPrompt(depsA);
+    return handleStop(input(), depsA).then(async (output) => {
+      expect(output?.reason).toContain("defers a requested step");
+
+      const failing = new FakeModel(() => ({
+        ...answers(NO, NO, NO, YES),
+        says_check_failing: noul(YES),
+      }));
+      const depsB = makeDeps(dir, { model: failing });
+      depsB.store.updateSession("s2", (s) => ({ ...s, prompts: ["fix the failing parser test"] }));
+      const second = await handleStop(input({ session_id: "s2" }), depsB);
+      expect(second?.reason).toContain("reports a check still failing");
+    });
   });
 
   it("counts the block so it happens at most once per prompt", async () => {
@@ -202,8 +327,41 @@ describe("handleStop", () => {
     await handleStop(input(), deps);
     expect(Object.keys(model.calls[0]!.state as Record<string, unknown>).sort()).toEqual([
       "final_message",
-      "user_request",
+      "request",
     ]);
+    expect(model.calls[0]!.state).toMatchObject({
+      request: { latest: "refactor the parser and migrate the call sites", previous: [] },
+    });
+  });
+});
+
+/**
+ * A subagent's final message is about the task its parent gave it, not about
+ * the user's last prompt — the user never saw the task. `SubagentStop` is also
+ * the event that says the task is finished with.
+ */
+describe("handleStop inside a subagent", () => {
+  const TASK = "find every call site of resolveDataDir and list them with line numbers";
+
+  it("judges the final message against the captured task, then drops it", async () => {
+    const model = new FakeModel(() => answers(YES, NO, NO, YES));
+    const deps = makeDeps(dir, { model });
+    deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["why is the data directory wrong after an upgrade?"] }));
+    deps.store.rememberSubagentTask("s1", { agent_type: "Explore", prompt: TASK, ts: deps.now() }, deps.now());
+
+    await handleStop(input({ hook_event_name: "SubagentStop", agent_type: "Explore" }), deps);
+    expect(model.calls[0]!.state).toMatchObject({ request: { latest: TASK } });
+    expect(deps.store.readLog().at(-1)?.subagent).toBe("Explore");
+    // Consumed: the subagent has stopped, so its task is nobody's request now.
+    expect(deps.store.readSession("s1").subagent_tasks).toBeUndefined();
+  });
+
+  it("falls back to the user's prompts when no task was captured", async () => {
+    const model = new FakeModel(() => answers(YES, NO, NO, YES));
+    const deps = makeDeps(dir, { model });
+    deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["refactor the parser"] }));
+    await handleStop(input({ hook_event_name: "SubagentStop", agent_type: "Explore" }), deps);
+    expect(model.calls[0]!.state).toMatchObject({ request: { latest: "refactor the parser" } });
   });
 });
 
@@ -296,7 +454,7 @@ describe("handleStop and the verification ledger", () => {
     }));
     const output = await handleStop(input({ last_assistant_message: CLAIM }), deps);
     expect(output?.decision).toBe("block");
-    expect(output?.reason).toContain("unfinished");
+    expect(output?.reason).toContain("names a part of the requested work as not done");
     // Still one block, not two.
     expect(deps.store.readSession("s1").stop_blocks).toBe(1);
   });
@@ -309,10 +467,12 @@ describe("handleStop and the verification ledger", () => {
     expect(model.calls).toHaveLength(1);
     expect(Object.keys(model.calls[0]!.questions).sort()).toEqual([
       "addresses_request",
-      "admits_unfinished",
       "asks_user",
       "claims_complete",
       "claims_verified",
+      "says_check_failing",
+      "says_part_not_done",
+      "says_step_deferred",
     ]);
     // The ledger is compared in code; it is never sent to the model.
     expect(JSON.stringify(model.calls[0]!.state)).not.toContain("npm test");
