@@ -75,11 +75,15 @@ bind address is a literal in the code. Nothing outside the machine can reach it,
 firewall says.
 
 **It authenticates with your TypeSafe API key.** Every hook sends it, in either
-`Authorization: Bearer` or `X-Jev-Env-Key`, and the daemon accepts a request only if one of them
-matches the key it resolved for itself — compared with `timingSafeEqual` over sha256 digests, so the
-comparison does not leak the key's length or prefix by timing. An empty `Bearer ` counts as no
+`Authorization: Bearer` or `X-Jev-Env-Key`, and the daemon accepts a request if one of them matches
+**any** of the keys present in its environment at start (`CLAUDE_PLUGIN_OPTION_API_KEY`,
+`JEV_PLUGIN_API_KEY`, `TYPESAFE_API_KEY`) — compared with `timingSafeEqual` over sha256 digests, so
+the comparison does not leak the key's length or prefix by timing. An empty `Bearer ` counts as no
 credential rather than a wrong one, because the plugin option interpolates to an empty string when it
-is unset.
+is unset. A refused hook post is answered `200 {}` and counted, never a 4xx — Claude Code shows any
+non-2xx from an http hook to the user as a hook error, and the plugin fails open in silence — while
+`/v1/health` exposes an 8-hex-character sha256 fingerprint of each held key so `/jev:daemon status`
+can say what the daemon accepts without ever printing a key.
 
 **`/v1/health` is unauthenticated and carries no secret.** It has to be: it is how a starting hook
 tells "my daemon, current version" from "my daemon, stale" from "somebody else's server" before it

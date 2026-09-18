@@ -244,6 +244,78 @@ describe("ensureDaemon", () => {
   }, 30_000);
 });
 
+/**
+ * A jev-shaped health responder with a current protocol, a fresh-looking
+ * bundle, and an optional `key_fingerprints` list.
+ *
+ * Built here rather than added to `daemon-helpers.ts` because it is the only
+ * test that needs to answer health with fingerprints.
+ */
+const FINGERPRINT_DAEMON = `
+import { createServer } from "node:http";
+const port = Number(process.argv[2]);
+const protocol = Number(process.argv[3] ?? "1");
+const mtime = Number(process.argv[4] ?? "1");
+const fingerprints = process.argv[5] ?? "";
+const server = createServer((req, res) => {
+  if (req.url === "/v1/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      jev: true,
+      pid: process.pid,
+      port,
+      version: "0.0.1",
+      protocol,
+      bundle_path: "/nowhere/hook.mjs",
+      bundle_mtime: mtime,
+      started_at: Date.now(),
+      uptime_ms: 1,
+      sessions: 0,
+      auth: "key",
+      counters: {},
+      ...(fingerprints === "" ? {} : { key_fingerprints: fingerprints.split(",") }),
+    }));
+    return;
+  }
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end("{}");
+});
+process.on("SIGTERM", () => { server.close(); process.exit(0); });
+server.listen(port, "127.0.0.1", () => process.stdout.write("ready\\n"));
+`;
+
+describe("key fingerprints in the staleness check", () => {
+  it("replaces a daemon whose key_fingerprints do not include one of ours", async () => {
+    // Current protocol, no older bundle: the fingerprints are the only reason
+    // this daemon is stale.
+    const child = spawnScript(
+      dir,
+      "fingerprint.mjs",
+      FINGERPRINT_DAEMON,
+      [String(port), String(PROTOCOL), String(Date.now()), "cafebabe"],
+    );
+    await onReady(child);
+    const old = child.pid as number;
+
+    expect(await ensureDaemon(options({ keyFingerprints: ["deadbeef"] }))).toBe("replaced");
+    await waitUntil(() => !isAlive(old), "the daemon holding an unheld key to exit");
+    const probe = await probeHealth(port, 1000);
+    expect(probe.kind).toBe("jev");
+  }, 30_000);
+
+  it("does not replace a daemon whose health predates key_fingerprints", async () => {
+    const child = spawnScript(
+      dir,
+      "fingerprint-plain.mjs",
+      FINGERPRINT_DAEMON,
+      [String(port), String(PROTOCOL), String(Date.now())],
+    );
+    await onReady(child);
+
+    expect(await ensureDaemon(options({ keyFingerprints: ["deadbeef"] }))).toBe("running");
+  }, 30_000);
+});
+
 describe("withLock", () => {
   it("runs the body and releases the lock", async () => {
     let ran = 0;

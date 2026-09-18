@@ -49,7 +49,7 @@ afterEach(async () => {
 async function daemonFor(deps: Deps): Promise<DaemonHandle> {
   const handle = await startDaemon({
     port: 0,
-    expectedKey: null,
+    expectedKeys: [],
     depsFor: () => deps,
     registry: new SessionRegistry(() => NOW),
     onExitRequested: () => undefined,

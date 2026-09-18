@@ -7,6 +7,26 @@ documented in this file. The npm package is published as `jevwire` and the Claud
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-09-18
+
+### Fixed
+
+- **The daemon never answers an http hook with a non-2xx status.** A real session showed that
+  Claude Code surfaces any 4xx from a `type: "http"` hook to the user as a hook error — the fail-open
+  the spike (question 3) promised for refused connections does not extend to a refusal the daemon
+  itself answers. Every `POST /v1/hook/*` refusal — bad key, wrong protocol, unknown event, wrong
+  method, oversize body — is now answered `200 {}` and counted, so the refusal is still auditable in
+  `/jev:daemon status` (which now explains rejected posts) but nothing lands in the user's transcript.
+  The `/v1/session/*` routes keep their real 4xx statuses: `/v1/session/start`'s 401 is how
+  SessionStart recognises a stale daemon.
+- **The daemon accepts a request whose credential matches any key it holds.** It keeps every key
+  present in its environment at start (`CLAUDE_PLUGIN_OPTION_API_KEY`, `JEV_PLUGIN_API_KEY`,
+  `TYPESAFE_API_KEY`) rather than only the one `loadHookConfig` picked, because the option and the
+  shell can legitimately hold different keys and the hooks interpolate one of each. `SessionStart`
+  replaces a running daemon that does not hold every key the current environment has (matched by
+  8-hex-character sha256 fingerprints exposed in `/v1/health`), so a changed key takes effect at the
+  next session start instead of producing a stream of counted refusals.
+
 ## [0.5.0] — 2026-09-18, judgment quality
 
 **Every question the plugin asks was rewritten.** 0.4.x asked short prose questions and got back

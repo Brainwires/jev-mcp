@@ -14,7 +14,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { DecisionModel, EvaluateResult, Question } from "../../src/decision/types.js";
-import { authorize, credentials } from "../../src/hooks/daemon/auth.js";
+import { authorize, credentials, expectedKeysFrom, keyFingerprint } from "../../src/hooks/daemon/auth.js";
 import { SessionRegistry, sessionConfigOf } from "../../src/hooks/daemon/registry.js";
 import { MAX_BODY_BYTES, PROTOCOL, startDaemon, type DaemonHandle } from "../../src/hooks/daemon/server.js";
 import type { Deps } from "../../src/hooks/types.js";
@@ -50,7 +50,7 @@ afterEach(async () => {
 });
 
 interface StartOptions {
-  expectedKey?: string | null;
+  expectedKeys?: readonly string[];
   model?: DecisionModel | null;
   depsFor?: (sessionId: string) => Deps;
   registry?: SessionRegistry;
@@ -69,7 +69,7 @@ async function start(options: StartOptions = {}): Promise<{
   const registry = options.registry ?? new SessionRegistry(() => NOW);
   const handle = await startDaemon({
     port: 0,
-    expectedKey: options.expectedKey === undefined ? KEY : options.expectedKey,
+    expectedKeys: options.expectedKeys === undefined ? [KEY] : options.expectedKeys,
     depsFor: options.depsFor ?? ((): Deps => deps),
     registry,
     onExitRequested: options.onExitRequested ?? ((): void => undefined),
@@ -146,8 +146,19 @@ describe("GET /v1/health", () => {
   });
 
   it("says auth none when there is no key anywhere", async () => {
-    const { handle } = await start({ expectedKey: null });
-    expect((await health(handle.port)).auth).toBe("none");
+    const { handle } = await start({ expectedKeys: [] });
+    const body = await health(handle.port);
+    expect(body.auth).toBe("none");
+    expect(body.key_fingerprints).toEqual([]);
+  });
+
+  it("lists a fingerprint for each key it holds, and still no key itself", async () => {
+    const { handle } = await start({ expectedKeys: [KEY, "sk-other-key"] });
+    const body = await health(handle.port);
+    expect(body.auth).toBe("key");
+    expect(body.key_fingerprints).toEqual([KEY, "sk-other-key"].map(keyFingerprint));
+    expect(JSON.stringify(body)).not.toContain(KEY);
+    expect(JSON.stringify(body)).not.toContain("sk-other-key");
   });
 
   it("refuses anything but GET", async () => {
@@ -182,20 +193,43 @@ describe("authorization", () => {
     expect(reply.status).toBe(200);
   });
 
-  it("rejects a wrong key, an absent one, and an empty bearer on its own", async () => {
+  it("accepts any one of the keys it holds, in either header", async () => {
+    // The option and the shell can hold different keys, and the hooks
+    // interpolate one of each, so either alone has to get in.
+    const { handle } = await start({ expectedKeys: ["option-key", "env-key"] });
+    expect(
+      (await hook(handle.port, "PreToolUse", PRE, { authorization: "Bearer option-key" })).status,
+    ).toBe(200);
+    expect((await hook(handle.port, "PreToolUse", PRE, { "x-jev-env-key": "env-key" })).status).toBe(200);
+    const wrong = await hook(handle.port, "PreToolUse", PRE, { authorization: "Bearer other" });
+    expect(wrong.status).toBe(200);
+    expect(wrong.text).toBe("{}");
+    expect(handle.stats().unauthorized).toBe(1);
+  });
+
+  it("answers 200 {} to a wrong key on a hook route, and 401 to the same key on a session route", async () => {
     const { handle } = await start();
     for (const headers of [{ authorization: "Bearer wrong" }, {}, { authorization: "Bearer " }]) {
       const reply = await hook(handle.port, "PreToolUse", PRE, headers);
-      expect(reply.status, JSON.stringify(headers)).toBe(401);
-      // A 401 is a non-blocking error to Claude Code, so the tool call still
-      // runs. The body says nothing either way.
-      expect(reply.text).toBe("{}");
+      // Claude Code shows any non-2xx from an http hook to the user as a hook
+      // error, so the refusal is answered in silence and counted instead.
+      expect(reply.status, JSON.stringify(headers)).toBe(200);
+      expect(reply.text, JSON.stringify(headers)).toBe("{}");
     }
     expect(handle.stats().unauthorized).toBe(3);
+    // The session routes keep their real status: `/v1/session/start` uses a
+    // 401 from them to recognise a stale daemon.
+    const session = await fetch(`http://127.0.0.1:${handle.port}/v1/session/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer wrong" },
+      body: JSON.stringify({ session_id: "s1" }),
+    });
+    expect(session.status).toBe(401);
+    expect(await session.text()).toBe("{}");
   });
 
   it("serves everything when no key is configured", async () => {
-    const { handle } = await start({ expectedKey: null });
+    const { handle } = await start({ expectedKeys: [] });
     expect((await hook(handle.port, "PreToolUse", PRE, {})).status).toBe(200);
   });
 
@@ -218,23 +252,44 @@ describe("authorize", () => {
   it("compares secrets of different lengths without throwing", () => {
     // `timingSafeEqual` rejects buffers of unequal length, which is why this
     // hashes first. A key one character longer must simply not match.
-    expect(authorize({ authorization: "Bearer short" }, "a-much-longer-key")).toBe(false);
-    expect(authorize({ authorization: `Bearer ${"x".repeat(500)}` }, "y")).toBe(false);
+    expect(authorize({ authorization: "Bearer short" }, ["a-much-longer-key"])).toBe(false);
+    expect(authorize({ authorization: `Bearer ${"x".repeat(500)}` }, ["y"])).toBe(false);
   });
 
   it("accepts anything in unauthenticated mode, including nothing", () => {
-    expect(authorize({}, null)).toBe(true);
-    expect(authorize({ authorization: "Bearer junk" }, null)).toBe(true);
+    expect(authorize({}, [])).toBe(true);
+    expect(authorize({ authorization: "Bearer junk" }, [])).toBe(true);
+  });
+
+  it("accepts a credential matching any held key", () => {
+    expect(authorize({ authorization: "Bearer one" }, ["one", "two"])).toBe(true);
+    expect(authorize({ "x-jev-env-key": "two" }, ["one", "two"])).toBe(true);
+    expect(authorize({ authorization: "Bearer three" }, ["one", "two"])).toBe(false);
+    expect(authorize({}, ["one", "two"])).toBe(false);
+  });
+
+  it("does not leak the key through a fingerprint", () => {
+    for (const key of ["abc", KEY]) {
+      expect(keyFingerprint(key)).toMatch(/^[0-9a-f]{8}$/);
+    }
+    expect(keyFingerprint("abc")).not.toBe(keyFingerprint("abd"));
+  });
+
+  it("reads every key the environment holds, in order, trimmed and de-duplicated", () => {
+    expect(expectedKeysFrom({ CLAUDE_PLUGIN_OPTION_API_KEY: " a ", JEV_PLUGIN_API_KEY: "", TYPESAFE_API_KEY: "a" })).toEqual(["a"]);
+    expect(expectedKeysFrom({})).toEqual([]);
+    expect(expectedKeysFrom({ TYPESAFE_API_KEY: "b", CLAUDE_PLUGIN_OPTION_API_KEY: "a" })).toEqual(["a", "b"]);
+    expect(expectedKeysFrom({ JEV_PLUGIN_API_KEY: "j", TYPESAFE_API_KEY: "j" })).toEqual(["j"]);
   });
 });
 
 // ------------------------------------------------------------------ routing
 
 describe("routing", () => {
-  it("404s an event it has no handler for, and counts it", async () => {
+  it("answers 200 {} to an event it has no handler for, and counts it", async () => {
     const { handle } = await start();
     const reply = await hook(handle.port, "NoSuchEvent", PRE);
-    expect(reply.status).toBe(404);
+    expect(reply.status).toBe(200);
     expect(reply.text).toBe("{}");
     expect(handle.stats().unknown_event).toBe(1);
   });
@@ -249,8 +304,15 @@ describe("routing", () => {
     expect(response.status).toBe(404);
   });
 
+  it("200s a GET on a hook route, which is not POST and not a session route", async () => {
+    const { handle } = await start();
+    const response = await fetch(`http://127.0.0.1:${handle.port}/v1/hook/PreToolUse`);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("{}");
+  });
+
   it("has a route for every handler, including the Approval label", async () => {
-    const { handle } = await start({ expectedKey: null });
+    const { handle } = await start({ expectedKeys: [] });
     for (const event of [
       "PreToolUse",
       "PostToolUse",
@@ -267,14 +329,25 @@ describe("routing", () => {
     }
   });
 
-  it("409s a caller that declares a different protocol", async () => {
+  it("answers 200 {} to a hook caller on a different protocol, and still 409s one on a session route", async () => {
     const { handle } = await start();
     const reply = await hook(handle.port, "PreToolUse", PRE, {
       authorization: `Bearer ${KEY}`,
       "x-jev-protocol": "99",
     });
-    expect(reply.status).toBe(409);
+    expect(reply.status).toBe(200);
+    expect(reply.text).toBe("{}");
     expect(handle.stats().protocol_mismatch).toBe(1);
+    const session = await fetch(`http://127.0.0.1:${handle.port}/v1/session/start`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${KEY}`,
+        "x-jev-protocol": "99",
+      },
+      body: JSON.stringify({ session_id: "s1" }),
+    });
+    expect(session.status).toBe(409);
   });
 
   it("accepts the matching protocol, and an absent one", async () => {
@@ -288,13 +361,16 @@ describe("routing", () => {
     expect((await hook(handle.port, "PreToolUse", PRE)).status).toBe(200);
   });
 
-  it("checks authorization before the route, so an unknown path cannot be probed", async () => {
+  it("checks authorization before the route, so an unknown hook path is refused in silence", async () => {
     const { handle } = await start();
     const response = await fetch(`http://127.0.0.1:${handle.port}/v1/hook/NoSuchEvent`, {
       method: "POST",
       body: "{}",
     });
-    expect(response.status).toBe(401);
+    // A hook route answers every refusal `200 {}`; the counter is the record.
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("{}");
+    expect(handle.stats().unauthorized).toBe(1);
   });
 });
 
@@ -355,7 +431,7 @@ describe("serving hooks", () => {
     const deps = makeDeps(dir, { now: NOW });
     const handle = await startDaemon({
       port: 0,
-      expectedKey: null,
+      expectedKeys: [],
       depsFor: (): Deps => deps,
       registry: new SessionRegistry(() => NOW),
       onExitRequested: () => undefined,
@@ -596,7 +672,7 @@ describe("lifetime", () => {
 
     const again = await startDaemon({
       port,
-      expectedKey: null,
+      expectedKeys: [],
       depsFor: (): Deps => makeDeps(dir, { now: NOW }),
       registry: new SessionRegistry(() => NOW),
       onExitRequested: () => undefined,
@@ -613,7 +689,7 @@ describe("lifetime", () => {
     await expect(
       startDaemon({
         port: handle.port,
-        expectedKey: null,
+        expectedKeys: [],
         depsFor: (): Deps => makeDeps(dir, { now: NOW }),
         registry: new SessionRegistry(() => NOW),
         onExitRequested: () => undefined,

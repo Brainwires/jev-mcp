@@ -20,6 +20,12 @@
  * therefore *absent*, not wrong — treating it as wrong would lock out every
  * install that sets the key in only one of the two places.
  *
+ * The daemon holds every key present in its environment — the plugin option,
+ * `JEV_PLUGIN_API_KEY` and `TYPESAFE_API_KEY` — and accepts a credential
+ * matching any of them. The option and the shell can legitimately hold
+ * different keys, and the hooks interpolate one of each, so an install that
+ * rotated one half and not the other still has a daemon that knows both.
+ *
  * With no key configured anywhere the daemon runs unauthenticated. That is not
  * a hole being waved through: with no key there is nothing to spend and no
  * judgment to make, so the daemon has no secret to leak and nothing to do. It
@@ -33,8 +39,8 @@ export type Headers = Record<string, string | string[] | undefined>;
 
 export type AuthMode = "key" | "none";
 
-export function authMode(expectedKey: string | null): AuthMode {
-  return expectedKey === null || expectedKey === "" ? "none" : "key";
+export function authMode(expectedKeys: readonly string[]): AuthMode {
+  return expectedKeys.length === 0 ? "none" : "key";
 }
 
 function header(headers: Headers, name: string): string | undefined {
@@ -74,16 +80,45 @@ function sameSecret(a: string, b: string): boolean {
 }
 
 /**
+ * The keys the daemon's environment holds, trimmed, empty ones dropped,
+ * duplicates collapsed (first occurrence wins), in a fixed order.
+ *
+ * The plugin option, `JEV_PLUGIN_API_KEY` and the shell's `TYPESAFE_API_KEY`
+ * are three places the same install can put a key, and the hooks interpolate
+ * one of each into the two headers, so the daemon serves them all rather than
+ * only the one `loadHookConfig` happened to pick.
+ */
+export function expectedKeysFrom(env: Record<string, string | undefined>): string[] {
+  const keys: string[] = [];
+  for (const raw of [env.CLAUDE_PLUGIN_OPTION_API_KEY, env.JEV_PLUGIN_API_KEY, env.TYPESAFE_API_KEY]) {
+    const value = (raw ?? "").trim();
+    if (value !== "" && !keys.includes(value)) keys.push(value);
+  }
+  return keys;
+}
+
+/**
+ * The first 8 lowercase hex characters of `sha256(key)`.
+ *
+ * It identifies a key in a status line without revealing it: 32 bits of a hash
+ * of a 100+ character secret is not a recovery path.
+ */
+export function keyFingerprint(key: string): string {
+  return createHash("sha256").update(key, "utf8").digest("hex").slice(0, 8);
+}
+
+/**
  * True when the request may be served.
  *
- * `expectedKey === null` is unauthenticated mode and accepts everything; with a
- * key configured, at least one non-empty credential has to match it.
+ * No key held is unauthenticated mode and accepts everything; with keys held,
+ * at least one non-empty credential has to match one of them.
  */
-export function authorize(headers: Headers, expectedKey: string | null): boolean {
-  if (authMode(expectedKey) === "none") return true;
-  const expected = expectedKey as string;
+export function authorize(headers: Headers, expectedKeys: readonly string[]): boolean {
+  if (expectedKeys.length === 0) return true;
   for (const candidate of credentials(headers)) {
-    if (sameSecret(candidate, expected)) return true;
+    for (const key of expectedKeys) {
+      if (sameSecret(candidate, key)) return true;
+    }
   }
   return false;
 }

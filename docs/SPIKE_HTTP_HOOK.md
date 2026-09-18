@@ -74,9 +74,12 @@ Record the answers in this file under "Results" with the Claude Code version (`c
 | 5 | Fired: the `async: true` PostToolUse entry reached the listener 1–3 s after each PreToolUse. Whether it blocked the turn was not measurable headless (no delay was added). The daemon design answers `{}` first and does bookkeeping after, so it does not depend on this. | listener log ordering |
 | 6 | **Yes.** `UserPromptSubmit` reached the listener before the first `PreToolUse` of the turn in all three runs. Plugin command `SessionStart` hooks ran before the prompt (they appear first in the transcript). | listener log ordering; transcript |
 | 7 | Not measurable headless. Cosmetic. | — |
+| 8 | **A non-2xx reply is NOT silent** (the one question the headless spike could not see and a real session answered the hard way): Claude Code shows it to the user as a hook error. Since 0.5.1 the daemon answers every hook-route refusal `200 {}` and counts it; only the `/v1/session/*` routes keep their real 4xx statuses, because `/v1/session/start` uses a 401 to recognise a stale daemon. | daemon.test.ts asserts 200 `{}` on hook-route refusals and 401 on the session route |
 
 Design consequences: pure `type: "http"` hooks on the hot path; a command hook only on `SessionStart`
 (to start/replace the daemon); keep a command fallback on `UserPromptSubmit` only (once per prompt,
 protects the first prompt when the daemon is cold — cheap insurance even though question 6 passed).
 Auth: the shell key interpolates; inside the plugin `CLAUDE_PLUGIN_OPTION_API_KEY` is expected to as
 well (docs), but the daemon must accept either header and must treat an empty `Bearer` as absent.
+And a refusal the daemon can only count, never answer with a status: an http hook route has exactly
+one user-visible outcome, so anything it wants to say has to fit in a counter.

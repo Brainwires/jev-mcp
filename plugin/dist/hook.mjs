@@ -621,6 +621,55 @@ function loadHookConfig(env = process.env) {
   };
 }
 
+// src/hooks/daemon/auth.ts
+import { createHash, timingSafeEqual } from "node:crypto";
+function authMode(expectedKeys) {
+  return expectedKeys.length === 0 ? "none" : "key";
+}
+function header(headers, name) {
+  const raw = headers[name] ?? headers[name.toLowerCase()];
+  if (raw === void 0) return void 0;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === "string" ? value : void 0;
+}
+function credentials(headers) {
+  const found = [];
+  const authorization = header(headers, "authorization")?.trim();
+  if (authorization !== void 0) {
+    const match = /^Bearer\s*(.*)$/i.exec(authorization);
+    const token = (match?.[1] ?? "").trim();
+    if (token !== "") found.push(token);
+  }
+  const envKey = header(headers, "x-jev-env-key")?.trim();
+  if (envKey !== void 0 && envKey !== "") found.push(envKey);
+  return found;
+}
+function sameSecret(a, b) {
+  const left = createHash("sha256").update(a, "utf8").digest();
+  const right = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(left, right);
+}
+function expectedKeysFrom(env) {
+  const keys = [];
+  for (const raw of [env.CLAUDE_PLUGIN_OPTION_API_KEY, env.JEV_PLUGIN_API_KEY, env.TYPESAFE_API_KEY]) {
+    const value = (raw ?? "").trim();
+    if (value !== "" && !keys.includes(value)) keys.push(value);
+  }
+  return keys;
+}
+function keyFingerprint(key) {
+  return createHash("sha256").update(key, "utf8").digest("hex").slice(0, 8);
+}
+function authorize(headers, expectedKeys) {
+  if (expectedKeys.length === 0) return true;
+  for (const candidate of credentials(headers)) {
+    for (const key of expectedKeys) {
+      if (sameSecret(candidate, key)) return true;
+    }
+  }
+  return false;
+}
+
 // src/hooks/daemon/control.ts
 import { spawn } from "node:child_process";
 import { closeSync as closeSync2 } from "node:fs";
@@ -773,7 +822,7 @@ function openLog(dataDir) {
 }
 
 // src/hooks/version.ts
-var HOOK_VERSION = "0.5.0";
+var HOOK_VERSION = "0.5.1";
 
 // src/hooks/daemon/control.ts
 function isAlive(pid) {
@@ -954,6 +1003,9 @@ async function waitForExit(pid, budgetMs) {
   }
   return true;
 }
+function missingFingerprint(held, wanted) {
+  return wanted !== void 0 && wanted.length > 0 && Array.isArray(held) && wanted.some((f) => !held.includes(f));
+}
 function recordConflict(options, previous) {
   const bundle = bundleIdentity(options.bundlePath);
   const now = Date.now();
@@ -997,7 +1049,7 @@ async function ensureDaemon(options) {
     const mine = bundleIdentity(options.bundlePath);
     const probe = await probeHealth(options.port, PROBE_TIMEOUT_MS);
     if (probe.kind === "jev") {
-      const stale = probe.health.protocol !== PROTOCOL || mine.mtime > 0 && probe.health.bundle_mtime > 0 && probe.health.bundle_mtime < mine.mtime;
+      const stale = probe.health.protocol !== PROTOCOL || mine.mtime > 0 && probe.health.bundle_mtime > 0 && probe.health.bundle_mtime < mine.mtime || missingFingerprint(probe.health.key_fingerprints, options.keyFingerprints);
       if (!stale) return "running";
       return await replaceDaemon(options);
     }
@@ -1026,7 +1078,7 @@ async function ensureDaemon(options) {
       async () => {
         const second = await probeHealth(options.port, PROBE_TIMEOUT_MS);
         if (second.kind === "jev") {
-          const stale = second.health.protocol !== PROTOCOL || mine.mtime > 0 && second.health.bundle_mtime > 0 && second.health.bundle_mtime < mine.mtime;
+          const stale = second.health.protocol !== PROTOCOL || mine.mtime > 0 && second.health.bundle_mtime > 0 && second.health.bundle_mtime < mine.mtime || missingFingerprint(second.health.key_fingerprints, options.keyFingerprints);
           return stale ? void 0 : "running";
         }
         if (second.kind === "foreign") {
@@ -1040,7 +1092,7 @@ async function ensureDaemon(options) {
     if (result === void 0) {
       const third = await probeHealth(options.port, PROBE_TIMEOUT_MS);
       if (third.kind === "jev") {
-        const stale = third.health.protocol !== PROTOCOL || mine.mtime > 0 && third.health.bundle_mtime > 0 && third.health.bundle_mtime < mine.mtime;
+        const stale = third.health.protocol !== PROTOCOL || mine.mtime > 0 && third.health.bundle_mtime > 0 && third.health.bundle_mtime < mine.mtime || missingFingerprint(third.health.key_fingerprints, options.keyFingerprints);
         return stale ? await replaceDaemon(options) : "running";
       }
       return "failed";
@@ -1067,7 +1119,7 @@ async function stopDaemon(dataDir, port, waitMs = WAIT_MS) {
 }
 
 // src/hooks/memo.ts
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 var MEMO_MAX_ENTRIES = 256;
 var MEMO_TTL_MS = 5 * 60 * 1e3;
 var DEFAULT_CONCURRENCY = 4;
@@ -1078,7 +1130,7 @@ function canonicalJson(value) {
   return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
 }
 function memoKey(model, state, questions) {
-  return createHash("sha256").update(canonicalJson({ model: model ?? null, state, questions })).digest("hex");
+  return createHash2("sha256").update(canonicalJson({ model: model ?? null, state, questions })).digest("hex");
 }
 function isTimeout(error) {
   const name = error?.name;
@@ -1227,7 +1279,7 @@ import {
 import { basename, dirname, join as join3 } from "node:path";
 
 // src/hooks/tripwire.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 var TRIP_TTL_MS = 30 * 60 * 1e3;
 var MAX_TRIPS = 20;
 var MIN_AFFIRM_CHARS = 12;
@@ -1292,7 +1344,7 @@ function canonicalAction(toolName, toolInput) {
 }
 function fingerprint(toolName, toolInput) {
   const canonical = canonicalAction(toolName, toolInput);
-  return createHash2("sha256").update(`${toolName}\0${canonical}`).digest("hex").slice(0, 16);
+  return createHash3("sha256").update(`${toolName}\0${canonical}`).digest("hex").slice(0, 16);
 }
 function tripIdOf(fingerprintHex) {
   return `t-${fingerprintHex.slice(0, 8)}`;
@@ -4849,43 +4901,6 @@ async function runEvent(event, raw, deps) {
   return handler(input, deps);
 }
 
-// src/hooks/daemon/auth.ts
-import { createHash as createHash3, timingSafeEqual } from "node:crypto";
-function authMode(expectedKey) {
-  return expectedKey === null || expectedKey === "" ? "none" : "key";
-}
-function header(headers, name) {
-  const raw = headers[name] ?? headers[name.toLowerCase()];
-  if (raw === void 0) return void 0;
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  return typeof value === "string" ? value : void 0;
-}
-function credentials(headers) {
-  const found = [];
-  const authorization = header(headers, "authorization")?.trim();
-  if (authorization !== void 0) {
-    const match = /^Bearer\s*(.*)$/i.exec(authorization);
-    const token = (match?.[1] ?? "").trim();
-    if (token !== "") found.push(token);
-  }
-  const envKey = header(headers, "x-jev-env-key")?.trim();
-  if (envKey !== void 0 && envKey !== "") found.push(envKey);
-  return found;
-}
-function sameSecret(a, b) {
-  const left = createHash3("sha256").update(a, "utf8").digest();
-  const right = createHash3("sha256").update(b, "utf8").digest();
-  return timingSafeEqual(left, right);
-}
-function authorize(headers, expectedKey) {
-  if (authMode(expectedKey) === "none") return true;
-  const expected = expectedKey;
-  for (const candidate of credentials(headers)) {
-    if (sameSecret(candidate, expected)) return true;
-  }
-  return false;
-}
-
 // src/hooks/daemon/server.ts
 var HOOK_PREFIX = "/v1/hook/";
 function bump(counters, key) {
@@ -4977,7 +4992,9 @@ async function startDaemon(options) {
     started_at: startedAt,
     uptime_ms: Date.now() - startedAt,
     sessions: options.registry.count(),
-    auth: authMode(options.expectedKey),
+    auth: authMode(options.expectedKeys),
+    // Identifies each key in `/jev:daemon status` without revealing it.
+    key_fingerprints: options.expectedKeys.map(keyFingerprint),
     counters: merge(counters, options.modelStats)
   });
   const onRequest = (req, res) => {
@@ -4994,42 +5011,41 @@ async function startDaemon(options) {
           respond(res, 200, health());
           return;
         }
-        if (!authorize(req.headers, options.expectedKey)) {
-          bump(counters, "unauthorized");
+        const isHook = url.startsWith(HOOK_PREFIX);
+        const event = isHook ? decodeURIComponent(url.slice(HOOK_PREFIX.length)) : "";
+        const refuse = (status) => {
           req.resume();
-          respond(res, 401, {});
+          respond(res, isHook ? 200 : status, {});
+        };
+        if (!authorize(req.headers, options.expectedKeys)) {
+          bump(counters, "unauthorized");
+          refuse(401);
           return;
         }
         if (req.method !== "POST") {
-          req.resume();
-          respond(res, 405, {});
+          refuse(405);
           return;
         }
-        const isHook = url.startsWith(HOOK_PREFIX);
-        const event = isHook ? decodeURIComponent(url.slice(HOOK_PREFIX.length)) : "";
         if (isHook && HANDLERS[event] === void 0) {
           bump(counters, "unknown_event");
-          req.resume();
-          respond(res, 404, {});
+          refuse(404);
           return;
         }
         if (!isHook && url !== "/v1/session/start" && url !== "/v1/session/end") {
-          req.resume();
-          respond(res, 404, {});
+          refuse(404);
           return;
         }
         const declared = req.headers["x-jev-protocol"];
         const declaredText = Array.isArray(declared) ? declared[0] : declared;
         if (typeof declaredText === "string" && declaredText.trim() !== "" && declaredText.trim() !== String(PROTOCOL)) {
           bump(counters, "protocol_mismatch");
-          req.resume();
-          respond(res, 409, {});
+          refuse(409);
           return;
         }
         const raw = await readBody(req, MAX_BODY_BYTES);
         if (raw === "too-large") {
           bump(counters, "oversize");
-          respond(res, 413, {});
+          respond(res, isHook ? 200 : 413, {});
           return;
         }
         let parsed;
@@ -5262,10 +5278,11 @@ async function runDaemon(argv, env) {
       process.exit(0);
     })();
   };
+  const keys = expectedKeysFrom(env);
   try {
     handle = await startDaemon({
       port,
-      expectedKey: config.apiKey,
+      expectedKeys: keys,
       depsFor,
       registry,
       idleMs: config.daemonIdleMs,
@@ -5311,7 +5328,7 @@ async function runDaemon(argv, env) {
 `);
   });
   process.stderr.write(
-    `[jev-daemon] v${HOOK_VERSION} protocol ${PROTOCOL} listening on 127.0.0.1:${live.port}, data ${config.dataDir}, auth ${config.apiKey === null ? "none" : "key"}, restarts ${restarts}
+    `[jev-daemon] v${HOOK_VERSION} protocol ${PROTOCOL} listening on 127.0.0.1:${live.port}, data ${config.dataDir}, auth ${keys.length === 0 ? "none" : `${keys.length} key${keys.length === 1 ? "" : "s"}`}, restarts ${restarts}
 `
   );
 }
@@ -5373,11 +5390,12 @@ function duration(raw) {
 function daemonReport(config, view, now = Date.now()) {
   const lines = ["Daemon", `  port: 127.0.0.1:${config.daemonPort}   protocol: ${PROTOCOL}`];
   const { state, health } = view;
+  const fingerprints = health?.key_fingerprints;
   if (health !== void 0) {
     lines.push(
       `  status: up, answering on this shell's loopback`,
       `  pid ${health.pid}, version ${health.version}, protocol ${health.protocol}, up ${duration(health.uptime_ms)}`,
-      `  sessions registered: ${health.sessions}   auth: ${health.auth}${health.auth === "none" ? " (no API key configured anywhere: unauthenticated, and nothing to spend)" : ""}`
+      `  sessions registered: ${health.sessions}   auth: ${health.auth}${health.auth === "none" ? " (no API key configured anywhere: unauthenticated, and nothing to spend)" : ""}${fingerprints !== void 0 && fingerprints.length > 0 ? ` (fingerprints ${fingerprints.join(", ")})` : ""}`
     );
     if (health.protocol !== PROTOCOL) {
       lines.push(
@@ -5421,6 +5439,9 @@ function daemonReport(config, view, now = Date.now()) {
       `  jev calls: ${counters.jev_calls}   memo hits: ${counters.memo_hits}   timeouts: ${counters.jev_timeouts}   errors: ${counters.jev_errors}`,
       `  sessions: ${counters.sessions_started} started, ${counters.sessions_ended} ended   deadline overruns: ${counters.deadline_overruns}`,
       `  rejected: ${counters.unauthorized} unauthorized, ${counters.protocol_mismatch} wrong protocol, ${counters.unknown_event} unknown event, ${counters.bad_request} unparseable, ${counters.oversize} oversize`,
+      ...counters.unauthorized > 0 ? [
+        `  ${counters.unauthorized} hook posts carried a key this daemon does not hold. The hooks send the plugin's api_key option and the shell's TYPESAFE_API_KEY; the daemon accepts any key present when it started, and /jev:daemon restart picks up a changed one.`
+      ] : [],
       health?.counters === void 0 ? "  counters read from the state file, which is rewritten every 15 s, so they lag by up to that." : "  counters read live from the daemon."
     );
   }
@@ -5982,7 +6003,13 @@ async function postJson(port, path, body, apiKey, timeoutMs) {
   });
 }
 async function startDaemonForSession(config, sessionId, bundlePath) {
-  const options = { dataDir: config.dataDir, port: config.daemonPort, bundlePath, env: process.env };
+  const options = {
+    dataDir: config.dataDir,
+    port: config.daemonPort,
+    bundlePath,
+    env: process.env,
+    keyFingerprints: expectedKeysFrom(process.env).map(keyFingerprint)
+  };
   let result = await ensureDaemon(options);
   if (result === "conflict") {
     const message = daemonSystemMessage(result, config.daemonPort);

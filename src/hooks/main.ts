@@ -27,6 +27,7 @@
 import { JevDecisionModel } from "../jev/client.js";
 import type { DecisionModel } from "../decision/types.js";
 import { loadHookConfig, type HookConfig } from "./config.js";
+import { expectedKeysFrom, keyFingerprint } from "./daemon/auth.js";
 import { ensureDaemon, probeHealth, replaceDaemon, stopDaemon, type EnsureResult } from "./daemon/control.js";
 import { runDaemon } from "./daemon/main.js";
 import { PROTOCOL } from "./daemon/protocol.js";
@@ -274,7 +275,16 @@ async function startDaemonForSession(
   sessionId: string,
   bundlePath: string,
 ): Promise<{ result: EnsureResult; systemMessage?: string }> {
-  const options = { dataDir: config.dataDir, port: config.daemonPort, bundlePath, env: process.env };
+  // Fingerprints of every key this environment holds, so `ensureDaemon`
+  // replaces a running daemon that is missing one: a key changed since it
+  // started takes effect at the next session start.
+  const options = {
+    dataDir: config.dataDir,
+    port: config.daemonPort,
+    bundlePath,
+    env: process.env,
+    keyFingerprints: expectedKeysFrom(process.env).map(keyFingerprint),
+  };
   let result = await ensureDaemon(options);
   if (result === "conflict") {
     const message = daemonSystemMessage(result, config.daemonPort);

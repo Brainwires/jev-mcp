@@ -18,6 +18,7 @@
 import { JevDecisionModel } from "../../jev/client.js";
 import type { DecisionModel } from "../../decision/types.js";
 import { loadHookConfig, type Env, type HookConfig } from "../config.js";
+import { expectedKeysFrom } from "./auth.js";
 import { LimitedModel, MemoizedModel } from "../memo.js";
 import { Store } from "../store.js";
 import type { Deps } from "../types.js";
@@ -207,10 +208,13 @@ export async function runDaemon(argv: readonly string[], env: Env): Promise<void
     })();
   };
 
+  // Every key the environment holds, not only the one `loadHookConfig` picked:
+  // the hooks interpolate both the plugin option and the shell's key.
+  const keys = expectedKeysFrom(env);
   try {
     handle = await startDaemon({
       port,
-      expectedKey: config.apiKey,
+      expectedKeys: keys,
       depsFor,
       registry,
       idleMs: config.daemonIdleMs,
@@ -265,6 +269,7 @@ export async function runDaemon(argv: readonly string[], env: Env): Promise<void
 
   process.stderr.write(
     `[jev-daemon] v${HOOK_VERSION} protocol ${PROTOCOL} listening on 127.0.0.1:${live.port}, ` +
-      `data ${config.dataDir}, auth ${config.apiKey === null ? "none" : "key"}, restarts ${restarts}\n`,
+      `data ${config.dataDir}, auth ${keys.length === 0 ? "none" : `${keys.length} key${keys.length === 1 ? "" : "s"}`}, ` +
+      `restarts ${restarts}\n`,
   );
 }

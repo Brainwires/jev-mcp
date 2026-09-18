@@ -113,6 +113,7 @@ function duration(raw: number): string {
 export function daemonReport(config: HookConfig, view: DaemonView, now: number = Date.now()): string[] {
   const lines = ["Daemon", `  port: 127.0.0.1:${config.daemonPort}   protocol: ${PROTOCOL}`];
   const { state, health } = view;
+  const fingerprints = health?.key_fingerprints;
 
   if (health !== undefined) {
     lines.push(
@@ -120,7 +121,7 @@ export function daemonReport(config: HookConfig, view: DaemonView, now: number =
       `  pid ${health.pid}, version ${health.version}, protocol ${health.protocol}, up ${duration(health.uptime_ms)}`,
       `  sessions registered: ${health.sessions}   auth: ${health.auth}${
         health.auth === "none" ? " (no API key configured anywhere: unauthenticated, and nothing to spend)" : ""
-      }`,
+      }${fingerprints !== undefined && fingerprints.length > 0 ? ` (fingerprints ${fingerprints.join(", ")})` : ""}`,
     );
     if (health.protocol !== PROTOCOL) {
       lines.push(
@@ -174,6 +175,11 @@ export function daemonReport(config: HookConfig, view: DaemonView, now: number =
         `deadline overruns: ${counters.deadline_overruns}`,
       `  rejected: ${counters.unauthorized} unauthorized, ${counters.protocol_mismatch} wrong protocol, ` +
         `${counters.unknown_event} unknown event, ${counters.bad_request} unparseable, ${counters.oversize} oversize`,
+      ...(counters.unauthorized > 0
+        ? [
+            `  ${counters.unauthorized} hook posts carried a key this daemon does not hold. The hooks send the plugin's api_key option and the shell's TYPESAFE_API_KEY; the daemon accepts any key present when it started, and /jev:daemon restart picks up a changed one.`,
+          ]
+        : []),
       health?.counters === undefined
         ? "  counters read from the state file, which is rewritten every 15 s, so they lag by up to that."
         : "  counters read live from the daemon.",

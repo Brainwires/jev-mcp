@@ -6,3 +6,5 @@ node_modules/
 .env
 *.log
 .DS_Store
+# fable-lite briefs and run transcripts: local orchestration state
+.fable-lite/

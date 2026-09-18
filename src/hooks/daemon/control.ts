@@ -58,6 +58,8 @@ export interface Health {
   uptime_ms: number;
   sessions: number;
   auth: string;
+  /** Absent on a daemon from before 0.5.1. Fingerprints, never the keys. */
+  key_fingerprints?: string[];
   counters?: DaemonCounters;
 }
 
@@ -90,6 +92,13 @@ export interface EnsureOptions {
    * otherwise be measuring the CPU rather than the code.
    */
   waitMs?: number;
+  /**
+   * Fingerprints of the keys this caller's environment holds. A running daemon
+   * missing any of them is stale and gets replaced, so a changed key takes
+   * effect at the next session start. A health without `key_fingerprints` (an
+   * older daemon) is never stale on this criterion.
+   */
+  keyFingerprints?: readonly string[];
 }
 
 /** Does a process with this pid exist? `kill(pid, 0)` answers without signalling. */
@@ -341,6 +350,21 @@ async function waitForExit(pid: number, budgetMs: number): Promise<boolean> {
   return true;
 }
 
+/**
+ * True when `wanted` holds a fingerprint the daemon's health does not.
+ *
+ * A health without `key_fingerprints` (a daemon from before 0.5.1) is never
+ * stale on this criterion, and neither is an empty `wanted`.
+ */
+function missingFingerprint(held: readonly string[] | undefined, wanted: readonly string[] | undefined): boolean {
+  return (
+    wanted !== undefined &&
+    wanted.length > 0 &&
+    Array.isArray(held) &&
+    wanted.some((f) => !held.includes(f))
+  );
+}
+
 function recordConflict(options: EnsureOptions, previous: DaemonState | undefined): void {
   const bundle = bundleIdentity(options.bundlePath);
   const now = Date.now();
@@ -402,7 +426,8 @@ export async function ensureDaemon(options: EnsureOptions): Promise<EnsureResult
     if (probe.kind === "jev") {
       const stale =
         probe.health.protocol !== PROTOCOL ||
-        (mine.mtime > 0 && probe.health.bundle_mtime > 0 && probe.health.bundle_mtime < mine.mtime);
+        (mine.mtime > 0 && probe.health.bundle_mtime > 0 && probe.health.bundle_mtime < mine.mtime) ||
+        missingFingerprint(probe.health.key_fingerprints, options.keyFingerprints);
       if (!stale) return "running";
       return await replaceDaemon(options);
     }
@@ -454,7 +479,8 @@ export async function ensureDaemon(options: EnsureOptions): Promise<EnsureResult
         if (second.kind === "jev") {
           const stale =
             second.health.protocol !== PROTOCOL ||
-            (mine.mtime > 0 && second.health.bundle_mtime > 0 && second.health.bundle_mtime < mine.mtime);
+            (mine.mtime > 0 && second.health.bundle_mtime > 0 && second.health.bundle_mtime < mine.mtime) ||
+            missingFingerprint(second.health.key_fingerprints, options.keyFingerprints);
           return stale ? undefined : ("running" as EnsureResult);
         }
         if (second.kind === "foreign") {
@@ -472,7 +498,8 @@ export async function ensureDaemon(options: EnsureOptions): Promise<EnsureResult
       if (third.kind === "jev") {
         const stale =
           third.health.protocol !== PROTOCOL ||
-          (mine.mtime > 0 && third.health.bundle_mtime > 0 && third.health.bundle_mtime < mine.mtime);
+          (mine.mtime > 0 && third.health.bundle_mtime > 0 && third.health.bundle_mtime < mine.mtime) ||
+          missingFingerprint(third.health.key_fingerprints, options.keyFingerprints);
         return stale ? await replaceDaemon(options) : "running";
       }
       return "failed";

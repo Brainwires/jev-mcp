@@ -29478,7 +29478,7 @@ function openLog(dataDir) {
 }
 
 // src/hooks/version.ts
-var HOOK_VERSION = "0.5.0";
+var HOOK_VERSION = "0.5.1";
 
 // src/hooks/daemon/control.ts
 function isAlive(pid) {
@@ -29651,6 +29651,9 @@ async function terminate(pid, port, budgetMs = WAIT_MS) {
   }
   await waitForPortFree(port, 500);
 }
+function missingFingerprint(held, wanted) {
+  return wanted !== void 0 && wanted.length > 0 && Array.isArray(held) && wanted.some((f) => !held.includes(f));
+}
 function recordConflict(options, previous) {
   const bundle = bundleIdentity(options.bundlePath);
   const now = Date.now();
@@ -29694,7 +29697,7 @@ async function ensureDaemon(options) {
     const mine = bundleIdentity(options.bundlePath);
     const probe = await probeHealth(options.port, PROBE_TIMEOUT_MS);
     if (probe.kind === "jev") {
-      const stale = probe.health.protocol !== PROTOCOL || mine.mtime > 0 && probe.health.bundle_mtime > 0 && probe.health.bundle_mtime < mine.mtime;
+      const stale = probe.health.protocol !== PROTOCOL || mine.mtime > 0 && probe.health.bundle_mtime > 0 && probe.health.bundle_mtime < mine.mtime || missingFingerprint(probe.health.key_fingerprints, options.keyFingerprints);
       if (!stale) return "running";
       return await replaceDaemon(options);
     }
@@ -29723,7 +29726,7 @@ async function ensureDaemon(options) {
       async () => {
         const second = await probeHealth(options.port, PROBE_TIMEOUT_MS);
         if (second.kind === "jev") {
-          const stale = second.health.protocol !== PROTOCOL || mine.mtime > 0 && second.health.bundle_mtime > 0 && second.health.bundle_mtime < mine.mtime;
+          const stale = second.health.protocol !== PROTOCOL || mine.mtime > 0 && second.health.bundle_mtime > 0 && second.health.bundle_mtime < mine.mtime || missingFingerprint(second.health.key_fingerprints, options.keyFingerprints);
           return stale ? void 0 : "running";
         }
         if (second.kind === "foreign") {
@@ -29737,7 +29740,7 @@ async function ensureDaemon(options) {
     if (result === void 0) {
       const third = await probeHealth(options.port, PROBE_TIMEOUT_MS);
       if (third.kind === "jev") {
-        const stale = third.health.protocol !== PROTOCOL || mine.mtime > 0 && third.health.bundle_mtime > 0 && third.health.bundle_mtime < mine.mtime;
+        const stale = third.health.protocol !== PROTOCOL || mine.mtime > 0 && third.health.bundle_mtime > 0 && third.health.bundle_mtime < mine.mtime || missingFingerprint(third.health.key_fingerprints, options.keyFingerprints);
         return stale ? await replaceDaemon(options) : "running";
       }
       return "failed";
@@ -39691,7 +39694,7 @@ function normalizeVerdict(choice) {
 
 // src/server.ts
 var SERVER_NAME = "jevwire";
-var SERVER_VERSION = "0.5.0";
+var SERVER_VERSION = "0.5.1";
 var ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 function ok(output2) {
   return {

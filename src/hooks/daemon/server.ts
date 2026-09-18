@@ -30,7 +30,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { HANDLERS, runEvent, WALL_CLOCK_MS } from "../dispatch.js";
 import type { Deps } from "../types.js";
 import { HOOK_VERSION } from "../version.js";
-import { authMode, authorize } from "./auth.js";
+import { authMode, authorize, keyFingerprint } from "./auth.js";
 import { DEFAULT_IDLE_MS, LAST_SESSION_GRACE_MS, MAX_BODY_BYTES, PROTOCOL } from "./protocol.js";
 import { readSessionConfig, sessionConfigOf, type SessionRegistry } from "./registry.js";
 import { bundleIdentity, emptyCounters, type DaemonCounters } from "./state-file.js";
@@ -40,8 +40,8 @@ export { DEFAULT_PORT, MAX_BODY_BYTES, PROTOCOL } from "./protocol.js";
 export interface DaemonOptions {
   /** 0 asks the OS for a free port; the chosen one comes back on the handle. */
   port: number;
-  /** `null` runs unauthenticated. See `auth.ts` for why that is a real mode. */
-  expectedKey: string | null;
+  /** Empty runs unauthenticated. See `auth.ts` for why that is a real mode. */
+  expectedKeys: readonly string[];
   /** Builds the `Deps` for one session id, honouring that session's config. */
   depsFor: (sessionId: string) => Deps;
   registry: SessionRegistry;
@@ -191,7 +191,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     started_at: startedAt,
     uptime_ms: Date.now() - startedAt,
     sessions: options.registry.count(),
-    auth: authMode(options.expectedKey),
+    auth: authMode(options.expectedKeys),
+    // Identifies each key in `/jev:daemon status` without revealing it.
+    key_fingerprints: options.expectedKeys.map(keyFingerprint),
     counters: merge(counters, options.modelStats),
   });
 
@@ -212,32 +214,39 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           return;
         }
 
-        // ----------------------------------------------------- authorization
-        if (!authorize(req.headers, options.expectedKey)) {
-          bump(counters, "unauthorized");
+        const isHook = url.startsWith(HOOK_PREFIX);
+        const event = isHook ? decodeURIComponent(url.slice(HOOK_PREFIX.length)) : "";
+
+        // A hook route answers `200 {}` on every refusal because Claude Code
+        // shows any non-2xx from an http hook to the user as a hook error, and
+        // this plugin fails open in silence. The counters keep the refusal
+        // countable, and the session routes keep their real status because
+        // `/v1/session/start` uses a 401 to recognise a stale daemon.
+        const refuse = (status: number): void => {
           req.resume();
-          respond(res, 401, {});
+          respond(res, isHook ? 200 : status, {});
+        };
+
+        // ----------------------------------------------------- authorization
+        if (!authorize(req.headers, options.expectedKeys)) {
+          bump(counters, "unauthorized");
+          refuse(401);
           return;
         }
 
         if (req.method !== "POST") {
-          req.resume();
-          respond(res, 405, {});
+          refuse(405);
           return;
         }
 
         // ------------------------------------------------------------ routing
-        const isHook = url.startsWith(HOOK_PREFIX);
-        const event = isHook ? decodeURIComponent(url.slice(HOOK_PREFIX.length)) : "";
         if (isHook && HANDLERS[event] === undefined) {
           bump(counters, "unknown_event");
-          req.resume();
-          respond(res, 404, {});
+          refuse(404);
           return;
         }
         if (!isHook && url !== "/v1/session/start" && url !== "/v1/session/end") {
-          req.resume();
-          respond(res, 404, {});
+          refuse(404);
           return;
         }
 
@@ -250,8 +259,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         const declaredText = Array.isArray(declared) ? declared[0] : declared;
         if (typeof declaredText === "string" && declaredText.trim() !== "" && declaredText.trim() !== String(PROTOCOL)) {
           bump(counters, "protocol_mismatch");
-          req.resume();
-          respond(res, 409, {});
+          refuse(409);
           return;
         }
 
@@ -259,7 +267,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         const raw = await readBody(req, MAX_BODY_BYTES);
         if (raw === "too-large") {
           bump(counters, "oversize");
-          respond(res, 413, {});
+          // `readBody` has already destroyed the request, so there is nothing
+          // left to drain; answer directly rather than through `refuse`.
+          respond(res, isHook ? 200 : 413, {});
           return;
         }
 
