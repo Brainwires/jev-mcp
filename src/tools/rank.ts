@@ -35,7 +35,7 @@ export const description = [
   "Rank files or texts by how well each helps answer a query, using Jev's calibrated yes/no judgment (one question per item, batched and parallel).",
   "Pass `glob` or `paths` for anything you have not already read — do NOT read files in order to pass their text. The server reads and chunks them itself and returns only `path:start_line-end_line` + score, so a 300-file search costs you almost no context in either direction.",
   "Pass `candidates` (id + text) only for text you already hold: search hits, retrieved passages, tool results.",
-  "`unit`: `chunk` (default) ranks line ranges, `file` ranks whole files by their best chunk.",
+  "`unit`: `chunk` (default) ranks line ranges, `file` ranks whole files by their best chunk. Prefer `file` for 'where is X' questions: Jev ranks by what a chunk talks about, so a header comment can outrank the code it describes.",
   "Sensitive files (.env, keys, credentials), binaries, generated output and anything outside the project root are never read; they come back counted in `skipped`.",
   "`relevance` is P(helps answer the query). Trust the top 1-3, not the order of the tail; a low `any_relevant` means look elsewhere.",
   "If `score_spread` (top minus median) is below 0.15 the ranking is not informative — narrow the glob or rephrase the query.",

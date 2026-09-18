@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-17
+
+### Changed
+- `jev_rank` description now recommends `unit: "file"` for "where is X" questions. Live use showed
+  a file's header comment outranking the code it describes, so file-level ranking is the reliable
+  way to pick the file; read it afterwards.
+
 ## [0.2.0] - 2026-09-17
 
 ### Added
@@ -154,6 +161,7 @@ are unchanged; the decision log records them so `/jev:calibrate` can replay the 
 
 Not yet exercised against the live API at the time of this release.
 
+[0.2.1]: https://github.com/Brainwires/jev-mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Brainwires/jev-mcp/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/Brainwires/jev-mcp/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Brainwires/jev-mcp/compare/v0.1.2...v0.1.3
