@@ -1,6 +1,6 @@
 # jev — Claude Code plugin spec
 
-Turns the existing `jev-mcp` package (DecisionModel core + 6 MCP tools) into a Claude Code
+Turns the existing `jevwire` package (DecisionModel core + 6 MCP tools) into a Claude Code
 plugin whose HOOKS put Jev judgments at harness boundaries. Same repo, same core.
 
 ## Invariants (do not violate)
@@ -29,7 +29,7 @@ plugin whose HOOKS put Jev judgments at harness boundaries. Same repo, same core
 
 ## Layout (repo root = marketplace; plugin in ./plugin)
 ```
-.claude-plugin/marketplace.json      name "brainwires-jev", owner Brainwires, plugins:[{name:"jev", source:"./plugin", ...}]
+.claude-plugin/marketplace.json      name "brainwires-jevwire", owner Brainwires, plugins:[{name:"jev", source:"./plugin", ...}]
 plugin/.claude-plugin/plugin.json    name "jev", version, description, author, license, keywords, userConfig, mcpServers
 plugin/hooks/hooks.json
 plugin/dist/hook.mjs  plugin/dist/mcp.mjs     (built by `npm run build:plugin`, COMMITTED — not gitignored)
@@ -339,7 +339,7 @@ answers on 10522 afterwards.
 
 ## README
 Add a top-level "Claude Code plugin" section: install (`/plugin marketplace add <path-or-repo>`,
-`/plugin install jev@brainwires-jev`), what each hook does, the never-allow + never-prompt + fail-open
+`/plugin install jev@brainwires-jevwire`), what each hook does, the never-allow + never-prompt + fail-open
 guarantees, privacy note (tool inputs/results excerpts are sent to TypeSafe's API, redacted best-effort;
 how to turn each hook off), costs, limitations (advisory, not a security boundary; a note is post-hoc by
 construction and only a tripwire acts before execution; marker text is logged and shown to the user).

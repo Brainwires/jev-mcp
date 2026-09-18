@@ -86,7 +86,7 @@ describe("npm run bump", () => {
 
   it("covers exactly the files this test asserts on", () => {
     // If someone adds a version to a new file, both lists have to grow.
-    expect(editsFor("jev-mcp")).toHaveLength(6);
+    expect(editsFor("jevwire")).toHaveLength(6);
   });
 
   it("leaves dependency versions alone", () => {
@@ -152,6 +152,6 @@ describe("the package manifest is publishable", () => {
   });
 
   it("does not leave the root directory unversioned", () => {
-    expect(root).toContain("jev-mcp");
+    expect(pkg.name).toBe("jevwire");
   });
 });

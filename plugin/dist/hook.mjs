@@ -756,7 +756,7 @@ function openLog(dataDir) {
 }
 
 // src/hooks/version.ts
-var HOOK_VERSION = "0.4.0";
+var HOOK_VERSION = "0.4.1";
 
 // src/hooks/daemon/control.ts
 function isAlive(pid) {
@@ -1197,6 +1197,7 @@ var LimitedModel = class {
 // src/hooks/store.ts
 import {
   appendFileSync,
+  cpSync,
   existsSync,
   mkdirSync as mkdirSync2,
   readdirSync,
@@ -1206,7 +1207,7 @@ import {
   unlinkSync as unlinkSync2,
   writeFileSync as writeFileSync2
 } from "node:fs";
-import { join as join3 } from "node:path";
+import { basename, dirname, join as join3 } from "node:path";
 
 // src/hooks/tripwire.ts
 import { createHash as createHash2 } from "node:crypto";
@@ -2563,10 +2564,27 @@ function safeSessionId(sessionId) {
   const cleaned = sessionId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 120);
   return cleaned === "" ? "unknown" : cleaned;
 }
+var LEGACY_DATA_DIR_NAMES = { "jev-brainwires-jevwire": "jev-brainwires-jev" };
+function migrateLegacyDataDir(dir) {
+  const legacyName = LEGACY_DATA_DIR_NAMES[basename(dir)];
+  if (legacyName === void 0) return false;
+  const legacy = join3(dirname(dir), legacyName);
+  if (!existsSync(join3(legacy, "decisions.jsonl"))) return false;
+  if (existsSync(join3(dir, "decisions.jsonl"))) return false;
+  return safe2(() => {
+    mkdirSync2(dir, { recursive: true });
+    for (const entry of ["decisions.jsonl", "decisions.1.jsonl", "sessions", "last-prune"]) {
+      const from = join3(legacy, entry);
+      if (existsSync(from)) cpSync(from, join3(dir, entry), { recursive: true, errorOnExist: false, force: false });
+    }
+    return true;
+  }, false);
+}
 var Store = class {
   dir;
   constructor(dir) {
     this.dir = dir;
+    migrateLegacyDataDir(dir);
   }
   ensureDir(sub) {
     const target = sub === void 0 ? this.dir : join3(this.dir, sub);

@@ -15,6 +15,7 @@
 
 import {
   appendFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -24,7 +25,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { SessionConfig } from "./daemon/registry.js";
 import { liveTrips, MAX_TRIPS, readTrip, type Trip, type TripSource } from "./tripwire.js";
 import { VERIFICATION_KINDS, type VerificationLedger } from "./verification.js";
@@ -269,11 +270,37 @@ export function safeSessionId(sessionId: string): string {
   return cleaned === "" ? "unknown" : cleaned;
 }
 
+/**
+ * The marketplace was renamed from `brainwires-jev` to `brainwires-jevwire`
+ * after 0.4.0, which moves the plugin's data directory (Claude Code derives it
+ * from `<plugin>@<marketplace>`). Copy the old directory into the new one
+ * exactly once, so `/jev:calibrate` keeps its history. Only when the new
+ * directory has no log yet: this never overwrites anything.
+ */
+export const LEGACY_DATA_DIR_NAMES: Record<string, string> = { "jev-brainwires-jevwire": "jev-brainwires-jev" };
+
+export function migrateLegacyDataDir(dir: string): boolean {
+  const legacyName = LEGACY_DATA_DIR_NAMES[basename(dir)];
+  if (legacyName === undefined) return false;
+  const legacy = join(dirname(dir), legacyName);
+  if (!existsSync(join(legacy, "decisions.jsonl"))) return false;
+  if (existsSync(join(dir, "decisions.jsonl"))) return false;
+  return safe(() => {
+    mkdirSync(dir, { recursive: true });
+    for (const entry of ["decisions.jsonl", "decisions.1.jsonl", "sessions", "last-prune"]) {
+      const from = join(legacy, entry);
+      if (existsSync(from)) cpSync(from, join(dir, entry), { recursive: true, errorOnExist: false, force: false });
+    }
+    return true;
+  }, false);
+}
+
 export class Store {
   readonly dir: string;
 
   constructor(dir: string) {
     this.dir = dir;
+    migrateLegacyDataDir(dir);
   }
 
   private ensureDir(sub?: string): string {

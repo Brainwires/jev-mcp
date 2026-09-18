@@ -167,7 +167,7 @@ describe("resolveDataDir", () => {
   it("prefers CLAUDE_PLUGIN_DATA over the derived id, and ignores paths outside the plugin cache", () => {
     const script = "/home/dev/.claude/plugins/cache/brainwires-jev/jev/0.1.0/dist/hook.mjs";
     expect(resolveDataDir({ CLAUDE_PLUGIN_DATA: "/tmp/data" }, script)).toBe("/tmp/data");
-    expect(installIdFromScriptPath("/repo/jev-mcp/plugin/dist/hook.mjs")).toBeUndefined();
+    expect(installIdFromScriptPath("/repo/jevwire/plugin/dist/hook.mjs")).toBeUndefined();
     expect(installIdFromScriptPath("/x/cache/a/b/1/dist/hook.mjs")).toBeUndefined();
     expect(installIdFromScriptPath(undefined)).toBeUndefined();
   });

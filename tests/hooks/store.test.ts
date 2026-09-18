@@ -3,10 +3,11 @@
  * scopes of `/jev:off`.
  */
 
-import { existsSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  migrateLegacyDataDir,
   nextPrompts,
   requestText,
   LOG_ROTATE_BYTES,
@@ -399,5 +400,42 @@ describe("nextPrompts and a double-fired hook", () => {
     let prompts = nextPrompts([], long);
     for (let i = 0; i < 5; i += 1) prompts = nextPrompts(prompts, "ship it");
     expect(prompts).toEqual([long, "ship it"]);
+  });
+});
+
+describe("migrateLegacyDataDir", () => {
+  it("copies the old marketplace's data into the new directory exactly once, never overwriting", () => {
+    const root = tempDir();
+    const legacy = join(root, "jev-brainwires-jev");
+    const current = join(root, "jev-brainwires-jevwire");
+    mkdirSync(join(legacy, "sessions"), { recursive: true });
+    writeFileSync(join(legacy, "decisions.jsonl"), '{"decision":"old"}\n');
+    writeFileSync(join(legacy, "sessions", "s1.json"), "{}");
+
+    expect(migrateLegacyDataDir(current)).toBe(true);
+    expect(readFileSync(join(current, "decisions.jsonl"), "utf8")).toContain('"old"');
+    expect(existsSync(join(current, "sessions", "s1.json"))).toBe(true);
+
+    writeFileSync(join(current, "decisions.jsonl"), '{"decision":"new"}\n');
+    expect(migrateLegacyDataDir(current)).toBe(false);
+    expect(readFileSync(join(current, "decisions.jsonl"), "utf8")).toContain('"new"');
+    cleanup(root);
+  });
+
+  it("does nothing for a directory that is not a known rename, or when there is nothing to copy", () => {
+    const root = tempDir();
+    expect(migrateLegacyDataDir(join(root, "jev"))).toBe(false);
+    expect(migrateLegacyDataDir(join(root, "jev-brainwires-jevwire"))).toBe(false);
+    expect(existsSync(join(root, "jev-brainwires-jevwire"))).toBe(false);
+    cleanup(root);
+  });
+
+  it("runs from the Store constructor", () => {
+    const root = tempDir();
+    mkdirSync(join(root, "jev-brainwires-jev"), { recursive: true });
+    writeFileSync(join(root, "jev-brainwires-jev", "decisions.jsonl"), '{"decision":"old"}\n');
+    const store = new Store(join(root, "jev-brainwires-jevwire"));
+    expect(store.readLog()).toHaveLength(1);
+    cleanup(root);
   });
 });

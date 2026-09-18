@@ -29103,7 +29103,7 @@ var DEFAULTS = {
   reviewThreshold: 0.6,
   maxConcurrency: 4
 };
-var MISSING_API_KEY_MESSAGE = "TYPESAFE_API_KEY is not set, so this server cannot reach the Jev API. Set it in the MCP server's environment (for example: `claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jev-mcp`) and restart the server. If this is the Claude Code plugin, either set the API key in the plugin's settings or export TYPESAFE_API_KEY before starting Claude Code, then run /reload-plugins. Keys are issued at https://typesafe.ai.";
+var MISSING_API_KEY_MESSAGE = "TYPESAFE_API_KEY is not set, so this server cannot reach the Jev API. Set it in the MCP server's environment (for example: `claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jevwire`) and restart the server. If this is the Claude Code plugin, either set the API key in the plugin's settings or export TYPESAFE_API_KEY before starting Claude Code, then run /reload-plugins. Keys are issued at https://typesafe.ai.";
 function readString(env, key, fallback) {
   const raw = env[key];
   if (raw === void 0) return fallback;
@@ -29452,7 +29452,7 @@ function openLog(dataDir) {
 }
 
 // src/hooks/version.ts
-var HOOK_VERSION = "0.4.0";
+var HOOK_VERSION = "0.4.1";
 
 // src/hooks/daemon/control.ts
 function isAlive(pid) {
@@ -39282,8 +39282,8 @@ function normalizeVerdict(choice) {
 }
 
 // src/server.ts
-var SERVER_NAME = "jev-mcp";
-var SERVER_VERSION = "0.4.0";
+var SERVER_NAME = "jevwire";
+var SERVER_VERSION = "0.4.1";
 var ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 function ok(output2) {
   return {

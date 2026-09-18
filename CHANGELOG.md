@@ -1,11 +1,23 @@
 # Changelog
 
 All notable changes to jevwire ([Brainwires/jevwire](https://github.com/Brainwires/jevwire)) are
-documented in this file. The npm package is published as `jev-mcp` and the Claude Code plugin is
+documented in this file. The npm package is published as `jevwire` and the Claude Code plugin is
 `jev`; the repository was renamed to jevwire after 0.3.0.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.4.1] - 2026-09-18
+
+### Changed
+- The project is now **jevwire**: npm package `jevwire` (was `jev-mcp`), repository
+  `Brainwires/jevwire` (the old URL redirects), marketplace `brainwires-jevwire`. The plugin id stays
+  `jev`, so `/jev:*` commands, the `[jev]` note prefix and the `jev_*` MCP tools are unchanged.
+- Because Claude Code derives the plugin's data directory from `<plugin>@<marketplace>`, the directory
+  moves from `jev-brainwires-jev` to `jev-brainwires-jevwire`. On first use the old directory is copied
+  into the new one exactly once, never overwriting, so `/jev:calibrate` keeps its history.
+- Upgrading: `/plugin marketplace add Brainwires/jevwire`, `/plugin install jev@brainwires-jevwire`,
+  then uninstall `jev@brainwires-jev` so the hooks do not run twice.
 
 ## [0.4.0] - 2026-09-18
 
@@ -334,6 +346,7 @@ are unchanged; the decision log records them so `/jev:calibrate` can replay the 
 
 Not yet exercised against the live API at the time of this release.
 
+[0.4.1]: https://github.com/Brainwires/jevwire/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Brainwires/jevwire/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Brainwires/jevwire/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Brainwires/jevwire/compare/v0.2.0...v0.2.1

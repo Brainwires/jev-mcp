@@ -322,6 +322,6 @@ describe("node plugin/dist/mcp.mjs", () => {
     const line = run.stdout.split("\n").find((l) => l.trim() !== "");
     expect(line, run.stdout).toBeDefined();
     const parsed = JSON.parse(line as string) as { result?: { serverInfo?: { name?: string } } };
-    expect(parsed.result?.serverInfo?.name).toBe("jev-mcp");
+    expect(parsed.result?.serverInfo?.name).toBe("jevwire");
   });
 });

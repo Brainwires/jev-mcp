@@ -7,7 +7,7 @@ rate-on-a-rubric — and it answers every one in parallel with a probability ove
 
 **jevwire** wires it into a harness. The repository is
 [Brainwires/jevwire](https://github.com/Brainwires/jevwire); the npm package is still published as
-`jev-mcp` and the Claude Code plugin is `jev`.
+`jevwire` and the Claude Code plugin is `jev`.
 
 It is three things:
 
@@ -36,7 +36,7 @@ Node >= 20 for all three routes.
 
 ```
 /plugin marketplace add Brainwires/jevwire
-/plugin install jev@brainwires-jev
+/plugin install jev@brainwires-jevwire
 ```
 
 Then give it a key, by either route:
@@ -53,7 +53,7 @@ dependency-free, esbuild-bundled single files.
 ### Bare MCP server
 
 ```bash
-claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jev-mcp
+claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jevwire
 ```
 
 Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
@@ -63,7 +63,7 @@ Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json
   "mcpServers": {
     "jev": {
       "command": "npx",
-      "args": ["-y", "jev-mcp"],
+      "args": ["-y", "jevwire"],
       "env": { "TYPESAFE_API_KEY": "sk-..." }
     }
   }
@@ -75,18 +75,18 @@ Codex (`~/.codex/config.toml`):
 ```toml
 [mcp_servers.jev]
 command = "npx"
-args = ["-y", "jev-mcp"]
+args = ["-y", "jevwire"]
 env = { TYPESAFE_API_KEY = "sk-..." }
 ```
 
 ### Library
 
 ```bash
-npm i jev-mcp
+npm i jevwire
 ```
 
 ```ts
-import { JevDecisionModel, runGateAction, runRank, runVerify, runNextStep } from "jev-mcp";
+import { JevDecisionModel, runGateAction, runRank, runVerify, runNextStep } from "jevwire";
 
 const jev = new JevDecisionModel({ apiKey: process.env.TYPESAFE_API_KEY!, model: "jev-1.13.0" });
 const config = { model: "jev-1.13.0", thresholds: { auto: 0.85, review: 0.6 }, maxConcurrency: 4 };

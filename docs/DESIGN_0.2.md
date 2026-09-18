@@ -135,7 +135,7 @@ Bookkeeping in code, judgment by Jev, decision by policy.
   prompts go to api.typesafe.ai; file contents go only when an MCP tool is pointed at them), what
   never does (sensitive-path files, anything outside the project root), where the log lives and how
   to delete it, the advisory-not-a-boundary statement, and how to report a vulnerability
-  (GitHub private advisory on Brainwires/jev-mcp).
+  (GitHub private advisory on Brainwires/jevwire).
 - README: restructure for a first-time reader — what it is in 5 lines; install (plugin first, then
   bare MCP, then library); a "what you will see" section with real `[jev]` lines and a real prompt
   screenshot description; settings table (incl. `auto_mode`, both API-key routes); the tools with
