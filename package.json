@@ -59,6 +59,7 @@
     "test:run": "vitest run",
     "smoke": "tsx scripts/smoke.ts",
     "bump": "tsx scripts/bump.ts",
+    "capture": "tsx scripts/capture-fixture.ts",
     "prepare": "tsc --project tsconfig.build.json"
   },
   "dependencies": {
