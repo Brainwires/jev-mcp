@@ -12,7 +12,8 @@ describe("loadHookConfig", () => {
   it("uses the documented defaults with an empty environment", () => {
     const config = loadHookConfig({});
     expect(config.apiKey).toBeNull();
-    expect(config.gateMode).toBe("standard");
+    expect(config.gate).toBe("advisory");
+    expect(config.askOnTrip).toBe(false);
     expect(config.stopCheck).toBe(true);
     expect(config.screenResults).toBe(true);
     expect(config.routePrompts).toBe(false);
@@ -38,17 +39,69 @@ describe("loadHookConfig", () => {
     expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_API_KEY: "   ", TYPESAFE_API_KEY: "sk-env" }).apiKey).toBe("sk-env");
   });
 
-  it("reads every gate mode", () => {
-    for (const mode of ["off", "standard", "strict"]) {
-      expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE_MODE: mode }).gateMode).toBe(mode);
+  it("reads every gate level", () => {
+    for (const level of ["off", "advisory", "strict"]) {
+      expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE: level }).gate).toBe(level);
     }
-    expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE_MODE: "STRICT" }).gateMode).toBe("strict");
+    expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE: "STRICT" }).gate).toBe("strict");
+    expect(loadHookConfig({ JEV_GATE: "off" }).gate).toBe("off");
   });
 
-  it("records a warning and keeps going on a bad gate mode", () => {
-    const config = loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE_MODE: "maybe" });
-    expect(config.gateMode).toBe("standard");
-    expect(config.warnings.join(" ")).toContain("gate_mode");
+  it("records a warning and keeps going on a bad gate level", () => {
+    const config = loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE: "maybe" });
+    expect(config.gate).toBe("advisory");
+    expect(config.warnings.join(" ")).toContain("gate=");
+  });
+
+  it("reads ask_on_trip, the one setting that can prompt a human", () => {
+    expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_ASK_ON_TRIP: "true" }).askOnTrip).toBe(true);
+    expect(loadHookConfig({ JEV_ASK_ON_TRIP: "1" }).askOnTrip).toBe(true);
+    expect(loadHookConfig({}).askOnTrip).toBe(false);
+  });
+
+  /**
+   * 0.2.x installs carry `gate_mode`. Ignoring it would silently change the
+   * gate under someone who had turned it off, so it is read, mapped, and
+   * reported — the warning is what `/jev:status` prints.
+   */
+  describe("migration from gate_mode", () => {
+    it("maps every old value and says so", () => {
+      for (const [old, mapped] of [
+        ["off", "off"],
+        ["standard", "advisory"],
+        ["strict", "strict"],
+      ] as const) {
+        const config = loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE_MODE: old });
+        expect(config.gate, old).toBe(mapped);
+        expect(config.warnings.join(" ")).toContain(`gate_mode is deprecated; read as gate=${mapped}`);
+      }
+    });
+
+    it("reads the JEV_ env form too", () => {
+      expect(loadHookConfig({ JEV_GATE_MODE: "off" }).gate).toBe("off");
+    });
+
+    it("prefers an explicit gate and then says nothing about the old setting", () => {
+      const config = loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE: "off", CLAUDE_PLUGIN_OPTION_GATE_MODE: "strict" });
+      expect(config.gate).toBe("off");
+      expect(config.warnings.join(" ")).not.toContain("gate_mode");
+    });
+
+    it("warns about an unreadable old value instead of guessing", () => {
+      const config = loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE_MODE: "maybe" });
+      expect(config.gate).toBe("advisory");
+      expect(config.warnings.join(" ")).toContain("gate_mode=\"maybe\"");
+    });
+
+    it("says plainly that auto_mode no longer does anything", () => {
+      const config = loadHookConfig({ CLAUDE_PLUGIN_OPTION_AUTO_MODE: "ask" });
+      expect(config.warnings.join(" ")).toContain("auto_mode is no longer used");
+      expect(config.warnings.join(" ")).toContain("never prompts");
+    });
+
+    it("stays quiet when neither legacy setting is present", () => {
+      expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_GATE: "advisory" }).warnings).toEqual([]);
+    });
   });
 
   it("reads booleans in every documented spelling", () => {

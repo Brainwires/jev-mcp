@@ -11,7 +11,7 @@ import type { Deps, HookInput, HookOutput } from "../types.js";
 export async function handleSessionStart(input: HookInput, deps: Deps): Promise<HookOutput | undefined> {
   const { config, store } = deps;
   if (config.apiKey !== null) return undefined;
-  if (config.gateMode === "off") return undefined;
+  if (config.gate === "off") return undefined;
 
   const sessionId = input.session_id ?? "unknown";
   const session = store.readSession(sessionId);

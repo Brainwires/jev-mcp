@@ -51,17 +51,35 @@ export async function handleUserPromptSubmit(input: HookInput, deps: Deps): Prom
   const prompt = input.prompt ?? "";
 
   // Bookkeeping: unconditional, no network, no model.
+  //
+  // The note budget resets here, which is what "at most five notes per user
+  // prompt" means. Open tripwires deliberately do NOT reset: a trip issued a
+  // moment before the user types "yes, do that" must still be answerable, and
+  // clearing them on every prompt would make a marker a no-op after any
+  // interleaved message.
   const session = store.updateSession(
     sessionId,
     (state) => ({
       ...state,
       prompts: nextPrompts(state.prompts, redactAndClamp(prompt, MAX_PROMPT_CHARS)),
       stop_blocks: 0,
-      pending_asks: [],
+      pending_reissues: [],
+      notes_this_prompt: 0,
     }),
     deps.now(),
   );
   store.pruneSessions(deps.now());
+
+  // One line per prompt, with no prompt text in it. It is the only way
+  // `/jev:calibrate` can report notes *per user prompt*: the counter that
+  // enforces the five-note cap lives in the session file, and a report over the
+  // log alone cannot otherwise tell where one prompt's window ends.
+  store.append({
+    ts: new Date(deps.now()).toISOString(),
+    session_id: sessionId,
+    event: "UserPromptSubmit",
+    decision: "prompt",
+  });
 
   if (!config.routePrompts) return undefined;
   if (store.isDisabled(sessionId)) return undefined;

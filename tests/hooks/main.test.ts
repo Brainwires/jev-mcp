@@ -27,7 +27,8 @@ afterEach(() => {
 describe("runEvent", () => {
   it("dispatches a known event", async () => {
     const output = await runEvent("PreToolUse", PRE, makeDeps(dir));
-    expect(output?.hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect(output?.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(output?.hookSpecificOutput?.permissionDecisionReason).toContain("[jev] tripwire");
   });
 
   it("ignores an unknown event", async () => {
@@ -61,14 +62,14 @@ describe("runEvent", () => {
 
   it("routes the Approval alias to bookkeeping only", async () => {
     const deps = makeDeps(dir);
-    deps.store.rememberAsk("s1", { tool_use_id: "t1", ts: 0, tool_name: "Bash" });
+    deps.store.rememberReissue("s1", { tool_use_id: "t1", ts: 0, tool_name: "Bash", trip_id: "t-aaaaaaaa" });
     const output = await runEvent(
       "Approval",
       JSON.stringify({ session_id: "s1", hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "t1" }),
       deps,
     );
     expect(output).toBeUndefined();
-    expect(deps.store.readLog().at(-1)?.event).toBe("approval");
+    expect(deps.store.readLog().at(-1)?.decision).toBe("reissue-ran");
   });
 
   const garbage = ["", "   ", "not json", "{", "[]", "null", "42", '"a string"', '{"tool_name":'];
@@ -77,6 +78,23 @@ describe("runEvent", () => {
       expect(await runEvent("PreToolUse", raw, makeDeps(dir))).toBeUndefined();
     });
   }
+
+  it("records a failed re-issue as failed, not as a run", async () => {
+    const deps = makeDeps(dir);
+    deps.store.rememberReissue("s1", { tool_use_id: "t1", ts: 0, tool_name: "Bash", trip_id: "t-aaaaaaaa" });
+    await runEvent(
+      "Approval",
+      JSON.stringify({
+        session_id: "s1",
+        hook_event_name: "PostToolUseFailure",
+        tool_name: "Bash",
+        tool_use_id: "t1",
+        error: "Exit code 1",
+      }),
+      deps,
+    );
+    expect(deps.store.readLog().at(-1)?.decision).toBe("reissue-failed");
+  });
 
   it("fills in the event name when stdin omits it", async () => {
     const deps = makeDeps(dir);
@@ -96,10 +114,11 @@ describe("runEvent", () => {
   });
 
   it("produces a serializable output and nothing else", async () => {
+    // Destructive, and not part of anything the user asked for: a note.
     const model = new FakeModel(() => ({
       destructive: noul(0.99),
       outward_facing: noul(0.02),
-      in_scope: noul(0.9),
+      in_scope: noul(0.3),
       credential_exposure: noul(0.01),
       blast_radius: score(1, ["a", "b", "c", "d"], 0.9),
     }));

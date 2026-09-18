@@ -16,6 +16,7 @@
 
 import { isAbsolute, resolve, sep } from "node:path";
 import { isSensitivePath } from "../util/sensitive-path.js";
+import { isSidecarBody, parseMarker, type AffirmationMarker } from "./tripwire.js";
 
 /**
  * Re-exported so that `src/hooks/*` and its tests keep one import site for the
@@ -24,13 +25,33 @@ import { isSensitivePath } from "../util/sensitive-path.js";
  */
 export { isSensitivePath };
 
+/** Fields every verdict may carry. */
+interface PrefilterCommon {
+  reason: string;
+  /** An affirmation marker found on the action, honoured or not. */
+  marker?: AffirmationMarker;
+  /**
+   * The tool input with the marker text removed. Present only when a marker was
+   * stripped, and then it is what everything downstream must use: the
+   * fingerprint, the action sent to Jev, and the verification ledger all have to
+   * see the same command the tokenizer classified.
+   */
+  stripped?: Record<string, unknown>;
+}
+
 export type Prefilter =
   /** Plainly read-only, or an ordinary in-project edit: no Jev call, no output. */
-  | { kind: "skip"; reason: string; writesInProject?: boolean }
+  | ({ kind: "skip"; writesInProject?: boolean } & PrefilterCommon)
   /** Send to Jev. */
-  | { kind: "judge"; reason: string; writesInProject?: boolean }
-  /** Code is sure enough to escalate on its own. */
-  | { kind: "escalate"; reason: string; pattern: string };
+  | ({ kind: "judge"; writesInProject?: boolean } & PrefilterCommon)
+  /** Code is sure enough to trip on its own. */
+  | ({ kind: "escalate"; pattern: string } & PrefilterCommon)
+  /**
+   * A do-nothing Bash call carrying an affirmation marker: `true # jev:intended
+   * t-1a2b3c4d: <reason>`. The sidecar form, which is how a Write, an Edit or an
+   * MCP call — none of which has a comment syntax — answers a tripwire.
+   */
+  | ({ kind: "affirm" } & PrefilterCommon);
 
 // --------------------------------------------------------------- bash scanner
 
@@ -1005,7 +1026,10 @@ function resolvesInside(cwd: string, target: string): boolean {
  * reading prompts. Without `options` there is no `cwd` to judge a target
  * against, so a redirect stays `judge` exactly as in 0.1.x.
  */
-export function prefilterBash(command: string, options?: FilePrefilterOptions): Prefilter {
+export function prefilterBash(
+  command: string,
+  options?: FilePrefilterOptions,
+): Exclude<Prefilter, { kind: "affirm" }> {
   const scan = scanBash(command);
   const flat = flatten(scan);
 
@@ -1183,6 +1207,27 @@ export interface PrefilterInput {
 
 const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit", "Update"]);
 
+/**
+ * Take the affirmation marker off a Bash command, if it has one.
+ *
+ * The marker has to come off *before* tokenizing, not after: `scanBash` has no
+ * notion of a `#` comment, so a marker left in place becomes tokens, and tokens
+ * change verdicts — `rm -rf ~/ # jev:intended …` would have `#` among its
+ * operands, and a marker's words could land on an allowlist check. Stripping
+ * first also means the fingerprint, the action sent to Jev and the verification
+ * ledger all see the identical command.
+ *
+ * A marker inside an unterminated quote is not a marker: if removing it leaves
+ * the command unbalanced, the `#` was quoted text and the command is returned
+ * untouched.
+ */
+export function readBashMarker(command: string): { command: string; marker?: AffirmationMarker } {
+  const parsed = parseMarker(command);
+  if (parsed.marker === undefined) return { command };
+  if (scanBash(parsed.stripped).features.unbalanced) return { command };
+  return { command: parsed.stripped, marker: parsed.marker };
+}
+
 export function prefilter(input: PrefilterInput): Prefilter {
   const { toolName } = input;
   if (isOwnTool(toolName)) return { kind: "skip", reason: "this plugin's own tool" };
@@ -1192,8 +1237,20 @@ export function prefilter(input: PrefilterInput): Prefilter {
     if (typeof command !== "string" || command.trim() === "") {
       return { kind: "judge", reason: "no command in the tool input" };
     }
-    if (toolName === "PowerShell") return { kind: "judge", reason: "PowerShell is not tokenized here" };
-    return prefilterBash(command, { cwd: input.cwd, strict: input.strict });
+
+    const reading = readBashMarker(command);
+    const found: Omit<PrefilterCommon, "reason"> =
+      reading.marker === undefined
+        ? {}
+        : { marker: reading.marker, stripped: { ...input.toolInput, command: reading.command } };
+
+    if (reading.marker !== undefined && isSidecarBody(reading.command)) {
+      return { ...found, kind: "affirm", reason: "sidecar affirmation" };
+    }
+    if (toolName === "PowerShell") {
+      return { ...found, kind: "judge", reason: "PowerShell is not tokenized here" };
+    }
+    return { ...prefilterBash(reading.command, { cwd: input.cwd, strict: input.strict }), ...found };
   }
 
   if (FILE_TOOLS.has(toolName)) {

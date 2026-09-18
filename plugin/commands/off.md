@@ -1,6 +1,6 @@
 ---
 name: off
-description: Turn the jev hooks off for this session — no gate, no result screening, no stop check — until /jev:on.
+description: Turn the jev hooks off for this session — no notes, no tripwires, no result screening, no stop check — until /jev:on.
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
@@ -24,4 +24,9 @@ Report which scope it reported back:
   without a file.
 
 Turning the hooks off does not change the MCP tools: `jev_gate_action` and the rest
-stay available for a deliberate check.
+stay available for a deliberate check. It also clears nothing that was already
+said: a note Claude has read is in the context either way, and an open tripwire
+stops mattering only because nothing is checking it any more.
+
+For the tool gate alone, without turning off result screening and the stop check,
+the setting is `gate: off` in `/plugin` → jev.

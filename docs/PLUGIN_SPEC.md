@@ -4,9 +4,15 @@ Turns the existing `jev-mcp` package (DecisionModel core + 6 MCP tools) into a C
 plugin whose HOOKS put Jev judgments at harness boundaries. Same repo, same core.
 
 ## Invariants (do not violate)
-1. **Escalate-only.** Hook output may be: nothing, `ask`, `deny`, `additionalContext`,
-   Stop `decision:"block"`. NEVER emit `permissionDecision: "allow"`. Jev is not
-   injection-hardened; its judgment must never grant permission.
+1. **Advisory-only, and never a prompt by default.** Hook output may be: nothing,
+   `additionalContext` (a note), `deny` (a tripwire), Stop `decision:"block"`, or
+   `ask` — but `ask` **only** under the explicit `ask_on_trip` setting and only in a
+   permission mode where a prompt has an audience. NEVER emit
+   `permissionDecision: "allow"`: Jev is not injection-hardened, so its judgment must
+   never grant permission, and `EscalatingDecision = "ask" | "deny"` keeps the case
+   unrepresentable. A deny's text rides in `permissionDecisionReason`, never in
+   `additionalContext` beside it — Claude Code drops `additionalContext` when the call
+   is blocked. (0.3.0 reworded this invariant; the prohibition on `allow` is unchanged.)
 2. **Fail open, silently.** No API key, timeout, network/API error, malformed stdin, any thrown
    error -> exit 0 with empty stdout. Log the error to the decision log only. Never exit 2.
 3. **stdout is protocol.** Only the single JSON object (or nothing). Diagnostics -> log file.
@@ -31,9 +37,12 @@ Mirror the `Brainwires/fable-lite` plugin for manifest/marketplace/skill house s
 
 ### plugin.json
 - `userConfig`: `api_key` {type string, sensitive true, required false, title "TypeSafe API key"},
-  `gate_mode` {string, default "standard"} (off|standard|strict), `stop_check` {boolean, default true},
-  `screen_results` {boolean, default true}, `route_prompts` {boolean, default false},
-  `auto_threshold` {number, default 0.85}.
+  `gate` {string, default "advisory"} (off|advisory|strict), `ask_on_trip` {boolean, default false},
+  `stop_check` {boolean, default true}, `screen_results` {boolean, default true},
+  `route_prompts` {boolean, default false}, `auto_threshold` {number, default 0.85}.
+  (0.3.0 replaced `gate_mode` with `gate` and removed `auto_mode`. `loadHookConfig` still reads
+  `gate_mode` when `gate` is absent — `standard` maps to `advisory` — and records a deprecation
+  warning that `/jev:status` prints; `auto_mode` present produces a "no longer used" warning.)
 - `mcpServers.jev`: command `node`, args [`${CLAUDE_PLUGIN_ROOT}/dist/mcp.mjs`],
   env { TYPESAFE_API_KEY: `${user_config.api_key}` }.
 - Hooks read config from env `CLAUDE_PLUGIN_OPTION_<KEY>` (uppercased), falling back to
@@ -69,22 +78,31 @@ Mirror the `Brainwires/fable-lite` plugin for manifest/marketplace/skill house s
 
 ## State: `${CLAUDE_PLUGIN_DATA}` (env CLAUDE_PLUGIN_DATA; fallback ~/.claude/plugins/data/jev)
 - `sessions/<session_id>.json`: { prompts: last 3 user prompts (each truncated 2000 chars), stop_blocks: n,
-  disabled?: bool }. Written by UserPromptSubmit (which ALWAYS runs this bookkeeping, even when
-  route_prompts is off, and resets stop_blocks to 0). This is how other hooks learn the user's request —
+  disabled?: bool, verification?: ledger, trips?: Trip[], notes_this_prompt?: n, noted?: [{fingerprint, ts}],
+  pending_reissues?: [...] }. Written by UserPromptSubmit (which ALWAYS runs this bookkeeping, even when
+  route_prompts is off, and resets stop_blocks, notes_this_prompt and pending_reissues to zero — but NOT
+  trips, which must outlive a prompt to stay answerable). This is how other hooks learn the user's request —
   do NOT parse transcript_path (format undocumented). Prune session files older than 7 days on SessionStart... 
-  simpler: prune opportunistically in UserPromptSubmit at most once per day.
+  simpler: prune opportunistically in UserPromptSubmit at most once per day. Every trip read back off disk
+  is validated field by field and clamped: it reaches a `deny` reason and a user-visible report.
 - `decisions.jsonl`: append-only, one line per hook invocation that reached a decision or error:
-  { ts, session_id, event, tool_name?, subject (<=300 chars, secrets redacted), prefilter?: string,
-    signals?: {name: prob}, decision, reasons[], model?, latency_ms?, input_tokens?, error? }.
-  Rotate at 5 MB (rename to decisions.1.jsonl, keep one). Atomic append (single appendFile call).
+  { ts, session_id, event, tool_name?, tool_use_id?, subject (<=300 chars, secrets redacted),
+    prefilter?: string, signals?: {name: prob}, policy?: {...}, decision, reasons[], fingerprint?, trip_id?,
+    source?: "pattern"|"model", channel?: "note"|"deny"|"ask", emitted? (exact agent-facing text, <=300,
+    redacted), affirmation? (<=200, redacted), suppressed?, firm?: string[], model?, latency_ms?,
+    input_tokens?, error? }. `decision` values: allow, note, trip, trip-repeat, affirm, affirm-unmatched,
+  marker-unmatched, marker-short, reissue, reissue-ran, reissue-failed, silent-local-destructive,
+  silent-scope, silent-uncertain, silent-dup, silent-cap, error, plus the non-gate events' own values
+  (prompt, clean, flagged, <kind>-passed/-failed, block). Rotate at 5 MB (rename to decisions.1.jsonl,
+  keep one). Atomic append (single appendFile call).
 - Redaction before logging AND before sending to Jev: mask values matching common secret patterns
   (sk-…, ghp_…, AKIA…, `Bearer …`, `password=…`, PEM blocks, long hex/base64 after key/token/secret=).
 
 ## Hooks
 
 ### PreToolUse — matcher `Bash|Write|Edit|MultiEdit|NotebookEdit|mcp__.*`
-Skip entirely if gate_mode=off, session disabled, or tool is one of this plugin's own jev tools.
-Prefilter (pure function, heavily unit-tested), returns `skip | judge | {decision}`:
+Skip entirely if gate=off, session disabled, or tool is one of this plugin's own jev tools.
+Prefilter (pure function, heavily unit-tested), returns `skip | judge | escalate | affirm`:
 - Bash: tokenize conservatively. `skip` only if EVERY segment of the pipeline/`&&`/`;` chain is in a
   read-only allowlist (ls, cat, head, tail, wc, grep, rg, find without -delete/-exec, pwd, echo without
   redirect, which, file, stat, du, df, ps, env-less `git status|log|diff|show|branch|remote -v|rev-parse`,
@@ -99,14 +117,47 @@ Prefilter (pure function, heavily unit-tested), returns `skip | judge | {decisio
   Sensitive or outside cwd -> `judge`.
 - mcp__*: `skip` if tool name's last segment starts with get|list|read|search|query|fetch|describe|find;
   else `judge`.
-- standard mode judges only `judge`; strict mode also judges Write/Edit inside cwd. 
+- advisory mode judges only `judge`; strict mode also judges Write/Edit inside cwd.
 Judge = existing gate_action `run()` with action = `<tool_name> <redacted compact tool_input, <=4000 chars>`,
 user_request = session prompts joined (or "(unknown)" -> then IGNORE the in_scope signal in policy),
-context = cwd + agent_type if present.
-Mapping: allow -> no output. confirm -> `ask` (reason = short human sentence listing top reasons + probs).
-block -> `ask` in default/plan/acceptEdits/auto modes; `deny` ONLY when permission_mode is dontAsk or
-bypassPermissions (no human will see an ask) — deny reason tells Claude what was flagged and to get
-explicit user confirmation or choose a safer alternative. Log everything.
+context = cwd + agent_type if present. **The affirmation marker is stripped from the action before
+anything else happens**, so marker text never reaches Jev and cannot move `in_scope`.
+
+**Mapping (0.3.0).** Rows evaluated top-down, first match wins. `auto`=0.85, `review`=0.6 unless
+configured; "firm" = `lean` at `auto`; `requested` = in_scope >= review AND destructive < 0.5 AND
+credential_exposure < 0.5; `requestedish` = in_scope >= review; `wide` = blast_radius >= 2. Rows 7-18
+are the pure function `gateOutcome` in `src/hooks/advisory.ts`; the wording is
+`src/hooks/wording.ts`; the full rationale is `docs/DESIGN_0.3.md`.
+
+| # | Condition | Outcome | Hook output | Log `decision` |
+|---|---|---|---|---|
+| 1 | Prefilter `skip` | silent | none | (none) |
+| 2 | Hard pattern (`escalate`), no open trip match | **trip** | `deny`, pattern-trip text | `trip` (`source:"pattern"`) |
+| 3 | Open trip, same fingerprint, **affirmed** (inline marker >= 12 chars, or a prior sidecar affirm) | pass | none (no judging, no model call) | `reissue` |
+| 4 | Open trip, same fingerprint, **not affirmed** | trip again | `deny`, repeat text | `trip-repeat` |
+| 5 | Marker present but no open trip matches | judged normally with the marker stripped | per row | extra `marker-unmatched` |
+| 6 | No model / error / timeout | silent | none | `error` or nothing |
+| 7 | Policy `block` (out_of_scope AND (destructive firm OR outward firm AND NOT requested)) | **trip** | `deny`, model-trip text | `trip` (`source:"model"`) |
+| 8 | Policy `allow` | silent | none | `allow` |
+| 9 | `credential_exposure` firm | **note** | `additionalContext` | `note` |
+| 10 | `outward_facing` firm AND NOT requested | **note** | `additionalContext` | `note` |
+| 11 | `destructive` firm AND (NOT requestedish OR wide) | **note** | `additionalContext` | `note` |
+| 12 | `wide` AND NOT requested | **note** | `additionalContext` | `note` |
+| 13 | `destructive` firm AND requestedish AND NOT wide | silent | none | `silent-local-destructive` |
+| 14 | `in_scope` firm-no with no firm risk signal | silent | none | `silent-scope` |
+| 15 | Uncertain signals only | silent | none | `silent-uncertain` |
+| 16 | Rows 9-12 hit, same fingerprint already noted this session (30 min) | silent | none | `silent-dup` |
+| 17 | Rows 9-12 hit, >= 5 notes since the last user prompt | silent | none | `silent-cap` |
+| 18 | `gate: strict` | rows 13 and 14 become **note** (row 15 stays silent: an uncertain reason is never printed); in-project edits are judged | | |
+| 19 | `ask_on_trip: true` AND permission_mode not in {dontAsk, bypassPermissions} | rows 2, 4, 7 emit `ask` instead of `deny`, same text | `ask` | `trip` with `channel:"ask"` |
+
+**Tripwire.** `fingerprint = sha256(tool_name + "\0" + canonical)[0:16]`, `trip_id = "t-" + fp[0:8]`.
+Bash canonical = marker stripped, CRLF normalized, trimmed; file tools = canonical JSON (sorted keys) of
+path + content/old+new/edits; everything else = canonical JSON of `tool_input` minus `description`.
+Marker forms: inline (Bash) `# jev:intended <reason>` on the last line, not honoured if the stripped
+command scans unbalanced; sidecar (any tool) a Bash call whose stripped body is exactly `true` or `:`
+with `# jev:intended <trip_id>: <reason>`. `MIN_AFFIRM_CHARS = 12`, `TRIP_TTL_MS` = 30 min,
+`MAX_TRIPS = 20`, `MAX_NOTES_PER_PROMPT = 5`, `NOTE_DEDUPE_TTL_MS` = 30 min. Log everything.
 
 ### PostToolUse — matcher `WebFetch|WebSearch|mcp__.*`
 Skip if screen_results false or response text < 200 chars. Extract text from tool_response (string, or
@@ -161,13 +212,18 @@ not meaningful: measured on Node 24 / macOS, `node -e ""` alone is 130 ms, the 0
 - `/jev:status` — run `node "${CLAUDE_PLUGIN_ROOT}/dist/hook.mjs" status`: config (key present y/n, never the
   key), model, thresholds, last-24h counts by event/decision, p50/p95 latency, total input tokens and est.
   cost at $0.042/Mtok, error count + last error.
-- `/jev:why` — `… hook.mjs why [n]`: last n (default 3) non-allow decisions with signals + reasons.
-- `/jev:calibrate` — `… hook.mjs calibrate`: from decisions.jsonl, distribution of each signal, how often
-  each gate fired, and what thresholds would have produced N% fewer asks. Be honest in output: we do not
-  observe whether the user approved an `ask` (no hook reports that reliably), so this is a firing-rate
-  report, not accuracy. (If a PermissionDenied/PostToolUse correlation is cheaply available — PostToolUse
-  for the same tool_input after an ask implies the user approved — implement that correlation and report
-  approval rate per signal bucket; that IS real calibration data.)
+- `/jev:why` — `… hook.mjs why [count] [notes|trips]`: last n (default 3) notes, trips, re-issues,
+  affirmations and errors, each printing the exact text handed to Claude (`emitted`), the trip id, and a
+  re-issue's marker text. `notes` and `trips` narrow it.
+- `/jev:calibrate` — `… hook.mjs calibrate`: from decisions.jsonl, six sections in order — (1) what Claude
+  was told: notes emitted, suppressed by reason, notes by driving signal, notes per user prompt;
+  (2) tripwires: by source/rule/top signal, repeats (3+ = stuck, reported never capped), re-issued
+  (ran/failed/affirmed-but-never-re-issued), not re-issued, median trip→re-issue; (3) marker hygiene
+  (`marker-unmatched` is the reflex metric); (4) signal histograms split by outcome (note/trip/silent);
+  (5) exact threshold replay counting notes+trips through `gateOutcome`; (6) the printed evidence
+  hierarchy. Be honest in output: nobody is prompted, so there is no human verdict to score against and
+  the report measures firing rates and outcomes, never correctness. The 0.2.x approval-correlation section
+  is removed — there are no approvals.
 - `/jev:off`, `/jev:on` — set `disabled` in the current session file (`… hook.mjs disable|enable <session>`;
   if session id is not available to a command, use a global flag file instead and say so).
 
@@ -176,19 +232,28 @@ When to reach for the MCP tools (rank >15 candidates, verify claims against a so
 next_step after a confusing tool failure, evaluate for batched custom judgments) vs. when not to (anything
 needing generation, math, dates, multi-hop reasoning). Question-writing rules from the vendor jaggedness
 doc. Explain that hooks run automatically and what `[jev]` context lines mean: advisory signal from a fast
-classifier; weigh it, don't obey blindly; never argue with a permission prompt it raised.
+classifier; weigh it, don't obey blindly. A note arrives after the call ran and needs no reply when the
+described effect matches the request; a tripwire means the call did not run, and the answer is the
+sentence of the user's request that requires it (as a marker) or a narrower action — never a marker typed
+by reflex, which is counted and shown to the user.
 
 ## Tests
 prefilter table (>=60 bash cases incl. quoting, pipes, redirects, subshells, env prefixes, `git -C`,
-chained allow+deny); redaction; each handler happy/skip/fail-open paths with fake model; mode mapping
-(ask vs deny by permission_mode); NEVER-ALLOW property test (fuzz handler outputs: no "allow" anywhere);
-stop policy truth table + one-block-per-prompt; store rotation; end-to-end: spawn `node dist/hook.mjs
-PreToolUse` with fixture stdin and no API key -> exit 0, empty stdout; with garbage stdin -> exit 0.
-`claude plugin validate` if the CLI supports it (try; report result).
+chained allow+deny, and the affirmation marker stripped before tokenizing); redaction; marker parsing and
+fingerprint stability; the advisory table as a truth table plus properties over the whole signal space;
+every wording template against the banned-imperative regex; each handler happy/skip/fail-open paths with
+fake model; every row of the decision table; NEVER-ALLOW *and* NEVER-ASK property tests (fuzz handler
+outputs: no "allow" anywhere, no permission decision but `deny` with the default config, `ask` only with
+`ask_on_trip` and only carrying a tripwire reason, plus a static check that `"ask"` is produced in exactly
+one expression); stop policy truth table + one-block-per-prompt; store rotation and trip validation;
+end-to-end through the shipped bundle: spawn `node dist/hook.mjs PreToolUse` with fixture stdin and no API
+key -> exit 0 and empty stdout on a skip, a `deny` with tripwire text on a hard pattern, a trip answered by
+a marker in a later process, and a legacy `gate_mode=off` still silencing everything; with garbage stdin ->
+exit 0. `claude plugin validate --strict` on both the marketplace root and `./plugin`.
 
 ## README
 Add a top-level "Claude Code plugin" section: install (`/plugin marketplace add <path-or-repo>`,
-`/plugin install jev@brainwires-jev`), what each hook does, the escalate-only + fail-open guarantees,
-privacy note (tool inputs/results excerpts are sent to TypeSafe's API, redacted best-effort; how to turn
-each hook off), costs, limitations (advisory, not a security boundary; ask has no audience in
-bypass/dontAsk so block-grade becomes deny there).
+`/plugin install jev@brainwires-jev`), what each hook does, the never-allow + never-prompt + fail-open
+guarantees, privacy note (tool inputs/results excerpts are sent to TypeSafe's API, redacted best-effort;
+how to turn each hook off), costs, limitations (advisory, not a security boundary; a note is post-hoc by
+construction and only a tripwire acts before execution; marker text is logged and shown to the user).

@@ -27,6 +27,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { lean } from "../../src/decision/policy.js";
+import { gateOutcome } from "../../src/hooks/advisory.js";
 import {
   gateActionPolicy,
   HIGH_BLAST_RADIUS,
@@ -80,6 +81,18 @@ function replay(record: Record_, options: GateActionPolicyOptions): string {
 
 const escalates = (record: Record_, options: GateActionPolicyOptions): boolean =>
   replay(record, options) !== "allow";
+
+/** What 0.3.0's advisory mode would have done with one logged record. */
+function advisoryOutcome(record: Record_): "silent" | "note" | "trip" {
+  const { blast_radius, ...signals } = record.signals;
+  const policy = gateActionPolicy({
+    signals,
+    blast_radius,
+    thresholds: THRESHOLDS,
+    options: { ...STANDARD_0_2, ignoreScope: record.policy.ignore_scope },
+  });
+  return gateOutcome({ decision: policy.decision, signals, blast_radius, thresholds: THRESHOLDS }).outcome;
+}
 
 /**
  * Is this record one that must still escalate?
@@ -221,6 +234,74 @@ describe(`day-one replay: ${RECORDS.length} judged records, ${RECORDED} escalati
     const strict: GateActionPolicyOptions = { uncertain: "confirm" };
     const strictEscalations = RECORDS.filter((r) => escalates(r, strict)).length;
     expect(strictEscalations).toBeGreaterThanOrEqual(AFTER);
+  });
+
+  /**
+   * 0.3.0: the same day, through the advisory table.
+   *
+   * The 0.2.0 numbers above are about *escalations* — every one of which was a
+   * permission prompt. This is the number that matters now: how much of that
+   * day would have reached the user at all (none of it) and how much would have
+   * reached Claude, and as what.
+   *
+   * The counts are in the test name on purpose. A release whose whole claim is
+   * "no prompts, fewer interruptions" has to state the size of the change
+   * somewhere a regression would show up in the diff.
+   */
+  it(`24 escalations as logged → ${
+    RECORDS.filter((r) => advisoryOutcome(r) === "note").length
+  } notes + ${RECORDS.filter((r) => advisoryOutcome(r) === "trip").length} trips, 0 prompts`, () => {
+    const counts = {
+      notes: 0,
+      trips: 0,
+      silent_allow: 0,
+      silent_local_destructive: 0,
+      silent_scope: 0,
+      silent_uncertain: 0,
+    };
+    for (const record of RECORDS) {
+      const { blast_radius, ...signals } = record.signals;
+      const policy = gateActionPolicy({
+        signals,
+        blast_radius,
+        thresholds: THRESHOLDS,
+        options: { ...STANDARD_0_2, ignoreScope: record.policy.ignore_scope },
+      });
+      const outcome = gateOutcome({
+        decision: policy.decision,
+        signals,
+        blast_radius,
+        thresholds: THRESHOLDS,
+      });
+      if (outcome.outcome === "note") counts.notes += 1;
+      else if (outcome.outcome === "trip") counts.trips += 1;
+      else if (outcome.suppressed === "allow") counts.silent_allow += 1;
+      else if (outcome.suppressed === "local-destructive") counts.silent_local_destructive += 1;
+      else if (outcome.suppressed === "scope") counts.silent_scope += 1;
+      else if (outcome.suppressed === "uncertain") counts.silent_uncertain += 1;
+    }
+
+    expect(counts).toMatchInlineSnapshot(`
+      {
+        "notes": 9,
+        "silent_allow": 21,
+        "silent_local_destructive": 1,
+        "silent_scope": 0,
+        "silent_uncertain": 0,
+        "trips": 1,
+      }
+    `);
+    // Every record is accounted for, so a row that silently stopped matching
+    // cannot hide inside the totals.
+    expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBe(RECORDS.length);
+  });
+
+  it("nothing in that day would have prompted the user", () => {
+    // `ask` is reachable only through `ask_on_trip`, which is off by default,
+    // and `gateOutcome` cannot express a prompt at all: the three outcomes are
+    // silence, a note, and a trip.
+    const outcomes = new Set(RECORDS.map((record) => advisoryOutcome(record)));
+    expect([...outcomes].sort()).toEqual(["note", "silent", "trip"]);
   });
 
   it("the MCP tool's default policy is untouched by any of this", () => {

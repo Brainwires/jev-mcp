@@ -15,17 +15,24 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const GATE_MODES = ["off", "standard", "strict"] as const;
-export type GateMode = (typeof GATE_MODES)[number];
-
 /**
- * `ask`: a confirm-grade judgment prompts, in every mode. `advise`: while the
- * session is in auto mode it hands Claude a note instead and abstains, leaving
- * the decision to Claude Code's own auto-mode classifier. Block-grade
- * judgments and the hard-coded patterns prompt either way.
+ * How much the tool gate says.
+ *
+ * `off`: nothing at all. `advisory`: the default — a note to the agent after
+ * the fact, and a tripwire before execution for the two block-grade cases.
+ * `strict`: also judges ordinary in-project edits, and notes the cases advisory
+ * mode keeps to itself (a local overwrite the user asked for, a firm
+ * out-of-scope reading with no risk signal).
  */
-export const AUTO_MODE_BEHAVIORS = ["ask", "advise"] as const;
-export type AutoModeBehavior = (typeof AUTO_MODE_BEHAVIORS)[number];
+export const GATE_LEVELS = ["off", "advisory", "strict"] as const;
+export type GateLevel = (typeof GATE_LEVELS)[number];
+
+/** 0.2.x `gate_mode` values, and what each one means as a `gate`. */
+const GATE_MODE_MIGRATION: Record<string, GateLevel> = {
+  off: "off",
+  standard: "advisory",
+  strict: "strict",
+};
 
 export interface HookConfig {
   apiKey: string | null;
@@ -34,9 +41,12 @@ export interface HookConfig {
   /** Deadline for one Jev call inside a hook. Deliberately short. */
   timeoutMs: number;
   maxRetries: number;
-  gateMode: GateMode;
-  /** What a confirm-grade judgment does while the session is in auto mode. */
-  autoMode: AutoModeBehavior;
+  gate: GateLevel;
+  /**
+   * The only way a human is ever prompted by this plugin: a tripwire emits
+   * `ask` instead of `deny`, in the modes where a prompt has an audience.
+   */
+  askOnTrip: boolean;
   stopCheck: boolean;
   screenResults: boolean;
   routePrompts: boolean;
@@ -55,8 +65,8 @@ export const HOOK_DEFAULTS = {
   model: "jev-latest",
   timeoutMs: 1500,
   maxRetries: 0,
-  gateMode: "standard" as GateMode,
-  autoMode: "advise" as AutoModeBehavior,
+  gate: "advisory" as GateLevel,
+  askOnTrip: false,
   stopCheck: true,
   screenResults: true,
   routePrompts: false,
@@ -136,26 +146,36 @@ export function installIdFromScriptPath(scriptPath: string | undefined): string 
 export function loadHookConfig(env: Env = process.env): HookConfig {
   const warnings: string[] = [];
 
-  const gateRaw = read(env, "gate_mode", "JEV_GATE_MODE");
-  let gateMode: GateMode = HOOK_DEFAULTS.gateMode;
+  // `gate` replaced `gate_mode` in 0.3.0. An install that still carries the old
+  // setting keeps working and is told so by `/jev:status`, rather than silently
+  // falling back to the default and changing behaviour under the user.
+  const gateRaw = read(env, "gate", "JEV_GATE");
+  let gate: GateLevel = HOOK_DEFAULTS.gate;
   if (gateRaw !== undefined) {
     const lowered = gateRaw.toLowerCase();
-    if ((GATE_MODES as readonly string[]).includes(lowered)) {
-      gateMode = lowered as GateMode;
+    if ((GATE_LEVELS as readonly string[]).includes(lowered)) {
+      gate = lowered as GateLevel;
     } else {
-      warnings.push(`gate_mode=${JSON.stringify(gateRaw)} is not one of ${GATE_MODES.join("|")}; using standard.`);
+      warnings.push(`gate=${JSON.stringify(gateRaw)} is not one of ${GATE_LEVELS.join("|")}; using advisory.`);
+    }
+  } else {
+    const legacy = read(env, "gate_mode", "JEV_GATE_MODE");
+    if (legacy !== undefined) {
+      const mapped = GATE_MODE_MIGRATION[legacy.toLowerCase()];
+      if (mapped === undefined) {
+        warnings.push(
+          `gate_mode=${JSON.stringify(legacy)} is not one of off|standard|strict; using gate=advisory. ` +
+            `Set "gate" in /plugin config.`,
+        );
+      } else {
+        gate = mapped;
+        warnings.push(`gate_mode is deprecated; read as gate=${mapped}. Set "gate" in /plugin config.`);
+      }
     }
   }
 
-  const autoRaw = read(env, "auto_mode", "JEV_AUTO_MODE");
-  let autoMode: AutoModeBehavior = HOOK_DEFAULTS.autoMode;
-  if (autoRaw !== undefined) {
-    const lowered = autoRaw.toLowerCase();
-    if ((AUTO_MODE_BEHAVIORS as readonly string[]).includes(lowered)) {
-      autoMode = lowered as AutoModeBehavior;
-    } else {
-      warnings.push(`auto_mode=${JSON.stringify(autoRaw)} is not one of ${AUTO_MODE_BEHAVIORS.join("|")}; using advise.`);
-    }
+  if (read(env, "auto_mode", "JEV_AUTO_MODE") !== undefined) {
+    warnings.push("auto_mode is no longer used: every judgment is advisory to Claude and never prompts.");
   }
 
   const apiKey = read(env, "api_key", "TYPESAFE_API_KEY") ?? null;
@@ -176,8 +196,8 @@ export function loadHookConfig(env: Env = process.env): HookConfig {
     model: read(env, "model", "JEV_MODEL") ?? HOOK_DEFAULTS.model,
     timeoutMs: readNumber(env, "timeout_ms", HOOK_DEFAULTS.timeoutMs, 100, 10_000, warnings, "JEV_HOOK_TIMEOUT_MS"),
     maxRetries: HOOK_DEFAULTS.maxRetries,
-    gateMode,
-    autoMode,
+    gate,
+    askOnTrip: readBool(env, "ask_on_trip", HOOK_DEFAULTS.askOnTrip, warnings, "JEV_ASK_ON_TRIP"),
     stopCheck: readBool(env, "stop_check", HOOK_DEFAULTS.stopCheck, warnings, "JEV_STOP_CHECK"),
     screenResults: readBool(env, "screen_results", HOOK_DEFAULTS.screenResults, warnings, "JEV_SCREEN_RESULTS"),
     routePrompts: readBool(env, "route_prompts", HOOK_DEFAULTS.routePrompts, warnings, "JEV_ROUTE_PROMPTS"),

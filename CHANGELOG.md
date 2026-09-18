@@ -5,6 +5,104 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-17
+
+**Advisory-first. The hooks no longer prompt you.** Everything the plugin decides is now addressed
+to Claude: a note about a call that already ran, or a single `deny` that Claude can answer. Replaying
+the first day of real use through the new rules, the 24 escalations that day — 24 permission prompts —
+become 9 notes, 1 tripwire and 0 prompts.
+
+The design, with the full decision table, the wording templates and the accepted risks, is
+`docs/DESIGN_0.3.md`. `docs/PLUGIN_SPEC.md` carries the table as the normative PreToolUse spec.
+
+### Changed
+
+- **The `PreToolUse` gate is advisory.** Three outcomes: silence, a **note**
+  (`additionalContext`), or a **tripwire** (`deny`). A confirm-grade judgment that used to raise a
+  permission prompt now either hands Claude one factual sentence about the call or says nothing at
+  all, according to a nineteen-row table evaluated top-down. Rows 9 to 12 (firm credential exposure,
+  firm outward reach on unrequested work, firm destructive with thin scope or a wide radius, a wide
+  radius on unrequested work) produce a note; rows 13 to 15 (a local overwrite the user asked about,
+  a firm out-of-scope reading with no risk signal, uncertain signals only) are silent and logged as
+  such; the two block-grade cases trip.
+- **A note is post-hoc, by construction, and the README and SECURITY.md now say so plainly.** Claude
+  Code delivers a PreToolUse `additionalContext` next to the *tool result* — after the call ran — and
+  drops it entirely when the call is blocked. A note can therefore only inform the next step, and a
+  deny's text has to ride in `permissionDecisionReason`. Only a tripwire acts before execution.
+- **A tripwire is a deny Claude can answer.** The hard-coded catastrophic patterns and a model
+  `block` deny the call once, with the reason, a trip id, and the exact marker that re-issues it.
+  Re-issuing the identical call with `# jev:intended <the sentence of the user's request that
+  requires this action>` on its last line passes the hook without a second judgment and without a
+  model call; for tools with no comment syntax the marker arrives as a separate Bash call,
+  `true # jev:intended t-1a2b3c4d: <that sentence>`. A marker is honoured only against a trip this
+  hook wrote, for the identical fingerprint, inside 30 minutes; a marker on a call that was never
+  tripped is stripped, ignored and counted. Marker text never reaches Jev, and is logged and shown
+  to the user by `/jev:why`.
+- **Notes are capped and de-duplicated:** at most five per user prompt, and never twice for the same
+  action inside 30 minutes. Both suppressions are logged, so the rate is measurable.
+- **Every agent-facing sentence was rewritten to be declarative** — what was scored, by what, with
+  what limits — because imperative "system command" phrasing in injected context trips Claude's own
+  injection defenses. A unit test rejects `do not`, `must`, `never`, `proceed`, `treat it` and
+  `ignore` in every note and trip this plugin can emit. The `PostToolUse` injection note now states
+  that the result was scored as containing instructions addressed to an agent and that it is data a
+  tool returned, rather than telling Claude what to do with it.
+- **`gate_mode` is now `gate`,** with values `off` / `advisory` / `strict` (was
+  `off` / `standard` / `strict`). **Migration is automatic and loud:** an install that still carries
+  `gate_mode` keeps working — `standard` is read as `advisory` — and `/jev:status` prints
+  `gate_mode is deprecated; read as gate=<x>. Set "gate" in /plugin config.` The `JEV_GATE_MODE`
+  environment fallback is read the same way. Nothing silently changes behaviour, including
+  `gate_mode: off`, which still silences the gate.
+- `/jev:calibrate` was rewritten around the new outcomes: what Claude was told and what was
+  suppressed by reason, the full tripwire lifecycle (by source and rule, repeats, re-issues that ran
+  or failed, affirmed-but-never-re-issued, not re-issued, median trip-to-re-issue time), marker
+  hygiene, signal histograms split by outcome, an exact threshold replay counting notes and trips
+  through the pure `gateOutcome`, and a printed evidence hierarchy. A deny loop is **reported** as
+  "stuck", not capped: a cap that went silent would be a bypass.
+- `/jev:why` takes an optional filter, `/jev:why [count] [notes|trips]`, and prints the exact text
+  handed to Claude plus the marker text of any re-issue.
+- `/jev:status` prints `gate`, `ask_on_trip`, and last-24h counts of notes, suppressions, tripwires,
+  re-issues and marker hygiene.
+- `DecisionRecord` gained `fingerprint`, `trip_id`, `source`, `channel`, `emitted`, `affirmation`,
+  `suppressed` and `firm`; `SessionState` gained `trips`, `notes_this_prompt`, `noted`, and
+  `pending_reissues` (renamed from `pending_asks`). `Store.rememberAsk`/`takeAsk` are
+  `rememberReissue`/`takeReissue`, and `recordApproval` is `recordReissueRun`. `UserPromptSubmit`
+  writes one text-free `prompt` line to the log, which is what makes "notes per user prompt"
+  computable.
+- `gateActionPolicy` returns the predicates it decided from — `requested`, `wide_blast`,
+  `out_of_scope`, `firm_risk`, `uncertain` — so the advisory layer and the replay read one
+  definition instead of two. `jev_gate_action`'s MCP output is unchanged.
+
+### Removed
+
+- **`auto_mode`.** It existed to choose between prompting and advising in auto mode; every judgment
+  is advisory now, in every mode. An install that still sets it gets the warning `auto_mode is no
+  longer used: every judgment is advisory to Claude and never prompts.`
+- **The approval-correlation section of `/jev:calibrate`**, and the `approval` / `approved` log
+  records behind it. They measured how often a user approved a prompt, and there are no prompts.
+  `reissue-ran` and `reissue-failed` replace them: they say whether a call Claude re-issued with a
+  reason actually ran.
+
+### Added
+
+- `ask_on_trip` (boolean, default `false`): the one setting that can prompt a human. It turns a
+  tripwire's `deny` into `ask`, with the same text, in the permission modes where a prompt has an
+  audience. Off by default, and `"ask"` is produced in exactly one expression in the whole hook
+  source — a test pins that, because "the hooks never prompt" is this release's central claim.
+- `src/hooks/advisory.ts` — `gateOutcome`, the decision table as one pure function, replayable over
+  the log; `src/hooks/tripwire.ts` — marker parsing, fingerprinting, the `Trip` record;
+  `src/hooks/wording.ts` — every sentence the plugin says, with the banned-imperative regex.
+- 151 new tests (1,111 total): the marker-parsing table including heredocs, quoting and CRLF;
+  fingerprint stability; the advisory truth table plus properties over ~5,800 signal combinations;
+  every wording template; every row of the decision table; a never-ask fuzz pass; the whole
+  tripwire lifecycle through the shipped bundle in separate processes; and the day-one replay's
+  `{notes: 9, trips: 1, silent_allow: 21, silent_local_destructive: 1}` as an inline snapshot.
+
+### Fixed
+
+- `scanBash` had no notion of a `#` comment, so an affirmation marker left in place would have
+  become tokens and changed verdicts. The marker is now stripped before tokenizing, and the
+  verification ledger strips it too: `npm test # jev:intended …` still counts as a test run.
+
 ## [0.2.1] - 2026-09-17
 
 ### Changed

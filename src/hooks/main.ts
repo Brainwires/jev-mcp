@@ -24,7 +24,7 @@ import { handlePreToolUse } from "./handlers/pre-tool-use.js";
 import { handleSessionStart } from "./handlers/session-start.js";
 import { handleStop } from "./handlers/stop.js";
 import { handleUserPromptSubmit } from "./handlers/user-prompt-submit.js";
-import { calibrateReport, statusReport, whyReport } from "./report.js";
+import { calibrateReport, statusReport, whyReport, type WhyFilter } from "./report.js";
 import { Store } from "./store.js";
 import type { Deps, Handler, HookInput, HookOutput } from "./types.js";
 
@@ -117,8 +117,14 @@ async function runCommand(command: string, args: string[], deps: Deps): Promise<
     case "status":
       return statusReport(deps.config, deps.store, deps.now());
     case "why": {
-      const parsed = Number(args[0]);
-      return whyReport(deps.store, Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 3);
+      // `why`, `why 5`, `why trips`, `why 5 trips`: the count and the filter
+      // are recognized by shape, so the order the user types them in does not
+      // matter and a typo falls back to the default rather than to nothing.
+      const numeric = args.map((arg) => Number(arg)).find((value) => Number.isFinite(value) && value > 0);
+      const filter = args.map((arg) => arg.toLowerCase()).find((arg): arg is WhyFilter =>
+        arg === "notes" || arg === "trips" || arg === "all",
+      );
+      return whyReport(deps.store, numeric === undefined ? 3 : Math.floor(numeric), filter ?? "all");
     }
     case "calibrate":
       return calibrateReport(deps.config, deps.store);

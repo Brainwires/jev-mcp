@@ -11,6 +11,7 @@
 
 import { USD_PER_MTOK } from "../decision/pricing.js";
 import { gateActionPolicy, type GateActionSignals } from "../tools/gate-action-core.js";
+import { gateOutcome, MAX_NOTES_PER_PROMPT } from "./advisory.js";
 import type { HookConfig } from "./config.js";
 import type { DecisionRecord, Store } from "./store.js";
 
@@ -44,11 +45,22 @@ function within(records: DecisionRecord[], now: number, windowMs: number): Decis
   });
 }
 
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? (sorted[middle] as number)
+    : ((sorted[middle - 1] as number) + (sorted[middle] as number)) / 2;
+}
+
 export function statusReport(config: HookConfig, store: Store, now: number = Date.now()): string {
   const all = store.readLog();
   const recent = within(all, now, DAY_MS);
-  // Model calls only. An `approval` record's latency_ms is the time from the
-  // prompt to the tool finishing — the user's thinking time, not Jev's.
+  const count = (...decisions: string[]): number =>
+    recent.filter((r) => decisions.includes(r.decision ?? "")).length;
+  // Model calls only. A `reissue-ran` record's latency_ms is the time from the
+  // re-issue to the tool finishing, which is not a Jev call.
   const latencies = recent
     .filter((r) => r.model !== undefined)
     .map((r) => r.latency_ms)
@@ -64,8 +76,8 @@ export function statusReport(config: HookConfig, store: Store, now: number = Dat
     `  API key: ${config.apiKey === null ? "not configured (judgment hooks inactive)" : "configured"}`,
     `  model: ${config.model}`,
     `  base url: ${config.baseUrl}`,
-    `  gate_mode: ${config.gateMode}`,
-    `  auto_mode: ${config.autoMode} (what a confirm-grade judgment does in auto mode)`,
+    `  gate: ${config.gate}`,
+    `  ask_on_trip: ${config.askOnTrip}${config.askOnTrip ? "" : " (a tripwire denies to Claude; the user is not prompted)"}`,
     `  stop_check: ${config.stopCheck}   screen_results: ${config.screenResults}   route_prompts: ${config.routePrompts}`,
     `  thresholds: auto ${config.autoThreshold}, review ${config.reviewThreshold}`,
     `  per-call timeout: ${config.timeoutMs} ms, retries: ${config.maxRetries}`,
@@ -80,6 +92,15 @@ export function statusReport(config: HookConfig, store: Store, now: number = Dat
   lines.push(
     "",
     `Last 24 h (${recent.length} logged decisions of ${all.length} total)`,
+    `  notes handed to Claude: ${count("note")}   suppressed: ${
+      recent.filter((r) => (r.decision ?? "").startsWith("silent-")).length
+    }`,
+    `  tripwires: ${count("trip")} opened, ${count("trip-repeat")} repeats, ${count("reissue")} re-issued (${count(
+      "reissue-ran",
+    )} ran, ${count("reissue-failed")} failed)`,
+    `  markers: ${count("affirm")} sidecar affirmations, ${count("marker-unmatched")} on untripped calls, ${count(
+      "marker-short",
+    )} too short`,
     " by event:",
     formatTally(tally(recent.map((r) => r.event ?? "?"))),
     " by decision:",
@@ -97,19 +118,35 @@ export function statusReport(config: HookConfig, store: Store, now: number = Dat
   return lines.join("\n");
 }
 
-export function whyReport(store: Store, limit = 3): string {
-  const interesting = store
-    .readLog()
-    .filter((r) => r.decision !== "allow" && r.decision !== "clean" && r.decision !== "approved" && r.decision !== "low-confidence");
-  const slice = interesting.slice(-Math.max(1, limit)).reverse();
-  if (slice.length === 0) return "jev — no escalations, blocks or errors recorded yet.";
+/** What `/jev:why` shows with no filter: everything the agent was told, plus errors. */
+const WHY_ALL = ["note", "trip", "trip-repeat", "reissue", "affirm", "error"];
+/** `/jev:why <n> trips`: the tripwire story, including how each trip ended. */
+const WHY_TRIPS = ["trip", "trip-repeat", "reissue", "affirm", "reissue-ran", "reissue-failed"];
 
-  const lines = [`jev — last ${slice.length} non-allow decision(s), newest first`, ""];
+export type WhyFilter = "all" | "notes" | "trips";
+
+export function whyReport(store: Store, limit = 3, filter: WhyFilter = "all"): string {
+  const wanted = filter === "notes" ? ["note"] : filter === "trips" ? WHY_TRIPS : WHY_ALL;
+  const interesting = store.readLog().filter((r) => wanted.includes(r.decision ?? ""));
+  const slice = interesting.slice(-Math.max(1, limit)).reverse();
+  const what = filter === "all" ? "note, trip and error" : filter === "notes" ? "note" : "tripwire";
+  if (slice.length === 0) return `jev — no ${what} records yet.`;
+
+  const lines = [`jev — last ${slice.length} ${what} record(s), newest first`, ""];
   for (const record of slice) {
     lines.push(`${record.ts}  ${record.event}  →  ${record.decision}`);
     if (record.tool_name !== undefined) lines.push(`  tool: ${record.tool_name}`);
+    if (record.trip_id !== undefined) {
+      lines.push(`  tripwire: ${record.trip_id}${record.source === undefined ? "" : ` (${record.source})`}`);
+    }
     if (record.subject !== undefined) lines.push(`  subject: ${record.subject}`);
     if (record.prefilter !== undefined) lines.push(`  prefilter: ${record.prefilter}`);
+    // The exact text the agent was handed, so "why did Claude say that" is
+    // answerable without guessing at which template fired.
+    if (record.emitted !== undefined) lines.push(`  said to Claude: ${record.emitted}`);
+    if (record.affirmation !== undefined) lines.push(`  marker text: ${record.affirmation}`);
+    if (record.firm !== undefined && record.firm.length > 0) lines.push(`  driven by: ${record.firm.join(", ")}`);
+    if (record.suppressed !== undefined) lines.push(`  not said because: ${record.suppressed}`);
     if (record.signals !== undefined) {
       lines.push(
         `  signals: ${Object.entries(record.signals)
@@ -158,109 +195,290 @@ function histogram(values: number[]): string {
 
 const GATE_SIGNALS = ["destructive", "outward_facing", "in_scope", "credential_exposure"] as const;
 
+
+/** Signals kept in the log for a judged gate decision. */
+interface LoggedSignals {
+  destructive: number;
+  outward_facing: number;
+  in_scope: number;
+  credential_exposure: number;
+  blast_radius: number;
+}
+
+function loggedSignals(record: DecisionRecord): LoggedSignals {
+  const signals = (record.signals ?? {}) as Record<string, number>;
+  return {
+    destructive: signals.destructive ?? 0.5,
+    outward_facing: signals.outward_facing ?? 0.5,
+    in_scope: signals.in_scope ?? 0.5,
+    credential_exposure: signals.credential_exposure ?? 0.5,
+    blast_radius: signals.blast_radius ?? 2,
+  };
+}
+
+/**
+ * Re-run one logged decision through the policy and the advisory table.
+ *
+ * Exact, not an estimate: the signals, the blast radius and every policy option
+ * in force were written to the log, so this is the same pure pair of functions
+ * the hook ran, with one honest gap — the per-session duplicate check and the
+ * per-prompt cap are session state, not log state, so the replay counts what
+ * the table called for before those two suppressions.
+ */
+function replay(record: DecisionRecord, auto: number, review: number): "note" | "trip" | "silent" {
+  const { blast_radius, ...signals } = loggedSignals(record);
+  const thresholds = { auto, review: Math.min(review, auto) };
+  const strict = record.policy?.uncertain === "confirm";
+  const policy = gateActionPolicy({
+    signals: signals satisfies GateActionSignals,
+    blast_radius,
+    thresholds,
+    options: {
+      ignoreScope: record.policy?.ignore_scope ?? false,
+      uncertain: strict ? "confirm" : "risky-lean",
+      lenientScope: record.policy?.lenient_scope ?? false,
+      trustRequested: record.policy?.trust_requested ?? false,
+      corroborateUncertain: record.policy?.corroborate_uncertain ?? false,
+    },
+  });
+  return gateOutcome({
+    decision: policy.decision,
+    signals,
+    blast_radius,
+    thresholds,
+    strict,
+  }).outcome;
+}
+
+/** The signal that drove a note or a trip, for the by-signal tallies. */
+function driver(record: DecisionRecord): string {
+  const firm = record.firm?.[0];
+  if (firm !== undefined) return firm;
+  const signals = (record.signals ?? {}) as Record<string, number>;
+  const ranked = GATE_SIGNALS.map((name) => [name, signals[name] ?? 0] as const)
+    .filter(([name]) => name !== "in_scope")
+    .sort((a, b) => b[1] - a[1]);
+  return ranked[0]?.[0] ?? "(unknown)";
+}
+
 export function calibrateReport(config: HookConfig, store: Store): string {
   const log = store.readLog();
-  const judged = log.filter(
-    (r) => r.event === "PreToolUse" && r.signals !== undefined && r.signals.destructive !== undefined,
+  const pre = log.filter((r) => r.event === "PreToolUse");
+  const judged = pre.filter((r) => r.signals !== undefined && r.signals.destructive !== undefined);
+  const decisions = (...names: string[]): DecisionRecord[] => log.filter((r) => names.includes(r.decision ?? ""));
+
+  const notes = decisions("note");
+  const suppressed = pre.filter((r) => typeof r.suppressed === "string");
+  const trips = decisions("trip");
+  const repeats = decisions("trip-repeat");
+  const reissues = decisions("reissue");
+  const affirms = decisions("affirm");
+  const prompts = log.filter((r) => r.event === "UserPromptSubmit" && r.decision === "prompt");
+
+  const lines = ["jev — calibration report", ""];
+
+  // ------------------------------------------------ 1. agent-facing output
+  lines.push(
+    "1. What Claude was told",
+    `  gate decisions judged by the model: ${judged.length}`,
+    `  tripwires from a code pattern (no model): ${
+      trips.filter((r) => r.source === "pattern").length
+    }`,
+    `  notes emitted: ${notes.length}`,
+    "  suppressed, by reason:",
+    formatTally(tally(suppressed.map((r) => r.suppressed as string))),
+    "  notes by driving signal:",
+    formatTally(tally(notes.map((record) => driver(record)))),
   );
-  const escalated = log.filter(
-    (r) => r.event === "PreToolUse" && r.signals === undefined && r.decision !== "error",
-  );
-  const approvals = new Set(log.filter((r) => r.event === "approval").map((r) => r.tool_use_id));
-
-  const lines = [
-    "jev — calibration report",
-    "",
-    `Gate decisions judged by the model: ${judged.length}`,
-    `Escalations decided by a code pattern (no model): ${escalated.length}`,
-    "",
-  ];
-
-  if (judged.length === 0) {
-    lines.push("Nothing judged yet. Run a few sessions with gate_mode=standard and try again.");
-    return lines.join("\n");
-  }
-
-  lines.push("Signal distributions (all judged gate decisions)");
-  for (const signal of GATE_SIGNALS) {
-    const values = judged.map((r) => r.signals?.[signal]).filter((n): n is number => typeof n === "number");
-    lines.push(`  ${signal.padEnd(20)} ${histogram(values)}`);
-  }
-  const blast = judged.map((r) => r.signals?.blast_radius).filter((n): n is number => typeof n === "number");
-  if (blast.length > 0) {
-    const mean = blast.reduce((a, b) => a + b, 0) / blast.length;
-    lines.push(`  blast_radius         mean ${mean.toFixed(2)} of 3, p95 ${percentile(blast, 95).toFixed(2)}`);
-  }
-
-  lines.push("", "How often each gate fired");
-  lines.push(formatTally(tally(judged.map((r) => r.decision ?? "?"))));
-
-  // Replay the same signals at other thresholds. The signals, the blast radius
-  // and the policy options are all in the log, so this is an exact replay of
-  // the pure policy function, not an estimate.
-  // `advise` is a confirm-grade judgment that auto mode turned into a note; the
-  // replay below counts it, so the baseline has to as well.
-  const asksNow = judged.filter((r) => r.decision === "ask" || r.decision === "deny" || r.decision === "advise").length;
-  lines.push("", `Replay at other auto thresholds (currently ${config.autoThreshold}; ${asksNow} escalations)`);
-  for (const auto of [0.75, 0.8, 0.85, 0.9, 0.95]) {
-    let escalations = 0;
-    for (const record of judged) {
-      const signals = record.signals as Record<string, number>;
-      const gate = gateActionPolicy({
-        signals: {
-          destructive: signals.destructive ?? 0.5,
-          outward_facing: signals.outward_facing ?? 0.5,
-          in_scope: signals.in_scope ?? 0.5,
-          credential_exposure: signals.credential_exposure ?? 0.5,
-        } satisfies GateActionSignals,
-        blast_radius: signals.blast_radius ?? 2,
-        thresholds: { auto, review: Math.min(config.reviewThreshold, auto) },
-        options: {
-          ignoreScope: record.policy?.ignore_scope ?? false,
-          uncertain: record.policy?.uncertain === "confirm" ? "confirm" : "risky-lean",
-          lenientScope: record.policy?.lenient_scope ?? false,
-          trustRequested: record.policy?.trust_requested ?? false,
-          corroborateUncertain: record.policy?.corroborate_uncertain ?? false,
-        },
-      });
-      if (gate.decision !== "allow") escalations += 1;
-    }
-    const delta = asksNow === 0 ? 0 : Math.round(((asksNow - escalations) / asksNow) * 100);
-    // A zero delta is "0%", not "-0%".
-    const change = delta === 0 ? "0%" : `${delta > 0 ? "-" : "+"}${Math.abs(delta)}%`;
-    lines.push(`  auto ${auto.toFixed(2)}: ${escalations} escalations (${change} vs now)`);
-  }
-
-  // Approval correlation. PostToolUse for a tool call we escalated means it
-  // ran, which means the user approved it. The reverse is not true — a denial,
-  // an interrupt, and a user who changed their mind look identical from here —
-  // so the unmatched share is an upper bound on rejections, not a measurement.
-  const correlatable = judged.filter((r) => r.tool_use_id !== undefined && (r.decision === "ask" || r.decision === "deny"));
-  lines.push("", "Approval correlation");
-  if (correlatable.length === 0) {
-    lines.push("  No escalation carried a tool_use_id yet, so nothing can be correlated.");
-  } else {
-    const approved = correlatable.filter((r) => approvals.has(r.tool_use_id));
+  if (prompts.length > 0) {
+    // Notes are attributed to the prompt window they fell in: the counter that
+    // enforces the cap resets on UserPromptSubmit, and so does this.
+    const boundaries = prompts
+      .map((record) => Date.parse(record.ts ?? ""))
+      .filter((ts) => Number.isFinite(ts))
+      .sort((a, b) => a - b);
+    const perPrompt = boundaries.map((start, index) => {
+      const end = boundaries[index + 1] ?? Number.POSITIVE_INFINITY;
+      return notes.filter((note) => {
+        const ts = Date.parse(note.ts ?? "");
+        return Number.isFinite(ts) && ts >= start && ts < end;
+      }).length;
+    });
+    const mean = perPrompt.reduce((a, b) => a + b, 0) / perPrompt.length;
     lines.push(
-      `  ${approved.length} of ${correlatable.length} escalated tool calls ran afterwards (${Math.round(
-        (approved.length / correlatable.length) * 100,
-      )}% approved).`,
+      `  notes per user prompt: mean ${mean.toFixed(2)}, max ${Math.max(...perPrompt)} (cap ${MAX_NOTES_PER_PROMPT}, ${perPrompt.length} prompts)`,
     );
-    lines.push("  By top signal of the escalation:");
-    for (const signal of GATE_SIGNALS) {
-      const bucket = correlatable.filter((r) => (r.signals?.[signal] ?? 0) >= config.autoThreshold);
-      if (bucket.length === 0) continue;
-      const yes = bucket.filter((r) => approvals.has(r.tool_use_id)).length;
-      lines.push(`    ${signal.padEnd(20)} ${yes}/${bucket.length} approved`);
-    }
+  } else {
+    lines.push("  notes per user prompt: no prompts recorded yet");
   }
+
+  // ------------------------------------------------------------ 2. tripwire
+  const tripById = new Map(trips.filter((r) => r.trip_id !== undefined).map((r) => [r.trip_id as string, r]));
+  const reissuedIds = new Set(reissues.map((r) => r.trip_id).filter((id): id is string => id !== undefined));
+  const affirmedIds = new Set(affirms.map((r) => r.trip_id).filter((id): id is string => id !== undefined));
+  const repeatsById = tally(repeats.map((r) => r.trip_id ?? "(unknown)"));
+  const stuck = [...repeatsById.entries()].filter(([, count]) => count >= 2);
+  const ranIds = new Set(decisions("reissue-ran").map((r) => r.trip_id));
+  const failedIds = new Set(decisions("reissue-failed").map((r) => r.trip_id));
+  const notReissued = [...tripById.keys()].filter((id) => !reissuedIds.has(id));
+  const gaps: number[] = [];
+  for (const reissue of reissues) {
+    const trip = reissue.trip_id === undefined ? undefined : tripById.get(reissue.trip_id);
+    if (trip === undefined) continue;
+    const from = Date.parse(trip.ts ?? "");
+    const to = Date.parse(reissue.ts ?? "");
+    if (Number.isFinite(from) && Number.isFinite(to) && to >= from) gaps.push(to - from);
+  }
+
   lines.push(
     "",
-    "Read this as a firing-rate report. Claude Code reports that an escalated call",
-    "later ran, but never reports that a user denied a prompt (PermissionDenied",
-    "fires only for auto-mode classifier denials), so an escalation with no",
-    "matching run may have been denied, interrupted, or simply abandoned.",
+    "2. Tripwires",
+    `  opened: ${trips.length}   repeats: ${repeats.length}   re-issued: ${reissuedIds.size}   not re-issued: ${notReissued.length}`,
+    "  by source:",
+    formatTally(tally(trips.map((r) => r.source ?? "(unknown)"))),
+  );
+  const patternTrips = trips.filter((r) => r.source === "pattern");
+  if (patternTrips.length > 0) {
+    lines.push("  by code rule:", formatTally(tally(patternTrips.map((r) => r.prefilter ?? "(unknown)"))));
+  }
+  const modelTrips = trips.filter((r) => r.source === "model");
+  if (modelTrips.length > 0) {
+    lines.push("  by top signal (model trips):", formatTally(tally(modelTrips.map((record) => driver(record)))));
+  }
+  lines.push(
+    `  re-issues that ran: ${ranIds.size}, that failed: ${failedIds.size}`,
+    `  affirmed but never re-issued: ${[...affirmedIds].filter((id) => !reissuedIds.has(id)).length}`,
+    `  median trip → re-issue: ${gaps.length === 0 ? "(none)" : `${Math.round(median(gaps) / 1000)}s`}`,
+  );
+  if (stuck.length > 0) {
+    lines.push(
+      `  stuck (3+ denies of the same call): ${stuck.length} — ${stuck.map(([id, n]) => `${id} ×${n + 1}`).join(", ")}`,
+      "  A deny loop is reported, not capped: a cap that went silent would be a bypass.",
+    );
+  }
+
+  // ----------------------------------------------------- 3. marker hygiene
+  lines.push(
+    "",
+    "3. Marker hygiene",
+    `  markers on calls that were never tripped: ${decisions("marker-unmatched").length}`,
+    `  markers too short to count as a reason: ${decisions("marker-short").length}`,
+    `  sidecar affirmations naming an unknown trip: ${decisions("affirm-unmatched").length}`,
+    "  The first line is the reflex metric: a marker only ever answers a specific tripwire.",
   );
 
-  return lines.join("\n");
+  // Sections 4 and 5 are about signals, so they need model judgments. Section 6
+  // is about how to read the rest, and a pattern trip is worth reading whether
+  // or not the model was ever called — so the report does not stop here.
+  if (judged.length === 0) {
+    lines.push(
+      "",
+      "4. Signal distributions, by what the gate did",
+      "  Nothing judged by the model yet. Run a few sessions with gate=advisory and try again.",
+      "",
+      "5. Replay at other auto thresholds",
+      "  Nothing to replay yet.",
+    );
+    return [...lines, "", ...evidenceSection(tripById, notReissued, reissues, affirms)].join("\n");
+  }
+
+  // ----------------------------------------- 4. histograms, split by outcome
+  lines.push("", "4. Signal distributions, by what the gate did");
+  const buckets: [string, DecisionRecord[]][] = [
+    ["note", judged.filter((r) => r.decision === "note")],
+    ["trip", judged.filter((r) => r.decision === "trip")],
+    ["silent", judged.filter((r) => r.decision === "allow" || (r.decision ?? "").startsWith("silent-"))],
+  ];
+  for (const [name, records] of buckets) {
+    lines.push(`  ${name} (${records.length})`);
+    if (records.length === 0) {
+      lines.push("    (no samples)");
+      continue;
+    }
+    for (const signal of GATE_SIGNALS) {
+      const values = records.map((r) => r.signals?.[signal]).filter((n): n is number => typeof n === "number");
+      lines.push(`    ${signal.padEnd(20)} ${histogram(values)}`);
+    }
+    const blast = records.map((r) => r.signals?.blast_radius).filter((n): n is number => typeof n === "number");
+    if (blast.length > 0) {
+      const mean = blast.reduce((a, b) => a + b, 0) / blast.length;
+      lines.push(`    blast_radius         mean ${mean.toFixed(2)} of 3, p95 ${percentile(blast, 95).toFixed(2)}`);
+    }
+  }
+
+  // --------------------------------------------------- 5. threshold replay
+  const outputsNow = judged.filter((r) => r.decision === "note" || r.decision === "trip").length;
+  lines.push(
+    "",
+    `5. Replay at other auto thresholds (currently ${config.autoThreshold}; ${outputsNow} notes+trips)`,
+  );
+  for (const auto of [0.75, 0.8, 0.85, 0.9, 0.95]) {
+    let noted = 0;
+    let tripped = 0;
+    for (const record of judged) {
+      const outcome = replay(record, auto, config.reviewThreshold);
+      if (outcome === "note") noted += 1;
+      if (outcome === "trip") tripped += 1;
+    }
+    const total = noted + tripped;
+    const delta = outputsNow === 0 ? 0 : Math.round(((outputsNow - total) / outputsNow) * 100);
+    // A zero delta is "0%", not "-0%".
+    const change = delta === 0 ? "0%" : `${delta > 0 ? "-" : "+"}${Math.abs(delta)}%`;
+    lines.push(`  auto ${auto.toFixed(2)}: ${noted} notes + ${tripped} trips = ${total} (${change} vs now)`);
+  }
+  lines.push(
+    "  Exact for the table's rows; the per-session duplicate check and the five-note",
+    "  cap are session state rather than log state, so the replay counts before them.",
+  );
+
+  return [...lines, "", ...evidenceSection(tripById, notReissued, reissues, affirms)].join("\n");
+}
+
+/**
+ * Section 6: what each kind of record is worth as evidence.
+ *
+ * Printed in the report rather than left to the README because this is where
+ * someone decides whether to keep the gate on, and the honest ordering is not
+ * obvious: the strongest thing the plugin can show is a trip the agent could
+ * have answered with one line and did not.
+ */
+function evidenceSection(
+  tripById: Map<string, DecisionRecord>,
+  notReissued: string[],
+  reissues: DecisionRecord[],
+  affirms: DecisionRecord[],
+): string[] {
+  const unansweredModelTrips = notReissued.filter((id) => tripById.get(id)?.source === "model").length;
+  const lines = [
+    "6. How to read this",
+    "  A pattern trip is certain by construction: a code rule matched and no model ran.",
+    `  A model trip that was NOT re-issued (${unansweredModelTrips}) is the strongest`,
+    "  evidence available that this gate changed what happened — the agent saw the",
+    "  reason, had a marker available, and chose something else.",
+    "  A re-issued trip is auditable by its marker text, below.",
+    "  A note is post-hoc by construction: it arrives with the tool result, after the",
+    "  call ran, so it can only inform the next step.",
+    "  Nothing here measures correctness. Nobody was prompted, so there is no human",
+    "  verdict to score against.",
+  ];
+  // A sidecar affirmation and the re-issue it let through carry the same text,
+  // so the same sentence is not printed twice.
+  const seen = new Set<string>();
+  const recentAffirmations = [...affirms, ...reissues]
+    .filter((r) => r.affirmation !== undefined)
+    .reverse()
+    .filter((r) => {
+      const key = `${r.trip_id ?? "?"}|${r.affirmation}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 5);
+  if (recentAffirmations.length > 0) {
+    lines.push("", "  Newest marker texts (redacted, as the agent wrote them):");
+    for (const record of recentAffirmations) {
+      lines.push(`    ${record.trip_id ?? "?"}  ${record.affirmation}`);
+    }
+  }
+  return lines;
 }

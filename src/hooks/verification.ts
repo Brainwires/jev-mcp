@@ -16,7 +16,7 @@
  */
 
 import { redactAndClamp } from "./redact.js";
-import { prefilterBash, scanBash } from "./prefilter.js";
+import { prefilterBash, readBashMarker, scanBash } from "./prefilter.js";
 import type { HookInput } from "./types.js";
 
 /** Longest command text kept in the ledger, redacted first. */
@@ -272,7 +272,11 @@ export function ledgerEvent(input: HookInput, now: number): LedgerEvent {
   const failed = bashFailed(input);
 
   if (toolName === "Bash" || toolName === "PowerShell") {
-    const command = typeof input.tool_input?.command === "string" ? input.tool_input.command : "";
+    const raw = typeof input.tool_input?.command === "string" ? input.tool_input.command : "";
+    if (raw.trim() === "") return { edited: false };
+    // The same stripping the gate did, for the same reason: `npm test
+    // # jev:intended …` is a test run, and the marker's words are not arguments.
+    const command = readBashMarker(raw).command;
     if (command.trim() === "") return { edited: false };
 
     const kind = verificationKind(command);

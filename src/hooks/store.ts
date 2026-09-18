@@ -25,6 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { liveTrips, MAX_TRIPS, readTrip, type Trip, type TripSource } from "./tripwire.js";
 import { VERIFICATION_KINDS, type VerificationLedger } from "./verification.js";
 
 /** Maximum substantive prompts kept per session, oldest first. */
@@ -87,13 +88,23 @@ export const LOG_ROTATE_BYTES = 5 * 1024 * 1024;
 /** Session files older than this are pruned. */
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
-/** Pending `ask` correlations kept per session. */
+/** Pending re-issue correlations kept per session. */
 const MAX_PENDING = 20;
+/** Noted fingerprints kept per session, for the duplicate check. */
+const MAX_NOTED = 40;
 
-export interface PendingAsk {
+export interface PendingReissue {
   tool_use_id: string;
   ts: number;
   tool_name: string;
+  /** The trip the re-issue answered, when one is known. */
+  trip_id?: string;
+}
+
+/** One fingerprint this session has already handed the agent a note about. */
+export interface NotedAction {
+  fingerprint: string;
+  ts: number;
 }
 
 export interface SessionState {
@@ -103,8 +114,20 @@ export interface SessionState {
   stop_blocks: number;
   /** `/jev:off` for this session. */
   disabled?: boolean;
-  /** Tool calls this plugin escalated to `ask`, awaiting a PostToolUse. */
-  pending_asks?: PendingAsk[];
+  /**
+   * Calls this plugin tripped and then let through after an affirmation,
+   * awaiting the PostToolUse that says whether they ran.
+   */
+  pending_reissues?: PendingReissue[];
+  /**
+   * Open tripwires. Deliberately NOT reset by a new user prompt: a trip issued
+   * a moment before the user types "yes, do it" must still be affirmable.
+   */
+  trips?: Trip[];
+  /** Notes emitted since the last user prompt, for the per-prompt cap. */
+  notes_this_prompt?: number;
+  /** Fingerprints already noted, for the duplicate check. */
+  noted?: NotedAction[];
   /** SessionStart already told the user the key is missing. */
   key_warned?: boolean;
   /**
@@ -139,6 +162,20 @@ export interface DecisionRecord {
   };
   decision: string;
   reasons?: string[];
+  /** 16 hex of the canonical action, so a trip and its re-issue can be paired. */
+  fingerprint?: string;
+  trip_id?: string;
+  source?: TripSource;
+  /** How the text reached its audience. `deny` and `ask` are pre-execution. */
+  channel?: "note" | "deny" | "ask";
+  /** The exact text handed to the agent, redacted and clamped. */
+  emitted?: string;
+  /** The agent's stated reason for a re-issue, redacted and clamped. */
+  affirmation?: string;
+  /** Why a note that the table called for was not emitted. */
+  suppressed?: string;
+  /** The firm reasons behind a note or a trip, in priority order. */
+  firm?: string[];
   model?: string;
   latency_ms?: number;
   input_tokens?: number;
@@ -224,10 +261,26 @@ export class Store {
       };
       if (state.disabled === true) session.disabled = true;
       if (state.key_warned === true) session.key_warned = true;
-      if (Array.isArray(state.pending_asks)) {
-        session.pending_asks = state.pending_asks.filter(
-          (p): p is PendingAsk => typeof p === "object" && p !== null && typeof p.tool_use_id === "string",
+      if (Array.isArray(state.pending_reissues)) {
+        session.pending_reissues = state.pending_reissues.filter(
+          (p): p is PendingReissue => typeof p === "object" && p !== null && typeof p.tool_use_id === "string",
         );
+      }
+      // Trips reach user-visible text and a `deny` reason, so every field is
+      // validated rather than trusted, and expired ones never come back at all.
+      if (Array.isArray(state.trips)) {
+        const trips = state.trips.map((raw) => readTrip(raw)).filter((trip): trip is Trip => trip !== undefined);
+        if (trips.length > 0) session.trips = trips.slice(-MAX_TRIPS);
+      }
+      if (typeof state.notes_this_prompt === "number" && state.notes_this_prompt >= 0) {
+        session.notes_this_prompt = Math.floor(state.notes_this_prompt);
+      }
+      if (Array.isArray(state.noted)) {
+        const noted = state.noted.filter(
+          (n): n is NotedAction =>
+            typeof n === "object" && n !== null && typeof n.fingerprint === "string" && typeof n.ts === "number",
+        );
+        if (noted.length > 0) session.noted = noted.slice(-MAX_NOTED);
       }
       if (typeof state.updated === "number") session.updated = state.updated;
       const ledger = readLedger(state.verification);
@@ -276,25 +329,128 @@ export class Store {
     return { scope: "session", path: this.sessionPath(sessionId) };
   }
 
-  /** Record that this tool call was escalated, so PostToolUse can see it ran. */
-  rememberAsk(sessionId: string, pending: PendingAsk): void {
+  /** Record that a re-issue was let through, so PostToolUse can see it ran. */
+  rememberReissue(sessionId: string, pending: PendingReissue): void {
     this.updateSession(sessionId, (state) => ({
       ...state,
-      pending_asks: [...(state.pending_asks ?? []), pending].slice(-MAX_PENDING),
+      pending_reissues: [...(state.pending_reissues ?? []), pending].slice(-MAX_PENDING),
     }));
   }
 
-  /** Consume a pending ask. Returns it when this tool call was one of ours. */
-  takeAsk(sessionId: string, toolUseId: string): PendingAsk | undefined {
+  /** Consume a pending re-issue. Returns it when this call was one of ours. */
+  takeReissue(sessionId: string, toolUseId: string): PendingReissue | undefined {
     const state = this.readSession(sessionId);
-    const pending = state.pending_asks ?? [];
+    const pending = state.pending_reissues ?? [];
     const found = pending.find((p) => p.tool_use_id === toolUseId);
     if (found === undefined) return undefined;
     this.writeSession(sessionId, {
       ...state,
-      pending_asks: pending.filter((p) => p.tool_use_id !== toolUseId),
+      pending_reissues: pending.filter((p) => p.tool_use_id !== toolUseId),
     });
     return found;
+  }
+
+  // --------------------------------------------------------------- tripwires
+
+  /** Open tripwires, expired ones dropped. */
+  liveTrips(sessionId: string, now: number = Date.now()): Trip[] {
+    return liveTrips(this.readSession(sessionId).trips ?? [], now);
+  }
+
+  /**
+   * The open trip for this exact action, if there is one.
+   *
+   * Exact fingerprint, deliberately: an affirmation answers one action, not a
+   * family of them, so an edited re-issue is a new judgment.
+   */
+  findTripByFingerprint(sessionId: string, fingerprint: string, now: number = Date.now()): Trip | undefined {
+    return this.liveTrips(sessionId, now).find((trip) => trip.fingerprint === fingerprint);
+  }
+
+  /** The open trip with this id, for the sidecar affirmation form. */
+  findTripById(sessionId: string, tripId: string, now: number = Date.now()): Trip | undefined {
+    return this.liveTrips(sessionId, now).find((trip) => trip.id === tripId);
+  }
+
+  /** Write a new trip, replacing any expired one for the same action. */
+  openTrip(sessionId: string, trip: Trip, now: number = Date.now()): Trip {
+    this.updateSession(
+      sessionId,
+      (state) => ({
+        ...state,
+        trips: [...liveTrips(state.trips ?? [], now).filter((t) => t.fingerprint !== trip.fingerprint), trip].slice(
+          -MAX_TRIPS,
+        ),
+      }),
+      now,
+    );
+    return trip;
+  }
+
+  /** Count one more deny against an open trip, and return the new count. */
+  repeatTrip(sessionId: string, tripId: string, now: number = Date.now()): number {
+    let denies = 1;
+    this.updateSession(
+      sessionId,
+      (state) => ({
+        ...state,
+        trips: liveTrips(state.trips ?? [], now).map((trip) => {
+          if (trip.id !== tripId) return trip;
+          denies = trip.denies + 1;
+          return { ...trip, denies };
+        }),
+      }),
+      now,
+    );
+    return denies;
+  }
+
+  /** Record a sidecar affirmation against an open trip. */
+  affirmTrip(sessionId: string, tripId: string, affirmation: string, now: number = Date.now()): void {
+    this.updateSession(
+      sessionId,
+      (state) => ({
+        ...state,
+        trips: liveTrips(state.trips ?? [], now).map((trip) =>
+          trip.id === tripId ? { ...trip, affirmed_at: now, affirmation } : trip,
+        ),
+      }),
+      now,
+    );
+  }
+
+  /** Close a trip: it was answered and the call went through. */
+  closeTrip(sessionId: string, tripId: string, now: number = Date.now()): void {
+    this.updateSession(
+      sessionId,
+      (state) => ({
+        ...state,
+        trips: liveTrips(state.trips ?? [], now).filter((trip) => trip.id !== tripId),
+      }),
+      now,
+    );
+  }
+
+  /** Remember that a note went out, for the duplicate check and the cap. */
+  noteEmitted(sessionId: string, fingerprint: string, now: number = Date.now()): void {
+    this.updateSession(
+      sessionId,
+      (state) => ({
+        ...state,
+        notes_this_prompt: (state.notes_this_prompt ?? 0) + 1,
+        noted: [...(state.noted ?? []).filter((n) => n.fingerprint !== fingerprint), { fingerprint, ts: now }].slice(
+          -MAX_NOTED,
+        ),
+      }),
+      now,
+    );
+  }
+
+  /** Was this exact action noted recently enough that a second note adds nothing? */
+  wasNoted(sessionId: string, fingerprint: string, withinMs: number, now: number = Date.now()): boolean {
+    return (this.readSession(sessionId).noted ?? []).some(
+      (noted) => noted.fingerprint === fingerprint && now - noted.ts <= withinMs,
+    );
   }
 
   /** One `appendFileSync` call, so concurrent hooks cannot interleave a line. */

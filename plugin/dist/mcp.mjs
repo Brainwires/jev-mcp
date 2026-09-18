@@ -37813,16 +37813,24 @@ function gateActionPolicy(input2) {
     );
   }
   const consequential = leans.destructive === "yes" || leans.outward_facing === "yes" && !requested;
+  const derived2 = {
+    requested,
+    wide_blast: wideBlast,
+    out_of_scope: outOfScope,
+    firm_risk: RISK_SIGNALS.filter((name7) => leans[name7] === "yes"),
+    uncertain: uncertainSignals
+  };
   if (outOfScope && consequential) {
-    return { decision: "block", reasons, leans };
+    return { decision: "block", reasons, leans, ...derived2 };
   }
   const needsConfirm = consequential || leans.credential_exposure === "yes" || wideBlast && !requested || outOfScope || uncertainSignals.length > 0;
-  if (needsConfirm) return { decision: "confirm", reasons, leans };
+  if (needsConfirm) return { decision: "confirm", reasons, leans, ...derived2 };
   const nothingFired = ignoreScope ? "No risk signal fired." : requested && (leans.outward_facing === "yes" || wideBlast) ? "The action reaches outside this machine, but it is what the user asked for and nothing destructive fired." : "No risk signal fired and the action is in scope.";
   return {
     decision: "allow",
     reasons: reasons.length > 0 ? reasons : [nothingFired],
-    leans
+    leans,
+    ...derived2
   };
 }
 async function runGateAction(model, input2, config2, signal) {
@@ -38649,7 +38657,7 @@ function normalizeVerdict(choice) {
 
 // src/server.ts
 var SERVER_NAME = "jev-mcp";
-var SERVER_VERSION = "0.2.1";
+var SERVER_VERSION = "0.3.0";
 var ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 function ok(output2) {
   return {

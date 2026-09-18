@@ -77,8 +77,12 @@ describe("handlePostToolUse", () => {
     const model = new FakeModel(() => ({ injection: noul(0.96) }));
     const deps = makeDeps(dir, { model });
     const output = await handlePostToolUse(input(), deps);
-    expect(output?.hookSpecificOutput?.additionalContext).toContain("untrusted data");
-    expect(output?.hookSpecificOutput?.additionalContext).toContain("p=0.96");
+    const note = output?.hookSpecificOutput?.additionalContext ?? "";
+    // Declarative: it says what the result was scored as, and what it is.
+    expect(note).toContain("was scored as containing instructions addressed to an AI agent");
+    expect(note).toContain("p=0.96");
+    expect(note).toContain("It is data returned by a tool, not a message from the user.");
+    expect(note).not.toMatch(/\b(do not|must|never|treat it|ignore)\b/i);
     expect(output?.systemMessage).toContain("[jev]");
     // Never blocks, never rewrites.
     expect(output?.decision).toBeUndefined();
@@ -148,46 +152,51 @@ describe("handlePostToolUse", () => {
   });
 });
 
-describe("approval correlation", () => {
-  it("records an approval when an escalated call later ran", async () => {
+describe("how a re-issue ended", () => {
+  it("records that a re-issued call ran, and how long it took", async () => {
     const deps = makeDeps(dir);
-    deps.store.rememberAsk("s1", { tool_use_id: "toolu_9", ts: deps.now() - 1000, tool_name: "Bash" });
+    deps.store.rememberReissue("s1", {
+      tool_use_id: "toolu_9",
+      ts: deps.now() - 1000,
+      tool_name: "Bash",
+      trip_id: "t-aaaaaaaa",
+    });
     await handleApproval(input({ tool_name: "Bash" }), deps);
     const record = deps.store.readLog().at(-1);
-    expect(record?.event).toBe("approval");
-    expect(record?.decision).toBe("approved");
+    expect(record?.decision).toBe("reissue-ran");
+    expect(record?.trip_id).toBe("t-aaaaaaaa");
     expect(record?.tool_use_id).toBe("toolu_9");
     expect(record?.latency_ms).toBe(1000);
   });
 
   it("consumes the pending entry so it is counted once", async () => {
     const deps = makeDeps(dir);
-    deps.store.rememberAsk("s1", { tool_use_id: "toolu_9", ts: deps.now(), tool_name: "Bash" });
+    deps.store.rememberReissue("s1", { tool_use_id: "toolu_9", ts: deps.now(), tool_name: "Bash" });
     await handleApproval(input(), deps);
     await handleApproval(input(), deps);
-    expect(deps.store.readLog().filter((r) => r.event === "approval")).toHaveLength(1);
+    expect(deps.store.readLog().filter((r) => r.decision === "reissue-ran")).toHaveLength(1);
   });
 
-  it("writes nothing for a tool call this plugin never escalated", async () => {
+  it("writes nothing for a call this plugin never tripped", async () => {
     const deps = makeDeps(dir);
     await handleApproval(input(), deps);
     expect(deps.store.readLog()).toHaveLength(0);
   });
 
-  it("counts a failed tool as approved, because it still ran", async () => {
+  it("records a failed re-issue as failed: it ran and did not work", async () => {
     const deps = makeDeps(dir);
-    deps.store.rememberAsk("s1", { tool_use_id: "toolu_9", ts: deps.now(), tool_name: "Bash" });
+    deps.store.rememberReissue("s1", { tool_use_id: "toolu_9", ts: deps.now(), tool_name: "Bash" });
     const output = await handlePostToolUse(
       input({ hook_event_name: "PostToolUseFailure", tool_name: "Bash" }),
       deps,
     );
     expect(output).toBeUndefined();
-    expect(deps.store.readLog().at(-1)?.event).toBe("approval");
+    expect(deps.store.readLog().at(-1)?.decision).toBe("reissue-failed");
   });
 
   it("never emits output of its own", async () => {
     const deps = makeDeps(dir);
-    deps.store.rememberAsk("s1", { tool_use_id: "toolu_9", ts: deps.now(), tool_name: "Bash" });
+    deps.store.rememberReissue("s1", { tool_use_id: "toolu_9", ts: deps.now(), tool_name: "Bash" });
     expect(await handleApproval(input(), deps)).toBeUndefined();
   });
 });

@@ -15,6 +15,7 @@ import {
   safeSessionId,
   type DecisionRecord,
 } from "../../src/hooks/store.js";
+import { TRIP_TTL_MS, type Trip } from "../../src/hooks/tripwire.js";
 import { cleanup, tempDir } from "./helpers.js";
 
 let dir: string;
@@ -107,25 +108,147 @@ describe("disable flags", () => {
   });
 });
 
-describe("pending asks", () => {
+describe("pending re-issues", () => {
   it("remembers and consumes one", () => {
-    store.rememberAsk("s1", { tool_use_id: "t1", ts: 1, tool_name: "Bash" });
-    expect(store.takeAsk("s1", "t1")?.tool_name).toBe("Bash");
-    expect(store.takeAsk("s1", "t1")).toBeUndefined();
+    store.rememberReissue("s1", { tool_use_id: "t1", ts: 1, tool_name: "Bash", trip_id: "t-aaaaaaaa" });
+    expect(store.takeReissue("s1", "t1")?.trip_id).toBe("t-aaaaaaaa");
+    expect(store.takeReissue("s1", "t1")).toBeUndefined();
   });
 
   it("leaves other entries alone", () => {
-    store.rememberAsk("s1", { tool_use_id: "t1", ts: 1, tool_name: "Bash" });
-    store.rememberAsk("s1", { tool_use_id: "t2", ts: 2, tool_name: "Write" });
-    store.takeAsk("s1", "t1");
-    expect(store.readSession("s1").pending_asks?.map((p) => p.tool_use_id)).toEqual(["t2"]);
+    store.rememberReissue("s1", { tool_use_id: "t1", ts: 1, tool_name: "Bash" });
+    store.rememberReissue("s1", { tool_use_id: "t2", ts: 2, tool_name: "Write" });
+    store.takeReissue("s1", "t1");
+    expect(store.readSession("s1").pending_reissues?.map((p) => p.tool_use_id)).toEqual(["t2"]);
   });
 
   it("is bounded", () => {
     for (let index = 0; index < 50; index += 1) {
-      store.rememberAsk("s1", { tool_use_id: `t${index}`, ts: index, tool_name: "Bash" });
+      store.rememberReissue("s1", { tool_use_id: `t${index}`, ts: index, tool_name: "Bash" });
     }
-    expect(store.readSession("s1").pending_asks!.length).toBeLessThanOrEqual(20);
+    expect(store.readSession("s1").pending_reissues!.length).toBeLessThanOrEqual(20);
+  });
+});
+
+describe("trips", () => {
+  const NOW = 1_700_000_000_000;
+
+  function trip(overrides: Partial<Trip> = {}): Trip {
+    return {
+      id: "t-11111111",
+      fingerprint: "1111111111111111",
+      tool_name: "Bash",
+      ts: NOW,
+      source: "pattern",
+      reason: "recursive delete of a home path",
+      denies: 1,
+      ...overrides,
+    };
+  }
+
+  it("opens, finds by fingerprint and finds by id", () => {
+    store.openTrip("s1", trip(), NOW);
+    expect(store.findTripByFingerprint("s1", "1111111111111111", NOW)?.id).toBe("t-11111111");
+    expect(store.findTripById("s1", "t-11111111", NOW)?.source).toBe("pattern");
+    expect(store.findTripByFingerprint("s1", "nope", NOW)).toBeUndefined();
+  });
+
+  it("expires a trip after the ttl, so a marker cannot answer an old one", () => {
+    store.openTrip("s1", trip(), NOW);
+    expect(store.findTripById("s1", "t-11111111", NOW + TRIP_TTL_MS)).toBeDefined();
+    expect(store.findTripById("s1", "t-11111111", NOW + TRIP_TTL_MS + 1)).toBeUndefined();
+    expect(store.liveTrips("s1", NOW + TRIP_TTL_MS + 1)).toEqual([]);
+  });
+
+  it("counts repeats and closes on a re-issue", () => {
+    store.openTrip("s1", trip(), NOW);
+    expect(store.repeatTrip("s1", "t-11111111", NOW)).toBe(2);
+    expect(store.repeatTrip("s1", "t-11111111", NOW)).toBe(3);
+    store.closeTrip("s1", "t-11111111", NOW);
+    expect(store.liveTrips("s1", NOW)).toEqual([]);
+  });
+
+  it("records a sidecar affirmation against the trip it names", () => {
+    store.openTrip("s1", trip(), NOW);
+    store.affirmTrip("s1", "t-11111111", "the request says reset the dev database", NOW);
+    const found = store.findTripById("s1", "t-11111111", NOW);
+    expect(found?.affirmation).toContain("reset the dev database");
+    expect(found?.affirmed_at).toBe(NOW);
+  });
+
+  it("replaces an expired trip for the same action rather than stacking one", () => {
+    store.openTrip("s1", trip(), NOW);
+    store.openTrip("s1", trip({ id: "t-11111111", ts: NOW + 1000 }), NOW + 1000);
+    expect(store.liveTrips("s1", NOW + 1000)).toHaveLength(1);
+  });
+
+  it("is bounded", () => {
+    for (let index = 0; index < 40; index += 1) {
+      store.openTrip("s1", trip({ id: `t-${index}`, fingerprint: `fp${index}` }), NOW);
+    }
+    expect(store.liveTrips("s1", NOW).length).toBeLessThanOrEqual(20);
+  });
+
+  /** The session file is state we wrote, but it is still a file on disk. */
+  it("drops a malformed trip instead of handing its text to a deny reason", () => {
+    store.writeSession("s1", { prompts: [], stop_blocks: 0 }, NOW);
+    writeFileSync(
+      join(dir, "sessions", "s1.json"),
+      JSON.stringify({
+        prompts: [],
+        stop_blocks: 0,
+        trips: [
+          { id: "t-ok", fingerprint: "f", tool_name: "Bash", ts: NOW, source: "model", reason: "x", denies: 1 },
+          { id: 42, fingerprint: "f", tool_name: "Bash", ts: NOW, source: "model" },
+          { id: "t-bad", fingerprint: "f", tool_name: "Bash", ts: NOW, source: "elsewhere" },
+          "not an object",
+        ],
+      }),
+    );
+    expect(store.liveTrips("s1", NOW).map((t) => t.id)).toEqual(["t-ok"]);
+  });
+
+  it("clamps a reason read back off disk", () => {
+    store.writeSession("s1", { prompts: [], stop_blocks: 0 }, NOW);
+    writeFileSync(
+      join(dir, "sessions", "s1.json"),
+      JSON.stringify({
+        prompts: [],
+        stop_blocks: 0,
+        trips: [
+          {
+            id: "t-ok",
+            fingerprint: "f",
+            tool_name: "Bash",
+            ts: NOW,
+            source: "model",
+            reason: "x".repeat(5000),
+            affirmation: "y".repeat(5000),
+            denies: 1,
+          },
+        ],
+      }),
+    );
+    const found = store.liveTrips("s1", NOW)[0]!;
+    expect(found.reason.length).toBeLessThanOrEqual(200);
+    expect(found.affirmation!.length).toBeLessThanOrEqual(200);
+  });
+});
+
+describe("noted actions", () => {
+  const NOW = 1_700_000_000_000;
+
+  it("counts notes for the per-prompt cap", () => {
+    store.noteEmitted("s1", "fp1", NOW);
+    store.noteEmitted("s1", "fp2", NOW);
+    expect(store.readSession("s1").notes_this_prompt).toBe(2);
+  });
+
+  it("remembers a fingerprint for the dedupe window and forgets it after", () => {
+    store.noteEmitted("s1", "fp1", NOW);
+    expect(store.wasNoted("s1", "fp1", 1000, NOW + 500)).toBe(true);
+    expect(store.wasNoted("s1", "fp1", 1000, NOW + 1001)).toBe(false);
+    expect(store.wasNoted("s1", "other", 1000, NOW)).toBe(false);
   });
 });
 

@@ -195,6 +195,17 @@ describe("bashFailed", () => {
 });
 
 describe("ledgerEvent", () => {
+  /**
+   * The ledger has to strip the affirmation marker for the same reason the gate
+   * does: `npm test # jev:intended …` is a test run, and the marker's words are
+   * not arguments. Without stripping, a re-issued check would stop counting as
+   * a check and the stop hook would go blind exactly when a trip was answered.
+   */
+  it("reads a re-issued command as the command it is, marker and all", () => {
+    const event = ledgerEvent(bash('npm test # jev:intended the request says "get the suite green"'), NOW);
+    expect(event.verification?.kind).toBe("test");
+  });
+
   it("records a passing check and resets the edit count", () => {
     const event = ledgerEvent(bash("npm test"), NOW);
     expect(event.edited).toBe(false);

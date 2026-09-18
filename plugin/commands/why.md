@@ -1,25 +1,39 @@
 ---
 name: why
-description: Explain the last few escalations the jev hooks raised — which signals fired, with what probabilities, and which policy rule turned them into a prompt.
+description: Show the last few things the jev hooks said to Claude — the exact note or tripwire text, the signals behind it, and the marker text of any re-issue.
 disable-model-invocation: true
-argument-hint: "[count]"
+argument-hint: "[count] [notes|trips]"
 allowed-tools: Bash(node:*)
 ---
 
 # /jev:why
 
-Run exactly this command with the Bash tool, substituting the count the user asked
-for (default 3) for `$ARGUMENTS`, and show the output verbatim:
+Run exactly this command with the Bash tool, passing through whatever the user
+typed (a count, a filter, both, or neither), and show the output verbatim:
 
 ```
 node "${CLAUDE_PLUGIN_ROOT}/dist/hook.mjs" why $ARGUMENTS
 ```
 
-Each entry lists the tool, the redacted subject, the prefilter verdict, the raw
-probabilities, and the reasons the policy gave. If an entry looks wrong to the
-user, the fix is usually one of: raise `auto_threshold` (fewer prompts, see
-`/jev:calibrate` first), switch `gate_mode` from `strict` to `standard`, or turn
-the gate off for this session with `/jev:off`.
+With no arguments it shows the last three notes, tripwires, re-issues and errors.
+`notes` narrows it to notes; `trips` narrows it to the tripwire story — each trip,
+every repeat, and how it ended.
 
-Note when a decision came from a code pattern rather than the model: those entries
-have a `prefilter` line and no signals, and no threshold change will affect them.
+Each entry prints the tool, the redacted subject, the prefilter verdict, the raw
+probabilities, and — the line that usually answers the question — **`said to
+Claude:`**, the exact text the agent was handed. A re-issue also prints `marker
+text:`, which is the reason Claude gave for going ahead. That text is the audit
+trail for the tripwire: read it, and say plainly if it does not look like a reason.
+
+If an entry looks wrong to the user:
+
+- a **note** that was not worth the context: raise `auto_threshold` (run
+  `/jev:calibrate` first — it replays your own log at other values), or set `gate`
+  to `off`;
+- a **tripwire** that should not have fired: the same, and note that a re-issue
+  with a marker already passes without another judgment;
+- a **pattern** entry has a `prefilter` line and no signals. It came from a code
+  rule, so no threshold change will affect it.
+
+Nothing here was ever a prompt to the user. If the user expected to be asked,
+`ask_on_trip` is the setting that does that.

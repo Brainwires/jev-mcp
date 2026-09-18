@@ -2,8 +2,8 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "jev",
   "displayName": "Jev",
-  "version": "0.2.1",
-  "description": "Puts a fast calibrated classifier at the harness boundaries: escalates risky tool calls to a permission prompt, flags tool results that read like prompt injection, and catches a turn that stops short of the work it was asked to do. Escalate-only and fail-open.",
+  "version": "0.3.0",
+  "description": "Puts a fast calibrated classifier at the harness boundaries: hands Claude a note about a risky tool call, denies the two block-grade cases once with a reason Claude can answer, flags tool results that read like prompt injection, and catches a turn that stops short of the work it was asked to do. Advisory to the agent, never a prompt to you, and fail-open.",
   "author": {
     "name": "Brainwires"
   },
@@ -28,19 +28,18 @@
       "sensitive": true,
       "required": false
     },
-    "gate_mode": {
+    "gate": {
       "type": "string",
       "title": "Tool-call gate",
-      "description": "off: no PreToolUse gate. standard: judge writes outside the project, sensitive paths, unrecognized shell commands, and MCP tools with unknown effects. strict: also judge ordinary edits inside the project, and treat any uncertain signal as a reason to ask.",
-      "default": "standard",
-      "options": ["off", "standard", "strict"]
+      "description": "off: no PreToolUse gate at all. advisory: judge writes outside the project, sensitive paths, unrecognized shell commands and MCP tools with unknown effects, then hand Claude a note about what was scored; the two block-grade cases are denied once with a reason Claude can answer. strict: also judge ordinary edits inside the project, and note the cases advisory mode keeps to itself. You are never prompted in any of the three.",
+      "default": "advisory",
+      "options": ["off", "advisory", "strict"]
     },
-    "auto_mode": {
-      "type": "string",
-      "title": "In auto mode",
-      "description": "What a confirm-grade judgment does while the session is in auto mode. advise: add a note to Claude's context and let Claude Code's auto-mode classifier decide, with no prompt. ask: prompt anyway. Out-of-scope actions that are destructive or outward-facing, and the hard-coded patterns like rm -rf ~, prompt either way.",
-      "default": "advise",
-      "options": ["advise", "ask"]
+    "ask_on_trip": {
+      "type": "boolean",
+      "title": "Ask me when a call is denied",
+      "description": "Turn the tripwire's deny into a permission prompt, so you decide instead of Claude. Off by default: the point of this plugin is that it talks to the agent, not to you. It has no effect in dontAsk or bypassPermissions, where there is no prompt to show.",
+      "default": false
     },
     "stop_check": {
       "type": "boolean",
@@ -63,7 +62,7 @@
     "auto_threshold": {
       "type": "number",
       "title": "Certainty threshold",
-      "description": "Probability at or above which a signal counts as established. Lower means more prompts. 0.85 is the default; /jev:calibrate replays your own log at other values.",
+      "description": "Probability at or above which a signal counts as established. Lower means more notes. 0.85 is the default; /jev:calibrate replays your own log at other values.",
       "default": 0.85,
       "min": 0.5,
       "max": 0.99

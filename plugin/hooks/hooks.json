@@ -1,5 +1,5 @@
 {
-  "description": "jev: escalate-only judgments at the harness boundaries. Every hook exits 0 with empty stdout on any error, and none of them can emit permissionDecision \"allow\". Set JEV_HOOKS_DISABLE=1 to turn all of them off, or gate_mode=off for the tool gate alone.",
+  "description": "jev: advisory judgments at the harness boundaries, addressed to Claude rather than to you. A hook can hand Claude a note about a call that already ran, or deny a call once with a reason Claude can answer by re-issuing it with `# jev:intended <why>`. None of them can emit permissionDecision \"allow\", and none of them prompts you unless you set ask_on_trip. Every hook exits 0 with empty stdout on any error. Set JEV_HOOKS_DISABLE=1 to turn all of them off, or gate=off for the tool gate alone.",
   "hooks": {
     "SessionStart": [
       {

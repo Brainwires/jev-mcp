@@ -73,17 +73,52 @@ describe("handleUserPromptSubmit", () => {
     expect(deps.store.readSession("s1").prompts[0]).toContain("[REDACTED]");
   });
 
-  it("resets the stop-block counter and pending asks", async () => {
+  it("resets the stop-block counter, the note budget and pending re-issues", async () => {
     const deps = makeDeps(dir);
     deps.store.updateSession("s1", (s) => ({
       ...s,
       stop_blocks: 1,
-      pending_asks: [{ tool_use_id: "t", ts: 0, tool_name: "Bash" }],
+      notes_this_prompt: 4,
+      pending_reissues: [{ tool_use_id: "t", ts: 0, tool_name: "Bash" }],
     }));
     await handleUserPromptSubmit({ session_id: "s1", prompt: PROMPT }, deps);
     const session = deps.store.readSession("s1");
     expect(session.stop_blocks).toBe(0);
-    expect(session.pending_asks).toEqual([]);
+    expect(session.notes_this_prompt).toBe(0);
+    expect(session.pending_reissues).toEqual([]);
+  });
+
+  /**
+   * A trip issued a moment before the user types "yes, do that" must still be
+   * answerable, so the trip list survives a prompt. Clearing it here would make
+   * every marker a no-op after any interleaved message.
+   */
+  it("keeps open tripwires across a user prompt", async () => {
+    const deps = makeDeps(dir);
+    deps.store.openTrip(
+      "s1",
+      {
+        id: "t-abcdef12",
+        fingerprint: "abcdef1234567890",
+        tool_name: "Bash",
+        ts: deps.now(),
+        source: "pattern",
+        reason: "recursive delete",
+        denies: 1,
+      },
+      deps.now(),
+    );
+    await handleUserPromptSubmit({ session_id: "s1", prompt: PROMPT }, deps);
+    expect(deps.store.liveTrips("s1", deps.now()).map((t) => t.id)).toEqual(["t-abcdef12"]);
+  });
+
+  it("records one prompt line in the log, with no prompt text in it", async () => {
+    const deps = makeDeps(dir);
+    await handleUserPromptSubmit({ session_id: "s1", prompt: PROMPT }, deps);
+    const record = deps.store.readLog().at(-1);
+    expect(record?.event).toBe("UserPromptSubmit");
+    expect(record?.decision).toBe("prompt");
+    expect(JSON.stringify(record)).not.toContain(PROMPT.slice(0, 20));
   });
 
   /**
@@ -178,7 +213,7 @@ describe("handleSessionStart", () => {
   });
 
   it("stays quiet when the gate is off entirely", async () => {
-    const deps = makeDeps(dir, { config: { apiKey: null, gateMode: "off" } });
+    const deps = makeDeps(dir, { config: { apiKey: null, gate: "off" } });
     expect(await handleSessionStart({ session_id: "s1" }, deps)).toBeUndefined();
   });
 

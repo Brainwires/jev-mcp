@@ -170,6 +170,25 @@ export interface GateActionPolicyResult {
   decision: ActionDecision;
   reasons: string[];
   leans: Record<keyof GateActionSignals, Lean>;
+  /**
+   * The derived predicates the decision was made from.
+   *
+   * Additive, and for one reason: the advisory layer in `src/hooks/advisory.ts`
+   * and `/jev:calibrate`'s replay both need to know *which* reading produced a
+   * decision, not just the decision. Recomputing them at the call site is how
+   * two copies of a predicate drift apart.
+   *
+   * They stay on the policy result rather than on `GateActionCoreResult`
+   * because the MCP server hands that object to `structuredContent` verbatim,
+   * and `jev_gate_action`'s output contract is unchanged in this release.
+   */
+  requested: boolean;
+  wide_blast: boolean;
+  out_of_scope: boolean;
+  /** Risk signals at or above `auto`, in signal order. */
+  firm_risk: string[];
+  /** Signals in the uncertain band that the policy acted on. */
+  uncertain: string[];
 }
 
 /** Does an uncertain signal sitting at `p` lean towards the unsafe side? */
@@ -261,8 +280,16 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
 
   const consequential = leans.destructive === "yes" || (leans.outward_facing === "yes" && !requested);
 
+  const derived = {
+    requested,
+    wide_blast: wideBlast,
+    out_of_scope: outOfScope,
+    firm_risk: RISK_SIGNALS.filter((name) => leans[name] === "yes") as string[],
+    uncertain: uncertainSignals as string[],
+  };
+
   if (outOfScope && consequential) {
-    return { decision: "block", reasons, leans };
+    return { decision: "block", reasons, leans, ...derived };
   }
 
   const needsConfirm =
@@ -272,7 +299,7 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
     outOfScope ||
     uncertainSignals.length > 0;
 
-  if (needsConfirm) return { decision: "confirm", reasons, leans };
+  if (needsConfirm) return { decision: "confirm", reasons, leans, ...derived };
 
   const nothingFired = ignoreScope
     ? "No risk signal fired."
@@ -283,6 +310,7 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
     decision: "allow",
     reasons: reasons.length > 0 ? reasons : [nothingFired],
     leans,
+    ...derived,
   };
 }
 

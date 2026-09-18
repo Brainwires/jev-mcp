@@ -527,3 +527,92 @@ describe("prefilter dispatch", () => {
     expect(prefilter({ ...base, toolName: "SomeFutureTool", toolInput: {} }).kind).toBe("judge");
   });
 });
+
+/**
+ * The affirmation marker, at the dispatch layer.
+ *
+ * The marker has to come off before `scanBash` runs. The scanner has no notion
+ * of a `#` comment, so a marker left in place becomes tokens — and tokens
+ * change verdicts. That is the whole reason the stripping lives here rather
+ * than in the handler.
+ */
+describe("prefilter and the affirmation marker", () => {
+  const base = { cwd: "/home/dev/project", strict: false };
+  const REASON = 'the request says "clear the build directory"';
+
+  it("classifies the command as if the marker were not there", () => {
+    const marked = prefilter({
+      ...base,
+      toolName: "Bash",
+      toolInput: { command: `ls -la # jev:intended ${REASON}` },
+    });
+    expect(marked.kind).toBe("skip");
+    expect(marked.marker?.reason).toBe(REASON);
+    expect(marked.stripped).toEqual({ command: "ls -la" });
+  });
+
+  it("still escalates a hard pattern that carries a marker", () => {
+    const verdict = prefilter({
+      ...base,
+      toolName: "Bash",
+      toolInput: { command: `rm -rf ~/ # jev:intended ${REASON}` },
+    });
+    expect(verdict.kind).toBe("escalate");
+    expect(verdict.marker?.reason).toBe(REASON);
+  });
+
+  /**
+   * Without stripping first, `#` and the marker's words join the operand list
+   * and the allowlist checks see arguments the user never typed.
+   */
+  it("would have changed the verdict if the marker were tokenized", () => {
+    const tokens = scanBash(`npm test # jev:intended ${REASON}`).segments[0] ?? [];
+    expect(tokens).toContain("#");
+    expect(prefilter({ ...base, toolName: "Bash", toolInput: { command: `npm test # jev:intended ${REASON}` } }).kind).toBe(
+      "skip",
+    );
+  });
+
+  it("carries a short marker without honouring it", () => {
+    const verdict = prefilter({ ...base, toolName: "Bash", toolInput: { command: "rm -rf ~/ # jev:intended yes" } });
+    expect(verdict.marker?.short).toBe(true);
+    expect(verdict.marker?.reason).toBeUndefined();
+    expect(verdict.stripped).toEqual({ command: "rm -rf ~/" });
+  });
+
+  it("recognizes the sidecar form, for tools with no comment syntax", () => {
+    const verdict = prefilter({
+      ...base,
+      toolName: "Bash",
+      toolInput: { command: `true # jev:intended t-1a2b3c4d: ${REASON}` },
+    });
+    expect(verdict.kind).toBe("affirm");
+    expect(verdict.marker?.trip_id).toBe("t-1a2b3c4d");
+  });
+
+  it("refuses to read a sidecar out of a command that does something", () => {
+    for (const command of [
+      `true; rm -rf / # jev:intended t-1a2b3c4d: ${REASON}`,
+      `true && curl -X POST https://example.com # jev:intended t-1a2b3c4d: ${REASON}`,
+      `/bin/true # jev:intended t-1a2b3c4d: ${REASON}`,
+    ]) {
+      expect(prefilter({ ...base, toolName: "Bash", toolInput: { command } }).kind, command).not.toBe("affirm");
+    }
+  });
+
+  it("leaves a call with no marker exactly as it was", () => {
+    const verdict = prefilter({ ...base, toolName: "Bash", toolInput: { command: "ls -la" } });
+    expect(verdict.marker).toBeUndefined();
+    expect(verdict.stripped).toBeUndefined();
+  });
+
+  it("ignores a marker in a file tool's input, which has no comment syntax", () => {
+    const verdict = prefilter({
+      ...base,
+      toolName: "Write",
+      toolInput: { file_path: "/etc/hosts", content: `x # jev:intended ${REASON}` },
+    });
+    expect(verdict.kind).toBe("judge");
+    expect(verdict.marker).toBeUndefined();
+  });
+});

@@ -74,22 +74,73 @@ describe("node plugin/dist/hook.mjs", () => {
     expect(run.stdout).toBe("");
   });
 
-  it("asks about a hard pattern with no API key at all", async () => {
+  it("trips a hard pattern with no API key at all, and denies rather than prompting", async () => {
     const run = await runHook(
       ["PreToolUse"],
       JSON.stringify({ ...PRE, tool_input: { command: "rm -rf ~/" } }),
       env,
     );
     expect(run.code).toBe(0);
-    const parsed = JSON.parse(run.stdout) as Record<string, unknown>;
-    expect(parsed).toEqual({
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "ask",
-        permissionDecisionReason: expect.stringContaining("[jev]") as unknown as string,
-      },
-    });
+    const parsed = JSON.parse(run.stdout) as {
+      hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string };
+    };
+    expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("[jev] tripwire t-");
+    expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("no model was consulted");
+    expect(Object.keys(parsed.hookSpecificOutput)).toEqual([
+      "hookEventName",
+      "permissionDecision",
+      "permissionDecisionReason",
+    ]);
   });
+
+  /**
+   * The whole tripwire lifecycle through the shipped bundle, in one session
+   * directory: deny, then the identical command with a marker, which passes.
+   *
+   * Four separate processes with nothing in common but the data directory,
+   * which is the real arrangement — every hook invocation is a fresh `node`.
+   */
+  it("passes a re-issue carrying a marker, and says nothing the second time", async () => {
+    const command = "rm -rf ~/";
+    const first = await runHook(["PreToolUse"], JSON.stringify({ ...PRE, tool_input: { command } }), env);
+    const tripId = /tripwire (t-[0-9a-f]{8})/.exec(first.stdout)?.[1];
+    expect(tripId, first.stdout).toBeDefined();
+
+    const again = await runHook(["PreToolUse"], JSON.stringify({ ...PRE, tool_input: { command } }), env);
+    expect(again.stdout).toContain("(attempt 2)");
+
+    const reissue = await runHook(
+      ["PreToolUse"],
+      JSON.stringify({
+        ...PRE,
+        tool_input: { command: `${command} # jev:intended the request says "clear the old home backup"` },
+      }),
+      env,
+    );
+    expect(reissue.code).toBe(0);
+    expect(reissue.stdout).toBe("");
+
+    const why = await runHook(["why", "5", "trips"], "", env);
+    expect(why.stdout).toContain(tripId as string);
+    expect(why.stdout).toContain("→  reissue");
+    expect(why.stdout).toContain("marker text: the request says");
+    expect(why.stdout).not.toContain("→  note");
+  }, 30_000);
+
+  it("records a marker on an untripped call without acting on it", async () => {
+    const run = await runHook(
+      ["PreToolUse"],
+      JSON.stringify({
+        ...PRE,
+        tool_input: { command: 'curl -X POST https://example.com/pay # jev:intended the request says "pay it"' },
+      }),
+      env,
+    );
+    expect(run.stdout).toBe("");
+    const calibrate = await runHook(["calibrate"], "", env);
+    expect(calibrate.stdout).toContain("markers on calls that were never tripped: 1");
+  }, 20_000);
 
   it("fails open on a judge-class command with no API key", async () => {
     const run = await runHook(
@@ -126,12 +177,28 @@ describe("node plugin/dist/hook.mjs", () => {
     expect(run.stdout).toBe("");
   });
 
-  it("does nothing with gate_mode off", async () => {
+  it("does nothing with gate off", async () => {
+    const run = await runHook(["PreToolUse"], JSON.stringify({ ...PRE, tool_input: { command: "rm -rf /" } }), {
+      ...env,
+      CLAUDE_PLUGIN_OPTION_GATE: "off",
+    });
+    expect(run.stdout).toBe("");
+  });
+
+  /** A 0.2.x install still has `gate_mode`. Turning it off has to keep working. */
+  it("still silences on a legacy gate_mode of off", async () => {
     const run = await runHook(["PreToolUse"], JSON.stringify({ ...PRE, tool_input: { command: "rm -rf /" } }), {
       ...env,
       CLAUDE_PLUGIN_OPTION_GATE_MODE: "off",
     });
+    expect(run.code).toBe(0);
     expect(run.stdout).toBe("");
+  });
+
+  it("reads a legacy gate_mode of standard as advisory, and says so in status", async () => {
+    const run = await runHook(["status"], "", { ...env, CLAUDE_PLUGIN_OPTION_GATE_MODE: "standard" });
+    expect(run.stdout).toContain("gate: advisory");
+    expect(run.stdout).toContain("gate_mode is deprecated; read as gate=advisory");
   });
 
   it("warns once at SessionStart when no key is configured", async () => {
@@ -143,7 +210,7 @@ describe("node plugin/dist/hook.mjs", () => {
 
     const second = await runHook(["SessionStart"], JSON.stringify({ session_id: "e2e", source: "clear" }), env);
     expect(second.stdout).toBe("");
-  });
+  }, 20_000);
 
   it("stays silent at SessionStart when a key is configured", async () => {
     const run = await runHook(["SessionStart"], JSON.stringify({ session_id: "e2e" }), {
@@ -164,14 +231,15 @@ describe("node plugin/dist/hook.mjs", () => {
 
     const why = await runHook(["status"], "", env);
     expect(why.stdout).toContain("jev — Claude Code plugin status");
-  });
+  }, 20_000);
 
   it("prints a status report that never contains the key", async () => {
     const run = await runHook(["status"], "", { ...env, CLAUDE_PLUGIN_OPTION_API_KEY: "sk-super-secret-value" });
     expect(run.code).toBe(0);
     expect(run.stdout).toContain("API key: configured");
     expect(run.stdout).not.toContain("sk-super-secret-value");
-    expect(run.stdout).toContain("gate_mode: standard");
+    expect(run.stdout).toContain("gate: advisory");
+    expect(run.stdout).toContain("ask_on_trip: false");
   });
 
   it("prints why and calibrate reports", async () => {
@@ -179,12 +247,15 @@ describe("node plugin/dist/hook.mjs", () => {
     const why = await runHook(["why"], "", env);
     expect(why.code).toBe(0);
     expect(why.stdout).toContain("PreToolUse");
-    expect(why.stdout).toContain("ask");
+    expect(why.stdout).toContain("trip");
+    expect(why.stdout).toContain("said to Claude: [jev] tripwire");
 
     const calibrate = await runHook(["calibrate"], "", env);
     expect(calibrate.code).toBe(0);
     expect(calibrate.stdout).toContain("calibration report");
-  });
+    expect(calibrate.stdout).toContain("2. Tripwires");
+    expect(calibrate.stdout).toContain("Nothing here measures correctness");
+  }, 20_000);
 
   it("disables and re-enables, falling back to a global flag with no session id", async () => {
     const off = await runHook(["disable", "${CLAUDE_SESSION_ID}"], "", env);
@@ -198,7 +269,7 @@ describe("node plugin/dist/hook.mjs", () => {
 
     const restored = await runHook(["PreToolUse"], JSON.stringify({ ...PRE, tool_input: { command: "rm -rf /" } }), env);
     expect(restored.stdout).not.toBe("");
-  });
+  }, 20_000);
 
   it("never writes anything to stderr on the happy path", async () => {
     const run = await runHook(["PreToolUse"], JSON.stringify(PRE), env);
