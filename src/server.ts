@@ -21,7 +21,7 @@ import * as verifyTool from "./tools/verify.js";
 import type { ToolConfig } from "./tools/shared.js";
 
 export const SERVER_NAME = "jev-mcp";
-export const SERVER_VERSION = "0.1.4";
+export const SERVER_VERSION = "0.2.0";
 
 /** Read-only, but every tool reaches an external API. */
 const ANNOTATIONS = { readOnlyHint: true, openWorldHint: true } as const;
@@ -53,6 +53,10 @@ export function createServer(model: DecisionModel | null, config: Config): McpSe
     model: config.model,
     thresholds: config.thresholds,
     maxConcurrency: config.maxConcurrency,
+    maxConcurrencyExplicit: config.maxConcurrencyExplicit,
+    // The one place the file-reading tools learn which directory they are
+    // confined to. Everything under `src/files` refuses to leave it.
+    files: { root: config.projectRoot },
   };
 
   /** Never let a key reach a client, even if an upstream body echoed it. */

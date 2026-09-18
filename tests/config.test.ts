@@ -12,7 +12,15 @@ describe("loadConfig", () => {
       maxRetries: DEFAULTS.maxRetries,
       thresholds: { auto: DEFAULTS.autoThreshold, review: DEFAULTS.reviewThreshold },
       maxConcurrency: DEFAULTS.maxConcurrency,
+      maxConcurrencyExplicit: false,
+      // Absolute and machine-dependent, so asserted for shape rather than value.
+      projectRoot: expect.any(String),
     });
+  });
+
+  it("confines the file tools to CLAUDE_PROJECT_DIR when the harness sets one", () => {
+    const config = loadConfig({ TYPESAFE_API_KEY: "sk-abc", CLAUDE_PROJECT_DIR: process.cwd() });
+    expect(config.projectRoot).toBe(process.cwd());
   });
 
   it("represents a missing API key instead of throwing", () => {
@@ -41,6 +49,8 @@ describe("loadConfig", () => {
       maxRetries: 0,
       thresholds: { auto: 0.9, review: 0.5 },
       maxConcurrency: 8,
+      maxConcurrencyExplicit: true,
+      projectRoot: expect.any(String),
     });
   });
 

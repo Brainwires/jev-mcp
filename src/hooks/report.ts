@@ -9,12 +9,13 @@
  * configured" is the whole of what a status report needs to say about it.
  */
 
+import { USD_PER_MTOK } from "../decision/pricing.js";
 import { gateActionPolicy, type GateActionSignals } from "../tools/gate-action-core.js";
 import type { HookConfig } from "./config.js";
 import type { DecisionRecord, Store } from "./store.js";
 
-/** TypeSafe bills input tokens only. */
-export const USD_PER_MTOK = 0.042;
+/** TypeSafe bills input tokens only. Defined in `src/decision/pricing.ts`. */
+export { USD_PER_MTOK };
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 function percentile(values: number[], p: number): number {
@@ -117,7 +118,21 @@ export function whyReport(store: Store, limit = 3): string {
       );
     }
     if (record.policy !== undefined) {
-      lines.push(`  policy: uncertain=${record.policy.uncertain}, in_scope ${record.policy.ignore_scope ? "ignored" : "used"}`);
+      // Every option in force, because "why did this fire" usually turns out
+      // to be "which leniency was or was not switched on".
+      const options = [
+        `uncertain=${record.policy.uncertain}`,
+        `in_scope ${record.policy.ignore_scope ? "ignored" : "used"}`,
+      ];
+      const flags: [string, boolean | undefined][] = [
+        ["lenient_scope", record.policy.lenient_scope],
+        ["trust_requested", record.policy.trust_requested],
+        ["corroborate_uncertain", record.policy.corroborate_uncertain],
+      ];
+      for (const [name, value] of flags) {
+        if (value !== undefined) options.push(`${name}=${value}`);
+      }
+      lines.push(`  policy: ${options.join(", ")}`);
     }
     for (const reason of record.reasons ?? []) lines.push(`  - ${reason}`);
     if (record.error !== undefined) lines.push(`  error: ${record.error}`);
@@ -205,14 +220,15 @@ export function calibrateReport(config: HookConfig, store: Store): string {
           uncertain: record.policy?.uncertain === "confirm" ? "confirm" : "risky-lean",
           lenientScope: record.policy?.lenient_scope ?? false,
           trustRequested: record.policy?.trust_requested ?? false,
+          corroborateUncertain: record.policy?.corroborate_uncertain ?? false,
         },
       });
       if (gate.decision !== "allow") escalations += 1;
     }
     const delta = asksNow === 0 ? 0 : Math.round(((asksNow - escalations) / asksNow) * 100);
-    lines.push(
-      `  auto ${auto.toFixed(2)}: ${escalations} escalations (${delta >= 0 ? "-" : "+"}${Math.abs(delta)}% vs now)`,
-    );
+    // A zero delta is "0%", not "-0%".
+    const change = delta === 0 ? "0%" : `${delta > 0 ? "-" : "+"}${Math.abs(delta)}%`;
+    lines.push(`  auto ${auto.toFixed(2)}: ${escalations} escalations (${change} vs now)`);
   }
 
   // Approval correlation. PostToolUse for a tool call we escalated means it

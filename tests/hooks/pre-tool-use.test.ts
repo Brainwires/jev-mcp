@@ -144,8 +144,29 @@ describe("handlePreToolUse", () => {
       expect(await handlePreToolUse(input({ tool_input: { command: "npm install --save-dev date-fns" } }), deps)).toBeUndefined();
     });
 
-    it("asks when the uncertain scope is corroborated by a risk signal", async () => {
+    /**
+     * 0.2.0 (`corroborateUncertain`): one uncertain signal cannot corroborate
+     * another. `outward_facing: 0.6` is a reading the policy would not act on
+     * by itself, so it is not evidence that an uncertain scope matters either.
+     * Ten of twenty-three day-one escalations were this shape.
+     */
+    it("does not ask when the only corroboration is a second uncertain signal", async () => {
       const model = new FakeModel(() => answers(0.12, 0.6, 0.37, 0.03, 1));
+      const deps = makeDeps(dir, { model });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["fix the date parser test"] }));
+      expect(await handlePreToolUse(input(), deps)).toBeUndefined();
+      expect(deps.store.readLog().at(-1)?.decision).toBe("allow");
+    });
+
+    it("asks when the uncertain scope is corroborated by a wide blast radius", async () => {
+      const model = new FakeModel(() => answers(0.12, 0.6, 0.37, 0.03, 2.3));
+      const deps = makeDeps(dir, { model });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["fix the date parser test"] }));
+      expect((await handlePreToolUse(input(), deps))?.hookSpecificOutput?.permissionDecision).toBe("ask");
+    });
+
+    it("asks when the uncertain scope is corroborated by a firm risk signal", async () => {
+      const model = new FakeModel(() => answers(YES, NO, 0.37, NO, 1));
       const deps = makeDeps(dir, { model });
       deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["fix the date parser test"] }));
       expect((await handlePreToolUse(input(), deps))?.hookSpecificOutput?.permissionDecision).toBe("ask");
@@ -242,17 +263,21 @@ describe("handlePreToolUse", () => {
     expect(output?.hookSpecificOutput?.permissionDecision).toBe("ask");
   });
 
-  it("treats an uncertain signal as a confirm only when it leans risky in standard mode", async () => {
-    const lowRisk = new FakeModel(() => answers(0.4, NO, YES, NO, 0));
-    const depsLow = makeDeps(dir, { model: lowRisk });
-    depsLow.store.updateSession("s1", (s) => ({ ...s, prompts: ["do the thing"] }));
-    expect(await handlePreToolUse(input(), depsLow)).toBeUndefined();
+  it("stays silent for an uncertain risk signal with nothing corroborating it", async () => {
+    for (const shape of [answers(0.4, NO, YES, NO, 0), answers(0.6, NO, YES, NO, 0)]) {
+      const deps = makeDeps(dir, { model: new FakeModel(() => shape) });
+      deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["do the thing"] }));
+      expect(await handlePreToolUse(input(), deps)).toBeUndefined();
+      expect(deps.store.readLog().at(-1)?.decision).toBe("allow");
+    }
+  });
 
-    const highRisk = new FakeModel(() => answers(0.6, NO, YES, NO, 0));
-    const depsHigh = makeDeps(dir, { model: highRisk });
-    depsHigh.store.updateSession("s1", (s) => ({ ...s, prompts: ["do the thing"] }));
-    const output = await handlePreToolUse(input(), depsHigh);
+  it("asks once a second risk signal corroborates the uncertain one", async () => {
+    const deps = makeDeps(dir, { model: new FakeModel(() => answers(0.6, 0.55, YES, NO, 0)) });
+    deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["do the thing"] }));
+    const output = await handlePreToolUse(input(), deps);
     expect(output?.hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect(output?.hookSpecificOutput?.permissionDecisionReason).toContain("unsure");
   });
 
   it("treats any uncertain signal as a confirm in strict mode", async () => {
@@ -307,7 +332,13 @@ describe("handlePreToolUse", () => {
     expect(record?.event).toBe("PreToolUse");
     expect(record?.decision).toBe("ask");
     expect(record?.signals?.outward_facing).toBe(YES);
-    expect(record?.policy).toEqual({ ignore_scope: false, uncertain: "risky-lean", lenient_scope: true, trust_requested: true });
+    expect(record?.policy).toEqual({
+      ignore_scope: false,
+      uncertain: "risky-lean",
+      lenient_scope: true,
+      trust_requested: true,
+      corroborate_uncertain: true,
+    });
     expect(record?.tool_use_id).toBe("toolu_1");
   });
 

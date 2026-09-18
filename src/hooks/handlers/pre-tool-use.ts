@@ -100,10 +100,11 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
   const policyOptions = {
     ignoreScope: !knownRequest,
     uncertain: config.gateMode === "strict" ? ("confirm" as const) : ("risky-lean" as const),
-    // Strict mode keeps every reason to ask. Standard mode drops the two that
-    // fire on ordinary, requested work.
+    // Strict mode keeps every reason to ask. Standard mode drops the three
+    // that fire on ordinary, requested work.
     lenientScope: config.gateMode !== "strict",
     trustRequested: config.gateMode !== "strict",
+    corroborateUncertain: config.gateMode !== "strict",
   };
 
   const controller = new AbortController();
@@ -134,6 +135,7 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
         uncertain: policyOptions.uncertain,
         lenient_scope: policyOptions.lenientScope,
         trust_requested: policyOptions.trustRequested,
+        corroborate_uncertain: policyOptions.corroborateUncertain,
       },
       reasons: result.reasons,
       model: result.model,

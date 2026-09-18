@@ -36,6 +36,15 @@ export interface HookInput {
   tool_input?: Record<string, unknown>;
   tool_response?: unknown;
   tool_use_id?: string;
+  /**
+   * PostToolUseFailure: a string describing the failure, whose first line is
+   * `Exit code N` for a Bash command that ran and exited.
+   */
+  error?: string;
+  /** PostToolUseFailure: the failure arrived as an abort, not as a verdict. */
+  is_interrupt?: boolean;
+  /** PostToolUseFailure: tool execution time, excluding permission prompts. */
+  duration_ms?: number;
   /** UserPromptSubmit. */
   prompt?: string;
   /** Stop / SubagentStop. */

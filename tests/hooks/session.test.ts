@@ -86,6 +86,22 @@ describe("handleUserPromptSubmit", () => {
     expect(session.pending_asks).toEqual([]);
   });
 
+  /**
+   * A failing test suite is still failing after the user types something, so
+   * the ledger deliberately outlives a prompt. If it did not, the stop check
+   * would be blind for exactly as long as it takes to say "carry on".
+   */
+  it("does not reset the verification ledger", async () => {
+    const deps = makeDeps(dir);
+    const ledger = {
+      last: { kind: "test" as const, ok: false, ts: 1_699_000_000_000, command: "npm test" },
+      edits_since: 3,
+    };
+    deps.store.updateSession("s1", (s) => ({ ...s, verification: ledger }));
+    await handleUserPromptSubmit({ session_id: "s1", prompt: PROMPT }, deps);
+    expect(deps.store.readSession("s1").verification).toEqual(ledger);
+  });
+
   it("does the bookkeeping even with no api key", async () => {
     const deps = makeDeps(dir, { model: null, config: { apiKey: null, routePrompts: true } });
     await handleUserPromptSubmit({ session_id: "s1", prompt: PROMPT }, deps);

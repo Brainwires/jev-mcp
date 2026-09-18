@@ -51,6 +51,7 @@ describe("jev_verify", () => {
       supported: 1,
       contradicted: 1,
       not_addressed: 1,
+      conflicting: 0,
       needs_review: 2,
     });
     expect(result.all_supported).toBe(false);

@@ -25,6 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { VERIFICATION_KINDS, type VerificationLedger } from "./verification.js";
 
 /** Maximum substantive prompts kept per session, oldest first. */
 export const MAX_PROMPTS = 3;
@@ -106,6 +107,12 @@ export interface SessionState {
   pending_asks?: PendingAsk[];
   /** SessionStart already told the user the key is missing. */
   key_warned?: boolean;
+  /**
+   * What the last test/build/type-check/lint run established, and how many
+   * edits have happened since. Deliberately NOT reset by a new user prompt:
+   * a failing test suite is still failing after the user types something.
+   */
+  verification?: VerificationLedger;
   /** Epoch ms of the last write, for pruning. */
   updated?: number;
 }
@@ -123,7 +130,13 @@ export interface DecisionRecord {
   prefilter?: string;
   signals?: Record<string, number>;
   /** Policy options in force, so `/jev:calibrate` can replay the decision. */
-  policy?: { ignore_scope: boolean; uncertain: string; lenient_scope?: boolean; trust_requested?: boolean };
+  policy?: {
+    ignore_scope: boolean;
+    uncertain: string;
+    lenient_scope?: boolean;
+    trust_requested?: boolean;
+    corroborate_uncertain?: boolean;
+  };
   decision: string;
   reasons?: string[];
   model?: string;
@@ -138,6 +151,33 @@ function safe<T>(fn: () => T, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Validate a ledger read back off disk.
+ *
+ * The session file is state this plugin wrote, but it is still a file on disk
+ * that anything could have edited, and `last.kind` reaches a user-visible
+ * message. Anything unrecognized is dropped rather than repaired.
+ */
+function readLedger(raw: unknown): VerificationLedger | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const value = raw as Partial<VerificationLedger>;
+  const ledger: VerificationLedger = {
+    edits_since: typeof value.edits_since === "number" && value.edits_since >= 0 ? Math.floor(value.edits_since) : 0,
+  };
+  const last = value.last;
+  if (
+    typeof last === "object" &&
+    last !== null &&
+    (VERIFICATION_KINDS as readonly string[]).includes(last.kind) &&
+    typeof last.ok === "boolean" &&
+    typeof last.ts === "number" &&
+    typeof last.command === "string"
+  ) {
+    ledger.last = { kind: last.kind, ok: last.ok, ts: last.ts, command: last.command };
+  }
+  return ledger;
 }
 
 /** Session ids arrive from the harness; never let one escape the data dir. */
@@ -190,6 +230,8 @@ export class Store {
         );
       }
       if (typeof state.updated === "number") session.updated = state.updated;
+      const ledger = readLedger(state.verification);
+      if (ledger !== undefined) session.verification = ledger;
       return session;
     }, { ...EMPTY_SESSION });
   }

@@ -417,6 +417,34 @@ describe("gateActionPolicy — hook-only leniency options", () => {
     expect(result.reasons.join(" ")).toContain("what the user asked for");
   });
 
+  /**
+   * The scope bar is `review`, deliberately. A push the user asked for scores
+   * `in_scope` around 0.72 to 0.81 in the logged data — short of `auto` — and
+   * staying silent on exactly that is why the option exists. Holding it to
+   * `auto` would make it unreachable.
+   */
+  it("trustRequested holds at the review bar, not the auto bar", () => {
+    const options = { uncertain: "risky-lean" as const, trustRequested: true, corroborateUncertain: true };
+    for (const in_scope of [0.72, 0.81, 0.84]) {
+      const result = gateActionTool.gateActionPolicy({
+        signals: { ...push, in_scope },
+        blast_radius: 2.77,
+        thresholds,
+        options,
+      });
+      expect(result.decision, `in_scope ${in_scope}`).toBe("allow");
+    }
+    // Below the review bar it is no longer a requested action.
+    expect(
+      gateActionTool.gateActionPolicy({
+        signals: { ...push, in_scope: 0.55 },
+        blast_radius: 2.77,
+        thresholds,
+        options,
+      }).decision,
+    ).toBe("confirm");
+  });
+
   it("trustRequested never rescues an out-of-scope or destructive action", () => {
     const options = { uncertain: "risky-lean" as const, trustRequested: true, lenientScope: true };
     const refund = { destructive: 0.53, outward_facing: 0.96, in_scope: 0.02, credential_exposure: 0.36 };

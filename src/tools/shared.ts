@@ -9,6 +9,7 @@
 
 import { z } from "zod";
 import type { GateThresholds, Instructions, Json, Question, State } from "../decision/types.js";
+import type { FileAccessOptions } from "../files/index.js";
 
 // --------------------------------------------------------------- zod fragments
 
@@ -131,6 +132,20 @@ export interface ToolConfig {
   model: string;
   thresholds: GateThresholds;
   maxConcurrency: number;
+  /**
+   * True when `JEV_MAX_CONCURRENCY` was set explicitly. File sources fan out
+   * wider than the default, but an operator who named a number meant it.
+   */
+  maxConcurrencyExplicit?: boolean | undefined;
+  /**
+   * Overrides for the file layer: the project root, the caps, the cost ceiling.
+   * Tests point `root` at a temp directory; production leaves it unset and the
+   * root comes from `CLAUDE_PROJECT_DIR` or the cwd.
+   *
+   * Imported as a type only, so nothing here pulls `node:fs` into a bundle
+   * that must not have it.
+   */
+  files?: FileAccessOptions | undefined;
 }
 
 /**

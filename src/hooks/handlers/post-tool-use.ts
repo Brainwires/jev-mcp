@@ -18,6 +18,7 @@
 import type { NoulAnswer, Question } from "../../decision/types.js";
 import { requestText } from "../store.js";
 import { redactAndClamp } from "../redact.js";
+import { applyLedgerEvent, EMPTY_LEDGER, ledgerEvent } from "../verification.js";
 import type { Deps, HookInput, HookOutput } from "../types.js";
 
 /** Below this, there is not enough text to carry an instruction worth flagging. */
@@ -99,9 +100,46 @@ export function recordApproval(input: HookInput, deps: Deps): void {
   });
 }
 
+/**
+ * Maintain the verification ledger.
+ *
+ * Runs on the async post-tool hooks, so it costs the session nothing and
+ * produces no output. Every write is a read-modify-write of one small JSON
+ * file; two async hooks finishing at once can lose an increment, which only
+ * ever makes the stop check more lenient.
+ */
+export function recordVerification(input: HookInput, deps: Deps): void {
+  const event = ledgerEvent(input, deps.now());
+  if (event.verification === undefined && !event.edited) return;
+
+  const sessionId = input.session_id ?? "unknown";
+  deps.store.updateSession(
+    sessionId,
+    (state) => ({
+      ...state,
+      verification: applyLedgerEvent(state.verification ?? EMPTY_LEDGER, event),
+    }),
+    deps.now(),
+  );
+
+  // Logged so `/jev:why` can explain a stop block after the fact, and so a
+  // misclassified command is visible rather than invisible.
+  if (event.verification !== undefined) {
+    deps.store.append({
+      ts: new Date(deps.now()).toISOString(),
+      session_id: sessionId,
+      event: "verification",
+      tool_name: input.tool_name ?? "Bash",
+      subject: event.verification.command,
+      decision: event.verification.ok ? `${event.verification.kind}-passed` : `${event.verification.kind}-failed`,
+    });
+  }
+}
+
 /** The bookkeeping-only path, for the async hook. */
 export async function handleApproval(input: HookInput, deps: Deps): Promise<HookOutput | undefined> {
   recordApproval(input, deps);
+  recordVerification(input, deps);
   return undefined;
 }
 

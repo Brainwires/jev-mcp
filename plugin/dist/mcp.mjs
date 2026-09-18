@@ -2984,7 +2984,7 @@ var require_compile = __commonJS({
       const schOrFunc = root.refs[ref];
       if (schOrFunc)
         return schOrFunc;
-      let _sch = resolve.call(this, root, ref);
+      let _sch = resolve2.call(this, root, ref);
       if (_sch === void 0) {
         const schema = (_a3 = root.localRefs) === null || _a3 === void 0 ? void 0 : _a3[ref];
         const { schemaId } = this.opts;
@@ -3011,7 +3011,7 @@ var require_compile = __commonJS({
     function sameSchemaEnv(s1, s2) {
       return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
     }
-    function resolve(root, ref) {
+    function resolve2(root, ref) {
       let sch;
       while (typeof (sch = this.refs[ref]) == "string")
         ref = sch;
@@ -3841,7 +3841,7 @@ var require_fast_uri = __commonJS({
       }
       return uri;
     }
-    function resolve(baseURI, relativeURI, options) {
+    function resolve2(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
       const {
         parsed: baseParsed,
@@ -4210,7 +4210,7 @@ var require_fast_uri = __commonJS({
     var fastUri = {
       SCHEMES,
       normalize,
-      resolve,
+      resolve: resolve2,
       resolveComponent,
       equal,
       serialize,
@@ -7915,8 +7915,8 @@ function cleanRegex(source) {
   const end = source.endsWith("$") ? source.length - 1 : source.length;
   return source.slice(start, end);
 }
-function floatSafeRemainder(val, step) {
-  const ratio = val / step;
+function floatSafeRemainder(val, step2) {
+  const ratio = val / step2;
   const roundedRatio = Math.round(ratio);
   const tolerance = 4 * Number.EPSILON * Math.max(Math.abs(ratio), 1);
   if (Math.abs(ratio - roundedRatio) < tolerance)
@@ -12228,7 +12228,7 @@ var recursive = /* @__PURE__ */ new WeakMap();
 var NONE = 0;
 var ASSUMED = 1;
 var PROVEN = 2;
-function isRecursive(inst, stack, resolve) {
+function isRecursive(inst, stack, resolve2) {
   const cached2 = recursive.get(inst);
   if (cached2 !== void 0)
     return cached2 ? PROVEN : NONE;
@@ -12238,7 +12238,7 @@ function isRecursive(inst, stack, resolve) {
   let result = NONE;
   const check2 = (child) => {
     if (result !== PROVEN && child?._zod) {
-      const answer = isRecursive(child, stack, resolve);
+      const answer = isRecursive(child, stack, resolve2);
       if (answer > result)
         result = answer;
     }
@@ -12249,7 +12249,7 @@ function isRecursive(inst, stack, resolve) {
       const desc = Object.getOwnPropertyDescriptor(sh, key);
       if (spread && !desc.enumerable)
         continue;
-      const child = desc.get ? ASSUMED : desc.value?._zod ? isRecursive(desc.value, stack, resolve) : NONE;
+      const child = desc.get ? ASSUMED : desc.value?._zod ? isRecursive(desc.value, stack, resolve2) : NONE;
       if (child > answer)
         answer = child;
     }
@@ -12313,7 +12313,7 @@ function isRecursive(inst, stack, resolve) {
       break;
     // `$ZodLazy` caches its inner on the def, so a resolved edge is followed exactly
     case "lazy": {
-      const inner = def._cachedInner ?? (resolve ? inst._zod.innerType : void 0);
+      const inner = def._cachedInner ?? (resolve2 ? inst._zod.innerType : void 0);
       merge2(inner ? isRecursive(inner, stack, false) : ASSUMED);
       break;
     }
@@ -28494,71 +28494,20 @@ var StdioServerTransport = class {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve) => {
+    return new Promise((resolve2) => {
       const json2 = serializeMessage(message);
       if (this._stdout.write(json2)) {
-        resolve();
+        resolve2();
       } else {
-        this._stdout.once("drain", resolve);
+        this._stdout.once("drain", resolve2);
       }
     });
   }
 };
 
-// src/config.ts
-var DEFAULTS = {
-  baseUrl: "https://api.typesafe.ai",
-  model: "jev-latest",
-  timeoutMs: 3e4,
-  maxRetries: 3,
-  autoThreshold: 0.85,
-  reviewThreshold: 0.6,
-  maxConcurrency: 4
-};
-var MISSING_API_KEY_MESSAGE = "TYPESAFE_API_KEY is not set, so this server cannot reach the Jev API. Set it in the MCP server's environment (for example: `claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jev-mcp`) and restart the server. If this is the Claude Code plugin, either set the API key in the plugin's settings or export TYPESAFE_API_KEY before starting Claude Code, then run /reload-plugins. Keys are issued at https://typesafe.ai.";
-function readString(env, key, fallback) {
-  const raw = env[key];
-  if (raw === void 0) return fallback;
-  const trimmed = raw.trim();
-  return trimmed === "" ? fallback : trimmed;
-}
-function readNumber(env, key, fallback, min, max) {
-  const raw = env[key];
-  if (raw === void 0 || raw.trim() === "") return fallback;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value < min || value > max) {
-    throw new Error(
-      `${key}=${JSON.stringify(raw)} is not usable: expected a number between ${min} and ${max}.`
-    );
-  }
-  return value;
-}
-function firstKey(...candidates) {
-  for (const candidate of candidates) {
-    const value = candidate?.trim();
-    if (value !== void 0 && value !== "" && !value.includes("${")) return value;
-  }
-  return void 0;
-}
-function loadConfig(env = process.env) {
-  const apiKeyRaw = firstKey(env.JEV_PLUGIN_API_KEY, env.CLAUDE_PLUGIN_OPTION_API_KEY, env.TYPESAFE_API_KEY);
-  const auto = readNumber(env, "JEV_AUTO_THRESHOLD", DEFAULTS.autoThreshold, 0, 1);
-  const review = readNumber(env, "JEV_REVIEW_THRESHOLD", DEFAULTS.reviewThreshold, 0, 1);
-  if (review > auto) {
-    throw new Error(
-      `JEV_REVIEW_THRESHOLD (${review}) must not exceed JEV_AUTO_THRESHOLD (${auto}).`
-    );
-  }
-  return {
-    apiKey: apiKeyRaw === void 0 || apiKeyRaw === "" ? null : apiKeyRaw,
-    baseUrl: readString(env, "TYPESAFE_BASE_URL", DEFAULTS.baseUrl).replace(/\/+$/, ""),
-    model: readString(env, "JEV_MODEL", DEFAULTS.model),
-    timeoutMs: readNumber(env, "JEV_TIMEOUT_MS", DEFAULTS.timeoutMs, 1, 6e5),
-    maxRetries: readNumber(env, "JEV_MAX_RETRIES", DEFAULTS.maxRetries, 0, 10),
-    thresholds: { auto, review },
-    maxConcurrency: readNumber(env, "JEV_MAX_CONCURRENCY", DEFAULTS.maxConcurrency, 1, 32)
-  };
-}
+// src/files/index.ts
+import { readFileSync, realpathSync as realpathSync2, statSync as statSync2 } from "node:fs";
+import { isAbsolute, relative as relativePath, resolve, sep as sep2 } from "node:path";
 
 // src/decision/budget.ts
 var CHARS_PER_TOKEN = 3.5;
@@ -28642,6 +28591,563 @@ function checkBudget(state, questions, limits = DEFAULT_BUDGET_LIMITS) {
 function fitsBudget(state, questions, limits = DEFAULT_BUDGET_LIMITS) {
   const estimate = estimateBudget(state, questions);
   return estimate.total_tokens <= limits.total && estimate.state_plus_longest_tokens <= limits.statePlusLongestQuestion;
+}
+
+// src/decision/pricing.ts
+var USD_PER_MTOK = 0.042;
+function estimateCostUsd(inputTokens) {
+  return inputTokens / 1e6 * USD_PER_MTOK;
+}
+
+// src/util/sensitive-path.ts
+var SENSITIVE_BASENAMES = [
+  /^\.env(\..*)?$/i,
+  /^id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i,
+  /^\.npmrc$/i,
+  /^\.netrc$/i,
+  /^\.pypirc$/i,
+  /^\.git-credentials$/i,
+  /^credentials$/i,
+  /^authorized_keys$/i,
+  /^known_hosts$/i,
+  /^\.(bash|zsh)(rc|_profile|env|profile|_login)$/i,
+  /^\.profile$/i,
+  /^\.bashrc$/i,
+  /^\.zshrc$/i,
+  /^\.zshenv$/i,
+  /^\.zprofile$/i,
+  /^\.bash_profile$/i,
+  /^\.bash_login$/i,
+  /^\.gitconfig$/i
+];
+var SENSITIVE_EXTENSIONS = [/\.pem$/i, /\.p12$/i, /\.pfx$/i, /\.key$/i, /\.keystore$/i, /\.jks$/i];
+var SENSITIVE_DIRS = /* @__PURE__ */ new Set([".ssh", ".aws", ".gnupg", ".config/gcloud", ".kube", ".docker"]);
+function isSensitivePath(path) {
+  const normalized = path.replace(/\\/g, "/");
+  const parts = normalized.split("/").filter((part) => part !== "");
+  const base = parts[parts.length - 1] ?? "";
+  if (SENSITIVE_BASENAMES.some((pattern) => pattern.test(base))) return true;
+  if (SENSITIVE_EXTENSIONS.some((pattern) => pattern.test(base))) return true;
+  if (parts.some((part) => SENSITIVE_DIRS.has(part))) return true;
+  if (/\/\.claude\/settings[^/]*\.json$/i.test(`/${normalized}`)) return true;
+  if (/\/\.claude\/(settings|hooks)\//i.test(`/${normalized}`)) return true;
+  if (parts.includes(".git")) return true;
+  return false;
+}
+
+// src/files/errors.ts
+var FileSelectionError = class extends Error {
+  kind;
+  constructor(kind, message) {
+    super(message);
+    this.name = "FileSelectionError";
+    this.kind = kind;
+  }
+};
+
+// src/files/glob.ts
+import { readdirSync, realpathSync, statSync } from "node:fs";
+import { join, sep } from "node:path";
+var DEFAULT_IGNORED_DIRS = /* @__PURE__ */ new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  ".next",
+  "target",
+  "vendor",
+  "coverage",
+  ".turbo",
+  ".venv",
+  "__pycache__"
+]);
+var LOCKFILES = /* @__PURE__ */ new Set([
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lockb",
+  "bun.lock",
+  "Cargo.lock",
+  "poetry.lock",
+  "composer.lock",
+  "Gemfile.lock",
+  "go.sum",
+  "uv.lock"
+]);
+function isIgnoredFile(basename) {
+  if (LOCKFILES.has(basename)) return true;
+  return /\.min\.[a-z0-9]+$/i.test(basename) || /\.map$/i.test(basename);
+}
+function expandBraces(pattern) {
+  const open2 = pattern.indexOf("{");
+  if (open2 === -1) return [pattern];
+  let depth = 0;
+  let close = -1;
+  const parts = [];
+  let current = "";
+  for (let i = open2; i < pattern.length; i += 1) {
+    const char = pattern[i];
+    if (char === "{") {
+      depth += 1;
+      if (depth === 1) continue;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        close = i;
+        parts.push(current);
+        break;
+      }
+    } else if (char === "," && depth === 1) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (close === -1) return [pattern];
+  const head = pattern.slice(0, open2);
+  const tail = pattern.slice(close + 1);
+  return parts.flatMap((part) => expandBraces(`${head}${part}${tail}`));
+}
+function segmentRegex(segment) {
+  let source = "^";
+  let index = 0;
+  while (index < segment.length) {
+    const char = segment[index];
+    if (char === "*") {
+      source += "[^/]*";
+      index += 1;
+      continue;
+    }
+    if (char === "?") {
+      source += "[^/]";
+      index += 1;
+      continue;
+    }
+    if (char === "[") {
+      const close = segment.indexOf("]", index + 1);
+      if (close !== -1) {
+        const body = segment.slice(index + 1, close);
+        const negated = body.startsWith("!") || body.startsWith("^");
+        const inner = negated ? body.slice(1) : body;
+        source += `[${negated ? "^" : ""}${inner.replace(/[\\\]]/g, "\\$&")}]`;
+        index = close + 1;
+        continue;
+      }
+    }
+    source += char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    index += 1;
+  }
+  return new RegExp(`${source}$`);
+}
+function compilePattern(pattern) {
+  const segments = pattern.replace(/\\/g, "/").split("/").filter((segment) => segment !== "" && segment !== ".").map((segment) => ({
+    globstar: segment === "**",
+    regex: segmentRegex(segment),
+    dot: segment.startsWith(".")
+  }));
+  return { segments };
+}
+function step(pattern, states, name7) {
+  const next = /* @__PURE__ */ new Set();
+  const hidden = name7.startsWith(".");
+  for (const state of states) {
+    const segment = pattern.segments[state];
+    if (segment === void 0) continue;
+    if (segment.globstar) {
+      if (!hidden) next.add(state);
+      for (const forward of closure(pattern, state + 1)) {
+        const target = pattern.segments[forward];
+        if (target === void 0) continue;
+        if (hidden && !target.dot) continue;
+        if (target.regex.test(name7)) next.add(forward + 1);
+      }
+      continue;
+    }
+    if (hidden && !segment.dot) continue;
+    if (segment.regex.test(name7)) next.add(state + 1);
+  }
+  return [...next];
+}
+function closure(pattern, state) {
+  const out = [];
+  let index = state;
+  for (; ; ) {
+    out.push(index);
+    const segment = pattern.segments[index];
+    if (segment?.globstar !== true) break;
+    index += 1;
+  }
+  return out;
+}
+function accepts(pattern, states) {
+  return states.some((state) => closure(pattern, state).some((s) => s >= pattern.segments.length));
+}
+var MAX_DIRECTORIES = 2e4;
+var MAX_ENTRIES = 2e5;
+function isInsideRoot(root, target) {
+  if (target === root) return true;
+  return target.startsWith(root.endsWith(sep) ? root : root + sep);
+}
+function globFiles(pattern, options) {
+  const ignoredDirs = options.ignoredDirs ?? DEFAULT_IGNORED_DIRS;
+  const maxEntries = options.maxVisited ?? MAX_ENTRIES;
+  const maxDirs = options.maxDirs ?? MAX_DIRECTORIES;
+  const compiled = expandBraces(pattern).map((expanded) => compilePattern(expanded));
+  const paths = [];
+  let ignored = 0;
+  let visited = 0;
+  let dirs = 0;
+  let outsideRoot = 0;
+  let truncated = false;
+  const seenDirs = /* @__PURE__ */ new Set();
+  const walk = (relative, states) => {
+    if (truncated) return;
+    let entries;
+    try {
+      entries = readdirSync(join(options.root, relative), { withFileTypes: true }).map((entry) => {
+        if (!entry.isSymbolicLink()) {
+          return { name: entry.name, isDirectory: entry.isDirectory(), isFile: entry.isFile() };
+        }
+        try {
+          const target = statSync(join(options.root, relative, entry.name));
+          return { name: entry.name, isDirectory: target.isDirectory(), isFile: target.isFile() };
+        } catch {
+          return { name: entry.name, isDirectory: false, isFile: false };
+        }
+      });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      visited += 1;
+      if (visited > maxEntries) {
+        throw new FileSelectionError(
+          "walk_too_wide",
+          `Expanding ${JSON.stringify(pattern)} looked at more than ${maxEntries.toLocaleString("en-US")} directory entries without finishing. Narrow the glob to a subdirectory. Nothing was sent.`
+        );
+      }
+      const child = relative === "" ? entry.name : `${relative}/${entry.name}`;
+      const nextStates = compiled.map((p, index) => step(p, states[index], entry.name));
+      if (entry.isFile && nextStates.some((s, index) => accepts(compiled[index], s))) {
+        if (isIgnoredFile(entry.name)) {
+          ignored += 1;
+        } else {
+          paths.push(child);
+          if (paths.length >= options.limit + 1) {
+            truncated = true;
+            return;
+          }
+        }
+      }
+      if (entry.isDirectory && !ignoredDirs.has(entry.name) && nextStates.some((s) => s.length > 0)) {
+        let real;
+        try {
+          real = realpathSync(join(options.root, child));
+        } catch {
+          continue;
+        }
+        if (!isInsideRoot(options.root, real)) {
+          outsideRoot += 1;
+          continue;
+        }
+        if (seenDirs.has(real)) continue;
+        seenDirs.add(real);
+        dirs += 1;
+        if (dirs > maxDirs) {
+          throw new FileSelectionError(
+            "walk_too_wide",
+            `Expanding ${JSON.stringify(pattern)} reached more than ${maxDirs.toLocaleString("en-US")} directories without finishing. Narrow the glob to a subdirectory. Nothing was sent.`
+          );
+        }
+        walk(child, nextStates);
+        if (truncated) return;
+      }
+    }
+  };
+  walk("", compiled.map((p) => closure(p, 0)));
+  return { paths: paths.sort(), truncated, ignored, outsideRoot };
+}
+
+// src/files/index.ts
+var MAX_FILE_BYTES = 512 * 1024;
+var MAX_FILES = 1e3;
+var CHUNK_LINES = 60;
+var CHUNK_OVERLAP_LINES = 5;
+var MAX_CHUNK_CHARS = 6e3;
+var MAX_INPUT_TOKENS = 3e6;
+var PER_CHUNK_OVERHEAD_TOKENS = 90;
+var BINARY_SNIFF_BYTES = 8192;
+function emptySkipped() {
+  return { binary: 0, too_large: 0, sensitive: 0, outside_root: 0, not_found: 0, ignored: 0 };
+}
+function skippedTotal(skipped) {
+  return Object.values(skipped).reduce((a, b) => a + b, 0);
+}
+function resolveProjectRoot(env = process.env, cwd = process.cwd()) {
+  const configured = env.CLAUDE_PROJECT_DIR?.trim();
+  const base = configured !== void 0 && configured !== "" ? configured : cwd;
+  try {
+    return realpathSync2(resolve(base));
+  } catch {
+    return resolve(base);
+  }
+}
+function rootOf(options = {}) {
+  if (options.root === void 0 || options.root === "") return resolveProjectRoot();
+  try {
+    return realpathSync2(resolve(options.root));
+  } catch {
+    return resolve(options.root);
+  }
+}
+function isInsideRoot2(root, target) {
+  if (target === root) return true;
+  return target.startsWith(root.endsWith(sep2) ? root : root + sep2);
+}
+function resolveInsideRoot(root, input2) {
+  if (input2.trim() === "") return { kind: "not_found" };
+  if (isSensitivePath(input2)) return { kind: "sensitive" };
+  const lexical = isAbsolute(input2) ? resolve(input2) : resolve(root, input2);
+  if (isSensitivePath(relativePath(root, lexical))) return { kind: "sensitive" };
+  let real;
+  try {
+    real = realpathSync2(lexical);
+  } catch {
+    return isInsideRoot2(root, lexical) ? { kind: "not_found" } : { kind: "outside_root" };
+  }
+  if (!isInsideRoot2(root, real)) return { kind: "outside_root" };
+  const rel = relativePath(root, real).split(sep2).join("/");
+  if (isSensitivePath(rel)) return { kind: "sensitive" };
+  try {
+    if (!statSync2(real).isFile()) return { kind: "not_found" };
+  } catch {
+    return { kind: "not_found" };
+  }
+  return { kind: "ok", absolute: real, relative: rel };
+}
+function looksBinary(buffer) {
+  const end = Math.min(buffer.length, BINARY_SNIFF_BYTES);
+  for (let i = 0; i < end; i += 1) {
+    if (buffer[i] === 0) return true;
+  }
+  return false;
+}
+function readTextFile(absolute, maxBytes = MAX_FILE_BYTES) {
+  let size;
+  try {
+    size = statSync2(absolute).size;
+  } catch {
+    return { kind: "not_found" };
+  }
+  if (size > maxBytes) return { kind: "too_large" };
+  let buffer;
+  try {
+    buffer = readFileSync(absolute);
+  } catch {
+    return { kind: "not_found" };
+  }
+  if (looksBinary(buffer)) return { kind: "binary" };
+  return { kind: "ok", text: buffer.toString("utf8") };
+}
+function chunkText(path, text, options = {}) {
+  const chunkLines = options.chunkLines ?? CHUNK_LINES;
+  const overlap = Math.min(options.overlapLines ?? CHUNK_OVERLAP_LINES, chunkLines - 1);
+  const maxChars = options.maxChunkChars ?? MAX_CHUNK_CHARS;
+  const step2 = Math.max(1, chunkLines - overlap);
+  const lines = text.split("\n");
+  const out = [];
+  for (let start = 0; start < lines.length; start += step2) {
+    const end = Math.min(start + chunkLines, lines.length);
+    pushRange(out, path, lines, start, end, maxChars);
+    if (end >= lines.length) break;
+  }
+  return out.filter((chunk) => chunk.text.trim() !== "");
+}
+function pushRange(out, path, lines, start, end, maxChars) {
+  const text = lines.slice(start, end).join("\n");
+  if (text.length <= maxChars) {
+    out.push({ path, start_line: start + 1, end_line: end, text });
+    return;
+  }
+  if (end - start > 1) {
+    const middle = start + Math.ceil((end - start) / 2);
+    pushRange(out, path, lines, start, middle, maxChars);
+    pushRange(out, path, lines, middle, end, maxChars);
+    return;
+  }
+  for (let offset = 0; offset < text.length; offset += maxChars) {
+    out.push({
+      path,
+      start_line: start + 1,
+      end_line: end,
+      text: text.slice(offset, offset + maxChars)
+    });
+  }
+}
+function estimateSelectionTokens(chunks) {
+  let tokens = 0;
+  for (const chunk of chunks) tokens += estimateTokens(chunk.text) + PER_CHUNK_OVERHEAD_TOKENS;
+  return tokens;
+}
+function expandGlob(pattern, options = {}) {
+  const root = rootOf(options);
+  const limit = options.maxFiles ?? MAX_FILES;
+  const globOptions = { root, limit };
+  if (options.ignoredDirs !== void 0) globOptions.ignoredDirs = options.ignoredDirs;
+  else globOptions.ignoredDirs = DEFAULT_IGNORED_DIRS;
+  if (options.maxDirs !== void 0) globOptions.maxDirs = options.maxDirs;
+  if (options.maxVisited !== void 0) globOptions.maxVisited = options.maxVisited;
+  const result = globFiles(pattern, globOptions);
+  if (result.truncated) {
+    throw new FileSelectionError(
+      "too_many_matches",
+      `The glob ${JSON.stringify(pattern)} matches more than ${limit} files. Narrow it \u2014 name a subdirectory, a single extension, or fewer \`**\` levels \u2014 and call again.`
+    );
+  }
+  if (result.paths.length === 0) {
+    throw new FileSelectionError(
+      "no_matches",
+      `The glob ${JSON.stringify(pattern)} matched no files under ${root}. Paths are relative to the project root; check the pattern, and note that ${[...DEFAULT_IGNORED_DIRS].slice(0, 5).join(", ")} and generated files are not scanned.`
+    );
+  }
+  return { paths: result.paths, ignored: result.ignored, outsideRoot: result.outsideRoot };
+}
+function collectChunks(input2, options = {}) {
+  const root = rootOf(options);
+  const skipped = emptySkipped();
+  let candidates;
+  if (input2.glob !== void 0) {
+    const expanded = expandGlob(input2.glob, { ...options, root });
+    candidates = expanded.paths;
+    skipped.ignored += expanded.ignored;
+    skipped.outside_root += expanded.outsideRoot;
+  } else {
+    candidates = [...input2.paths ?? []];
+  }
+  const chunks = [];
+  let scanned = 0;
+  const seen = /* @__PURE__ */ new Set();
+  for (const candidate of candidates) {
+    const resolution = resolveInsideRoot(root, candidate);
+    if (resolution.kind === "sensitive") {
+      skipped.sensitive += 1;
+      continue;
+    }
+    if (resolution.kind === "outside_root") {
+      skipped.outside_root += 1;
+      continue;
+    }
+    if (resolution.kind === "not_found") {
+      skipped.not_found += 1;
+      continue;
+    }
+    if (seen.has(resolution.absolute)) continue;
+    seen.add(resolution.absolute);
+    if (input2.glob === void 0 && isIgnoredFile(resolution.relative.split("/").pop() ?? "")) {
+      skipped.ignored += 1;
+      continue;
+    }
+    const read = readTextFile(resolution.absolute, options.maxFileBytes ?? MAX_FILE_BYTES);
+    if (read.kind === "binary") {
+      skipped.binary += 1;
+      continue;
+    }
+    if (read.kind === "too_large") {
+      skipped.too_large += 1;
+      continue;
+    }
+    if (read.kind === "not_found") {
+      skipped.not_found += 1;
+      continue;
+    }
+    const fileChunks = chunkText(resolution.relative, read.text, options);
+    if (fileChunks.length === 0) continue;
+    scanned += 1;
+    chunks.push(...fileChunks);
+  }
+  const tokens = estimateSelectionTokens(chunks);
+  return {
+    chunks,
+    files_scanned: scanned,
+    skipped,
+    est_input_tokens: tokens,
+    est_cost_usd: estimateCostUsd(tokens),
+    root
+  };
+}
+function enforceSelection(selection, options = {}) {
+  const ceiling = options.maxInputTokens ?? MAX_INPUT_TOKENS;
+  if (selection.est_input_tokens > ceiling) {
+    throw new FileSelectionError(
+      "cost_ceiling",
+      `This call would send an estimated ${selection.est_input_tokens.toLocaleString("en-US")} input tokens (about $${selection.est_cost_usd.toFixed(2)}) across ${selection.chunks.length} chunks of ${selection.files_scanned} files, over the ${ceiling.toLocaleString("en-US")}-token ceiling for one call. Nothing was sent. Narrow the glob, pass fewer paths, or use \`unit: "file"\` on a smaller set.`
+    );
+  }
+  if (selection.chunks.length === 0) {
+    const detail = skippedTotal(selection.skipped) === 0 ? "" : ` Skipped: ${JSON.stringify(selection.skipped)}.`;
+    throw new FileSelectionError(
+      "nothing_readable",
+      `No readable text was found in the files named.${detail} Sensitive files, binaries, files over ${Math.round((options.maxFileBytes ?? MAX_FILE_BYTES) / 1024)} KB and generated output are never read.`
+    );
+  }
+}
+
+// src/config.ts
+var DEFAULTS = {
+  baseUrl: "https://api.typesafe.ai",
+  model: "jev-latest",
+  timeoutMs: 3e4,
+  maxRetries: 3,
+  autoThreshold: 0.85,
+  reviewThreshold: 0.6,
+  maxConcurrency: 4
+};
+var MISSING_API_KEY_MESSAGE = "TYPESAFE_API_KEY is not set, so this server cannot reach the Jev API. Set it in the MCP server's environment (for example: `claude mcp add jev -e TYPESAFE_API_KEY=sk-... -- npx -y jev-mcp`) and restart the server. If this is the Claude Code plugin, either set the API key in the plugin's settings or export TYPESAFE_API_KEY before starting Claude Code, then run /reload-plugins. Keys are issued at https://typesafe.ai.";
+function readString(env, key, fallback) {
+  const raw = env[key];
+  if (raw === void 0) return fallback;
+  const trimmed = raw.trim();
+  return trimmed === "" ? fallback : trimmed;
+}
+function readNumber(env, key, fallback, min, max) {
+  const raw = env[key];
+  if (raw === void 0 || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min || value > max) {
+    throw new Error(
+      `${key}=${JSON.stringify(raw)} is not usable: expected a number between ${min} and ${max}.`
+    );
+  }
+  return value;
+}
+function firstKey(...candidates) {
+  for (const candidate of candidates) {
+    const value = candidate?.trim();
+    if (value !== void 0 && value !== "" && !value.includes("${")) return value;
+  }
+  return void 0;
+}
+function loadConfig(env = process.env) {
+  const apiKeyRaw = firstKey(env.JEV_PLUGIN_API_KEY, env.CLAUDE_PLUGIN_OPTION_API_KEY, env.TYPESAFE_API_KEY);
+  const auto = readNumber(env, "JEV_AUTO_THRESHOLD", DEFAULTS.autoThreshold, 0, 1);
+  const review = readNumber(env, "JEV_REVIEW_THRESHOLD", DEFAULTS.reviewThreshold, 0, 1);
+  if (review > auto) {
+    throw new Error(
+      `JEV_REVIEW_THRESHOLD (${review}) must not exceed JEV_AUTO_THRESHOLD (${auto}).`
+    );
+  }
+  return {
+    apiKey: apiKeyRaw === void 0 || apiKeyRaw === "" ? null : apiKeyRaw,
+    baseUrl: readString(env, "TYPESAFE_BASE_URL", DEFAULTS.baseUrl).replace(/\/+$/, ""),
+    model: readString(env, "JEV_MODEL", DEFAULTS.model),
+    timeoutMs: readNumber(env, "JEV_TIMEOUT_MS", DEFAULTS.timeoutMs, 1, 6e5),
+    maxRetries: readNumber(env, "JEV_MAX_RETRIES", DEFAULTS.maxRetries, 0, 10),
+    thresholds: { auto, review },
+    maxConcurrency: readNumber(env, "JEV_MAX_CONCURRENCY", DEFAULTS.maxConcurrency, 1, 32),
+    maxConcurrencyExplicit: (env.JEV_MAX_CONCURRENCY ?? "").trim() !== "",
+    projectRoot: resolveProjectRoot(env)
+  };
 }
 
 // src/decision/validate.ts
@@ -28779,8 +29285,8 @@ function parseRetryAfter(header, now = Date.now()) {
   if (Number.isNaN(date5)) return null;
   return Math.min(Math.max(date5 - now, 0), BACKOFF_CAP_MS);
 }
-var defaultSleep = (ms) => new Promise((resolve) => {
-  setTimeout(resolve, ms);
+var defaultSleep = (ms) => new Promise((resolve2) => {
+  setTimeout(resolve2, ms);
 });
 function isAbortError(error62) {
   return typeof error62 === "object" && error62 !== null && "name" in error62 && error62.name === "AbortError";
@@ -30499,12 +31005,12 @@ ZodString2.create = (params) => {
     ...processCreateParams(params)
   });
 };
-function floatSafeRemainder2(val, step) {
+function floatSafeRemainder2(val, step2) {
   const valDecCount = (val.toString().split(".")[1] || "").length;
-  const stepDecCount = (step.toString().split(".")[1] || "").length;
+  const stepDecCount = (step2.toString().split(".")[1] || "").length;
   const decCount = valDecCount > stepDecCount ? valDecCount : stepDecCount;
   const valInt = Number.parseInt(val.toFixed(decCount).replace(".", ""));
-  const stepInt = Number.parseInt(step.toFixed(decCount).replace(".", ""));
+  const stepInt = Number.parseInt(step2.toFixed(decCount).replace(".", ""));
   return valInt % stepInt / 10 ** decCount;
 }
 var ZodNumber2 = class _ZodNumber extends ZodType2 {
@@ -34992,7 +35498,7 @@ var Protocol = class {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1e3;
-        await new Promise((resolve) => setTimeout(resolve, pollInterval));
+        await new Promise((resolve2) => setTimeout(resolve2, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error62) {
@@ -35009,7 +35515,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       const earlyReject = (error62) => {
         reject(error62);
       };
@@ -35087,7 +35593,7 @@ var Protocol = class {
           if (!parseResult.success) {
             reject(parseResult.error);
           } else {
-            resolve(parseResult.data);
+            resolve2(parseResult.data);
           }
         } catch (error62) {
           reject(error62);
@@ -35348,12 +35854,12 @@ var Protocol = class {
       }
     } catch {
     }
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve, interval);
+      const timeoutId = setTimeout(resolve2, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -36444,7 +36950,7 @@ var McpServer = class {
     let task = createTaskResult.task;
     const pollInterval = task.pollInterval ?? 5e3;
     while (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+      await new Promise((resolve2) => setTimeout(resolve2, pollInterval));
       const updatedTask = await extra.taskStore.getTask(taskId);
       if (!updatedTask) {
         throw new McpError(ErrorCode.InternalError, `Task ${taskId} not found during polling`);
@@ -37257,6 +37763,7 @@ var QUESTIONS = {
     criteria: BLAST_RADIUS_LEVELS
   }
 };
+var RISK_SIGNALS = ["destructive", "outward_facing", "credential_exposure"];
 var SIGNAL_NAMES = ["destructive", "outward_facing", "in_scope", "credential_exposure"];
 function leansRisky(signal, p) {
   return signal === "in_scope" ? p < 0.5 : p >= 0.5;
@@ -37267,9 +37774,10 @@ function gateActionPolicy(input2) {
   const uncertainMode = input2.options?.uncertain ?? "confirm";
   const lenientScope = input2.options?.lenientScope === true;
   const { signals } = input2;
+  const corroborateUncertain = input2.options?.corroborateUncertain === true;
   const requested = input2.options?.trustRequested === true && !ignoreScope && signals.in_scope >= input2.thresholds.review && signals.destructive < 0.5 && signals.credential_exposure < 0.5;
   const wideBlast = input2.blast_radius >= HIGH_BLAST_RADIUS;
-  const corroborated = wideBlast || signals.destructive >= 0.5 || signals.outward_facing >= 0.5 || signals.credential_exposure >= 0.5;
+  const corroborated = corroborateUncertain ? wideBlast || RISK_SIGNALS.some((name7) => signals[name7] >= auto) : wideBlast || RISK_SIGNALS.some((name7) => signals[name7] >= 0.5);
   const leans = {
     destructive: lean(input2.signals.destructive, auto),
     outward_facing: lean(input2.signals.outward_facing, auto),
@@ -37292,7 +37800,12 @@ function gateActionPolicy(input2) {
     if (ignoreScope && signal === "in_scope") return false;
     if (signal === "in_scope" && (requested || lenientScope && !corroborated)) return false;
     if (signal === "outward_facing" && requested) return false;
-    return uncertainMode === "confirm" || leansRisky(signal, input2.signals[signal]);
+    if (uncertainMode !== "confirm" && !leansRisky(signal, input2.signals[signal])) return false;
+    if (corroborateUncertain && RISK_SIGNALS.includes(signal)) {
+      const secondRiskSignal = RISK_SIGNALS.some((other) => other !== signal && signals[other] >= 0.5);
+      if (!wideBlast && !secondRiskSignal && leans.in_scope !== "no") return false;
+    }
+    return true;
   });
   for (const signal of uncertainSignals) {
     reasons.push(
@@ -37613,40 +38126,73 @@ function noul2(answer) {
 // src/tools/rank.ts
 var name5 = "jev_rank";
 var description5 = [
-  "Rank up to 500 candidate texts by how well each helps answer a query, using Jev's calibrated yes/no judgment (one question per candidate, batched).",
-  "Use it to triage search hits, retrieved passages, files, tool results or skills before you spend reading budget on them \u2014 and to find out whether *anything* in the set is relevant at all (`any_relevant`).",
-  "Candidates are judged independently and in parallel, so ranking 200 is barely slower than ranking 5. Oversized sets are auto-chunked to fit the context budget.",
-  "Pass short, self-contained candidate texts (a snippet, a docstring, a summary); a whole file per candidate wastes budget and dilutes the judgment. Candidate text is NOT echoed back \u2014 keep your own id -> text map.",
-  "`relevance` is P(helps answer the query): near 1 relevant, near 0 not, near 0.5 the model is unsure. Use `min_relevance` to drop the tail rather than trusting the ordering of near-ties."
+  "Rank files or texts by how well each helps answer a query, using Jev's calibrated yes/no judgment (one question per item, batched and parallel).",
+  "Pass `glob` or `paths` for anything you have not already read \u2014 do NOT read files in order to pass their text. The server reads and chunks them itself and returns only `path:start_line-end_line` + score, so a 300-file search costs you almost no context in either direction.",
+  "Pass `candidates` (id + text) only for text you already hold: search hits, retrieved passages, tool results.",
+  "`unit`: `chunk` (default) ranks line ranges, `file` ranks whole files by their best chunk.",
+  "Sensitive files (.env, keys, credentials), binaries, generated output and anything outside the project root are never read; they come back counted in `skipped`.",
+  "`relevance` is P(helps answer the query). Trust the top 1-3, not the order of the tail; a low `any_relevant` means look elsewhere.",
+  "If `score_spread` (top minus median) is below 0.15 the ranking is not informative \u2014 narrow the glob or rephrase the query."
 ].join("\n");
 var candidateSchema = external_exports.object({
   id: external_exports.string().min(1).describe("Your identifier for this candidate. Returned as-is; never shown to the model."),
   text: external_exports.string().describe("The candidate text to judge. Keep it to the part that could answer the query.")
 });
+var UNITS = ["chunk", "file"];
 var inputShape5 = {
   query: external_exports.string().min(1).describe("What you are trying to find out."),
-  candidates: external_exports.array(candidateSchema).min(1).max(500).describe("The candidates to rank, 1 to 500."),
+  candidates: external_exports.array(candidateSchema).min(1).max(500).optional().describe("Text you already hold, 1 to 500. Use this only when you did not have to read a file to get it."),
+  paths: external_exports.array(external_exports.string().min(1)).min(1).max(1e3).optional().describe("Files for the server to read, relative to the project root (absolute paths inside it are fine)."),
+  glob: external_exports.string().min(1).optional().describe('A glob for the server to expand and read, e.g. "src/**/*.ts". Supports * ** ? [abc] {a,b}.'),
+  unit: external_exports.enum(UNITS).optional().describe("For paths/glob: `chunk` (default) ranks line ranges, `file` ranks whole files by their best chunk."),
   top_k: external_exports.number().int().min(1).max(500).optional().describe("How many ranked results to return. Default 10."),
   min_relevance: external_exports.number().min(0).max(1).optional().describe("Drop candidates whose relevance is below this. Default 0 (keep everything)."),
   instructions: external_exports.string().optional().describe("Optional extra definition of what counts as relevant here, folded into every question.")
 };
-var inputSchema5 = external_exports.object(inputShape5);
+var inputSchema5 = external_exports.object(inputShape5).refine(
+  (value) => [value.candidates, value.paths, value.glob].filter((v) => v !== void 0).length === 1,
+  {
+    message: "Pass exactly one of `candidates`, `paths` or `glob`. Use `glob`/`paths` for files you have not read (the server reads them), and `candidates` only for text you already hold."
+  }
+);
+var skippedSchema = external_exports.object({
+  binary: external_exports.number().int(),
+  too_large: external_exports.number().int(),
+  sensitive: external_exports.number().int().describe("Files holding credentials. Never read, never sent, whatever named them."),
+  outside_root: external_exports.number().int().describe("Paths that resolved outside the project root, symlinks included."),
+  not_found: external_exports.number().int(),
+  ignored: external_exports.number().int().describe("Lockfiles, `*.min.*`, sourcemaps and ignored directories.")
+}).describe("Why files were not read. Nothing is dropped silently.");
 var outputShape5 = {
   ranked: external_exports.array(
     external_exports.object({
-      id: external_exports.string(),
-      relevance: external_exports.number().describe("P(this candidate helps answer the query), 0..1."),
+      id: external_exports.string().optional().describe("Present for `candidates` sources: your own id, as passed."),
+      path: external_exports.string().optional().describe("Present for file sources: path relative to the project root."),
+      start_line: external_exports.number().int().optional().describe("1-based, inclusive."),
+      end_line: external_exports.number().int().optional().describe("1-based, inclusive."),
+      relevance: external_exports.number().describe("P(this item helps answer the query), 0..1."),
       rank: external_exports.number().int().describe("1-based position after sorting and filtering.")
     })
-  ).describe("Sorted by relevance descending; ties keep input order. Candidate text is not echoed back."),
-  any_relevant: external_exports.number().describe("P(at least one candidate helps answer the query), the maximum across chunks. Low means: look elsewhere."),
-  chunks: external_exports.number().int().describe("How many API requests the candidate set was split into."),
-  total_candidates: external_exports.number().int().describe("How many candidates were judged, before top_k/min_relevance."),
+  ).describe("Sorted by relevance descending; ties keep input order. Text is never echoed back."),
+  any_relevant: external_exports.number().describe(
+    "P(at least one candidate helps answer the query), as the MAXIMUM across requests. Low means: look elsewhere. Being a maximum, it is biased upward as the set grows, because a large set is split into more requests and each contributes a sample \u2014 so read a high value as weak evidence and a low value as strong evidence. `score_spread` is the better diagnostic."
+  ),
+  score_spread: external_exports.number().describe(
+    "Top relevance minus median relevance, 2 decimals. How much the ranking actually discriminated. Below 0.15 the scores are effectively flat and the ordering is not informative: narrow the glob or rephrase the query rather than trusting the order."
+  ),
+  chunks: external_exports.number().int().describe("How many API requests the item set was split into."),
+  total_candidates: external_exports.number().int().describe("How many items were judged, before top_k/min_relevance."),
+  files_scanned: external_exports.number().int().optional().describe("File sources only: files actually read."),
+  chunks_scored: external_exports.number().int().optional().describe("File sources only: line-range chunks judged."),
+  skipped: skippedSchema.optional().describe("File sources only."),
+  est_cost_usd: external_exports.number().optional().describe("File sources only: estimated input-token cost of this call."),
   ...envelopeShape
 };
 var outputSchema5 = external_exports.object(outputShape5);
 var ANY_RELEVANT_ID = "any_relevant";
 var DEFAULT_TOP_K = 10;
+var FILE_CONCURRENCY = 8;
+var MAX_CANDIDATES_PER_REQUEST = 16;
 function candidateQuestion(localIndex, extra) {
   const suffix = extra === void 0 || extra.trim() === "" ? "" : ` Relevant here means: ${extra.trim()}`;
   return {
@@ -37678,10 +38224,14 @@ function buildRequest(query, entries, extra) {
   questions[ANY_RELEVANT_ID] = anyRelevantQuestion(extra);
   return { state, questions };
 }
-function chunkCandidates(query, entries, extra, limits = DEFAULT_BUDGET_LIMITS) {
+function chunkCandidates(query, entries, extra, limits = DEFAULT_BUDGET_LIMITS, maxPerRequest = MAX_CANDIDATES_PER_REQUEST) {
   const chunks = [];
   let current = [];
   for (const entry of entries) {
+    if (current.length >= maxPerRequest) {
+      chunks.push(current);
+      current = [];
+    }
     const solo = buildRequest(query, [entry], extra);
     if (!fitsBudget(solo.state, solo.questions, limits)) {
       const estimate = estimateBudget(solo.state, solo.questions);
@@ -37704,15 +38254,72 @@ function chunkCandidates(query, entries, extra, limits = DEFAULT_BUDGET_LIMITS) 
   if (current.length > 0) chunks.push(current);
   return chunks;
 }
-async function run5(model, input2, config2, signal) {
-  const entries = input2.candidates.map((candidate, index) => ({
-    id: candidate.id,
-    text: candidate.text,
-    index
+function validateSource(input2) {
+  const named = ["candidates", "paths", "glob"].filter((key) => input2[key] !== void 0);
+  if (named.length !== 1) {
+    throw new FileSelectionError(
+      "bad_source",
+      named.length === 0 ? "Pass exactly one of `candidates`, `paths` or `glob`. Use `glob` or `paths` for files you have not read \u2014 the server reads them \u2014 and `candidates` only for text you already hold." : `Pass exactly one of \`candidates\`, \`paths\` or \`glob\`; got ${named.join(" and ")}.`
+    );
+  }
+  if (input2.unit !== void 0 && input2.candidates !== void 0) {
+    throw new FileSelectionError(
+      "bad_source",
+      "`unit` applies to `paths`/`glob` only: a `candidates` entry is already the unit you chose."
+    );
+  }
+}
+function buildSource(input2, fileOptions) {
+  validateSource(input2);
+  if (input2.candidates !== void 0) {
+    return {
+      entries: input2.candidates.map((candidate, index) => ({ id: candidate.id, text: candidate.text, index })),
+      fromFiles: false
+    };
+  }
+  const selection = input2.glob !== void 0 ? collectChunks({ glob: input2.glob }, fileOptions) : collectChunks({ paths: input2.paths ?? [] }, fileOptions);
+  enforceSelection(selection, fileOptions);
+  const entries = selection.chunks.map((chunk, index) => ({
+    id: `${chunk.path}:${chunk.start_line}-${chunk.end_line}`,
+    text: chunk.text,
+    index,
+    where: { path: chunk.path, start_line: chunk.start_line, end_line: chunk.end_line }
   }));
+  return {
+    entries,
+    files: {
+      files_scanned: selection.files_scanned,
+      chunks_scored: selection.chunks.length,
+      skipped: selection.skipped,
+      est_cost_usd: selection.est_cost_usd
+    },
+    fromFiles: true
+  };
+}
+function scoreSpread(relevances) {
+  if (relevances.length === 0) return 0;
+  const sorted = [...relevances].sort((a, b) => b - a);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  return Math.round((sorted[0] - median) * 100) / 100;
+}
+function foldToFiles(scored) {
+  const best = /* @__PURE__ */ new Map();
+  for (const item of scored) {
+    const path = item.entry.where?.path;
+    if (path === void 0) continue;
+    const current = best.get(path);
+    if (current === void 0 || item.relevance > current.relevance) best.set(path, item);
+  }
+  return [...best.values()];
+}
+async function run5(model, input2, config2, signal) {
+  const fileOptions = config2.files ?? {};
+  const source = buildSource(input2, fileOptions);
+  const entries = source.entries;
   const chunks = chunkCandidates(input2.query, entries, input2.instructions);
+  const concurrency = source.fromFiles && config2.maxConcurrencyExplicit !== true ? Math.max(config2.maxConcurrency, FILE_CONCURRENCY) : config2.maxConcurrency;
   const started = Date.now();
-  const results = await mapWithConcurrency(chunks, config2.maxConcurrency, async (chunk) => {
+  const results = await mapWithConcurrency(chunks, concurrency, async (chunk) => {
     const { state, questions } = buildRequest(input2.query, chunk, input2.instructions);
     const request = { state, questions };
     if (signal !== void 0) request.signal = signal;
@@ -37725,42 +38332,74 @@ async function run5(model, input2, config2, signal) {
     const answers = result.answers;
     chunk.forEach((entry, localIndex) => {
       const answer = answers[`cand_${localIndex}`];
-      scored.push({ id: entry.id, relevance: answer?.noul ?? 0, index: entry.index });
+      scored.push({ entry, relevance: answer?.noul ?? 0 });
     });
     const any2 = answers[ANY_RELEVANT_ID]?.noul;
     if (typeof any2 === "number" && any2 > anyRelevant) anyRelevant = any2;
   }
+  const unit = input2.unit ?? "chunk";
+  const rows = source.fromFiles && unit === "file" ? foldToFiles(scored) : scored;
   const minRelevance = input2.min_relevance ?? 0;
   const topK = input2.top_k ?? DEFAULT_TOP_K;
-  const ranked = scored.filter((item) => item.relevance >= minRelevance).sort((a, b) => b.relevance - a.relevance || a.index - b.index).slice(0, topK).map((item, position) => ({ id: item.id, relevance: item.relevance, rank: position + 1 }));
-  return {
+  const ranked = rows.filter((item) => item.relevance >= minRelevance).sort((a, b) => b.relevance - a.relevance || a.entry.index - b.entry.index).slice(0, topK).map((item, position) => {
+    const row = { relevance: item.relevance, rank: position + 1 };
+    if (item.entry.where === void 0) {
+      row.id = item.entry.id;
+    } else {
+      row.path = item.entry.where.path;
+      row.start_line = item.entry.where.start_line;
+      row.end_line = item.entry.where.end_line;
+    }
+    return row;
+  });
+  const output2 = {
     ranked,
     any_relevant: anyRelevant,
+    // Over everything judged, not just the rows that survived top_k: the
+    // question it answers is whether the model discriminated at all.
+    score_spread: scoreSpread(rows.map((row) => row.relevance)),
     chunks: chunks.length,
-    total_candidates: entries.length,
+    total_candidates: rows.length,
     model: results[0]?.result.model ?? model.name,
     usage: sumUsage(results.map(({ result }) => result.usage)),
     latency_ms: Date.now() - started
   };
+  if (source.files !== void 0) {
+    output2.files_scanned = source.files.files_scanned;
+    output2.chunks_scored = source.files.chunks_scored;
+    output2.skipped = source.files.skipped;
+    output2.est_cost_usd = source.files.est_cost_usd;
+  }
+  return output2;
 }
 
 // src/tools/verify.ts
 var name6 = "jev_verify";
 var description6 = [
-  "Check each of up to 100 claims against one block of evidence, and get supported / contradicted / not_addressed per claim with a calibrated confidence.",
-  "Use it before you assert something to the user or write it into a file: verify your draft's factual claims against the source you actually read, or check a summary against the document it summarises.",
-  "The rubric is strictly literal and closed-world: a claim counts as supported only if the evidence states or directly entails it. A claim that is true in the world but absent from the evidence comes back `not_addressed`, which is the answer you want when you are checking for unsupported assertions.",
-  "Claims should be single, self-contained statements \u2014 split compound sentences, and resolve pronouns before sending. Evidence should be the passage you want to hold the claims to, nothing more.",
-  "`all_supported` is true only when every claim is supported AND the model was confident about each one; treat `review`/`escalate` gates as claims a human should look at."
+  "Check up to 100 claims against one body of evidence: supported / contradicted / not_addressed per claim, with a calibrated confidence.",
+  "Pass `evidence_path` for anything you have not already read \u2014 do NOT read a file in order to pass its text. The server reads it, chunks it if it is large, checks every claim against every chunk and returns line ranges. Use `evidence` only for text you already hold.",
+  "Use it before you assert something to the user or write it into a file: hold your draft's claims to the source, or check a summary against the document it summarises.",
+  "The rubric is strictly literal and closed-world: supported only if the evidence states or entails it. A claim that is true in the world but absent from the evidence comes back `not_addressed` \u2014 which is the answer you want when hunting unsupported assertions. `conflicting` means one part of the evidence firmly supports it and another firmly contradicts it.",
+  "Claims should be single, self-contained statements \u2014 split compound sentences and resolve pronouns first.",
+  "`all_supported` is true only when every claim is supported AND the model was confident about each; treat `review`/`escalate` gates as claims a human should look at."
 ].join("\n");
 var inputShape6 = {
   claims: external_exports.array(external_exports.string().min(1)).min(1).max(100).describe("Self-contained statements to check, one per entry. Split compound claims."),
-  evidence: external_exports.string().min(1).describe("The only material the claims are judged against."),
+  evidence: external_exports.string().min(1).optional().describe("Text you already hold. The only material the claims are judged against."),
+  evidence_path: external_exports.string().min(1).optional().describe("A file for the server to read, relative to the project root. Preferred over pasting file text."),
+  start_line: external_exports.number().int().min(1).optional().describe("With `evidence_path`: first line to use, 1-based inclusive. Default 1."),
+  end_line: external_exports.number().int().min(1).optional().describe("With `evidence_path`: last line to use, 1-based inclusive. Default end of file."),
   thresholds: thresholdsSchema
 };
-var inputSchema6 = external_exports.object(inputShape6);
+var inputSchema6 = external_exports.object(inputShape6).refine(
+  (value) => [value.evidence, value.evidence_path].filter((v) => v !== void 0).length === 1,
+  {
+    message: "Pass exactly one of `evidence` or `evidence_path`. Use `evidence_path` for a file you have not read (the server reads it); `evidence` only for text you already hold."
+  }
+);
 var VERDICTS = ["supported", "contradicted", "not_addressed"];
-var verdictSchema = external_exports.enum(VERDICTS);
+var MERGED_VERDICTS = [...VERDICTS, "conflicting"];
+var verdictSchema = external_exports.enum(MERGED_VERDICTS);
 var outputShape6 = {
   claims: external_exports.array(
     external_exports.object({
@@ -37768,17 +38407,22 @@ var outputShape6 = {
       verdict: verdictSchema,
       probabilities: external_exports.record(external_exports.string(), external_exports.number()),
       confidence: external_exports.number(),
-      gate: gateSchema
+      gate: gateSchema,
+      where: external_exports.object({ start_line: external_exports.number().int(), end_line: external_exports.number().int() }).optional().describe("Which lines of the evidence settled it. Present when the evidence came from a file or was chunked.")
     })
   ).describe("One result per input claim, in input order."),
   summary: external_exports.object({
     supported: external_exports.number().int(),
     contradicted: external_exports.number().int(),
     not_addressed: external_exports.number().int(),
+    conflicting: external_exports.number().int().describe("Firmly supported by one part of the evidence and contradicted by another."),
     needs_review: external_exports.number().int().describe("Claims whose gate is not `auto`.")
   }).describe("Counts across all claims."),
   all_supported: external_exports.boolean().describe("True only if every claim is `supported` and every gate is `auto`."),
   thresholds: external_exports.object({ auto: external_exports.number(), review: external_exports.number() }),
+  evidence_chunks: external_exports.number().int().describe("How many requests the evidence was split into. 1 unless it was large."),
+  evidence_path: external_exports.string().optional().describe("Present when the evidence was read from a file; relative to the root."),
+  est_cost_usd: external_exports.number().optional().describe("Present for file evidence: estimated input-token cost of this call."),
   ...envelopeShape
 };
 var outputSchema6 = external_exports.object(outputShape6);
@@ -37800,45 +38444,204 @@ function questionId(index) {
 function allSupported(results) {
   return results.length > 0 && results.every((r) => r.verdict === "supported" && r.gate === "auto");
 }
+var PIECE_OVERLAP_LINES = 5;
+function packEvidence(text, claims, firstLine = 1, limits = DEFAULT_BUDGET_LIMITS) {
+  const questions = {};
+  claims.forEach((_claim, index) => {
+    questions[questionId(index)] = claimQuestion(index);
+  });
+  const fits = (body) => fitsBudget({ evidence: body, claims: [...claims] }, questions, limits);
+  if (fits(text)) {
+    const lineCount = text.split("\n").length;
+    return [{ text, start_line: firstLine, end_line: firstLine + lineCount - 1 }];
+  }
+  const lines = text.split("\n");
+  const pieces = [];
+  let start = 0;
+  while (start < lines.length) {
+    let end = start;
+    let accepted = "";
+    while (end < lines.length) {
+      const attempt = lines.slice(start, end + 1).join("\n");
+      if (!fits(attempt)) break;
+      accepted = attempt;
+      end += 1;
+    }
+    if (end === start) {
+      throw new FileSelectionError(
+        "cost_ceiling",
+        `Line ${firstLine + start} of the evidence is too long to verify on its own against ${claims.length} claim${claims.length === 1 ? "" : "s"}. Pass fewer claims, or narrow the evidence with \`start_line\`/\`end_line\`.`
+      );
+    }
+    pieces.push({ text: accepted, start_line: firstLine + start, end_line: firstLine + end - 1 });
+    if (end >= lines.length) break;
+    start = Math.max(start + 1, end - PIECE_OVERLAP_LINES);
+  }
+  return pieces;
+}
+function mergeClaim(claim2, answers, thresholds, reportWhere) {
+  const present = answers.filter((a) => a.answer !== void 0);
+  if (present.length === 0) {
+    return { claim: claim2, verdict: "not_addressed", probabilities: {}, confidence: 0, gate: "escalate" };
+  }
+  const decisiveness = (a) => Math.max(a.probabilities.supported ?? 0, a.probabilities.contradicted ?? 0);
+  const firmlySupports = present.some(
+    (a) => normalizeVerdict(a.answer.choice) === "supported" && (a.answer.probabilities.supported ?? 0) >= thresholds.auto
+  );
+  const firmlyContradicts = present.some(
+    (a) => normalizeVerdict(a.answer.choice) === "contradicted" && (a.answer.probabilities.contradicted ?? 0) >= thresholds.auto
+  );
+  const best = present.reduce((a, b) => decisiveness(b.answer) > decisiveness(a.answer) ? b : a);
+  if (firmlySupports && firmlyContradicts) {
+    const result2 = {
+      claim: claim2,
+      verdict: "conflicting",
+      probabilities: best.answer.probabilities,
+      confidence: best.answer.confidence,
+      gate: "escalate"
+    };
+    if (reportWhere) result2.where = { start_line: best.piece.start_line, end_line: best.piece.end_line };
+    return result2;
+  }
+  const result = {
+    claim: claim2,
+    verdict: normalizeVerdict(best.answer.choice),
+    probabilities: best.answer.probabilities,
+    confidence: best.answer.confidence,
+    gate: gateChoice(best.answer, thresholds)
+  };
+  if (reportWhere) result.where = { start_line: best.piece.start_line, end_line: best.piece.end_line };
+  return result;
+}
+function validateSource2(input2) {
+  const named = ["evidence", "evidence_path"].filter((key) => input2[key] !== void 0);
+  if (named.length !== 1) {
+    throw new FileSelectionError(
+      "bad_source",
+      named.length === 0 ? "Pass exactly one of `evidence` or `evidence_path`. Use `evidence_path` for a file you have not read \u2014 the server reads it \u2014 and `evidence` only for text you already hold." : "Pass exactly one of `evidence` or `evidence_path`; got both."
+    );
+  }
+  if (input2.evidence !== void 0 && (input2.start_line !== void 0 || input2.end_line !== void 0)) {
+    throw new FileSelectionError(
+      "bad_source",
+      "`start_line`/`end_line` select a window in `evidence_path`; they do not apply to inline `evidence`."
+    );
+  }
+}
+function readEvidenceFile(input2, options) {
+  const root = rootOf(options);
+  const named = input2.evidence_path;
+  const resolution = resolveInsideRoot(root, named);
+  if (resolution.kind === "sensitive") {
+    throw new FileSelectionError(
+      "sensitive",
+      `${named} holds credentials, so it is never read. Nothing was sent.`
+    );
+  }
+  if (resolution.kind === "outside_root") {
+    throw new FileSelectionError(
+      "outside_root",
+      `${named} resolves outside the project root (${root}), so it is never read. Nothing was sent.`
+    );
+  }
+  if (resolution.kind === "not_found") {
+    throw new FileSelectionError("not_found", `${named} is not a readable file under ${root}.`);
+  }
+  const read = readTextFile(resolution.absolute, options.maxFileBytes);
+  if (read.kind === "binary") {
+    throw new FileSelectionError("nothing_readable", `${resolution.relative} looks like a binary file.`);
+  }
+  if (read.kind === "too_large") {
+    throw new FileSelectionError(
+      "nothing_readable",
+      `${resolution.relative} is over the size limit for one call. Use \`start_line\`/\`end_line\` to name a window.`
+    );
+  }
+  if (read.kind === "not_found") {
+    throw new FileSelectionError("not_found", `${resolution.relative} could not be read.`);
+  }
+  const lines = read.text.split("\n");
+  const first = Math.min(input2.start_line ?? 1, lines.length);
+  const last = Math.min(input2.end_line ?? lines.length, lines.length);
+  if (last < first) {
+    throw new FileSelectionError(
+      "bad_source",
+      `end_line (${input2.end_line}) is before start_line (${input2.start_line}) in ${resolution.relative}.`
+    );
+  }
+  const text = lines.slice(first - 1, last).join("\n");
+  if (text.trim() === "") {
+    throw new FileSelectionError(
+      "nothing_readable",
+      `Lines ${first}-${last} of ${resolution.relative} contain no text to verify against.`
+    );
+  }
+  return { text, firstLine: first, path: resolution.relative };
+}
 async function run6(model, input2, config2, signal) {
+  validateSource2(input2);
   const thresholds = resolveThresholds(config2.thresholds, input2.thresholds);
-  const state = { evidence: input2.evidence, claims: [...input2.claims] };
+  const fileOptions = config2.files ?? {};
+  const fromFile = input2.evidence_path !== void 0;
+  const source = fromFile ? readEvidenceFile(input2, fileOptions) : { text: input2.evidence, firstLine: 1, path: void 0 };
+  const pieces = packEvidence(source.text, input2.claims, source.firstLine);
+  const estimated = pieces.reduce(
+    (sum, piece) => sum + estimateTokens(piece.text) + estimateTokens(input2.claims) + 60 * input2.claims.length,
+    0
+  );
+  const ceiling = fileOptions.maxInputTokens ?? MAX_INPUT_TOKENS;
+  if (estimated > ceiling) {
+    throw new FileSelectionError(
+      "cost_ceiling",
+      `Verifying ${input2.claims.length} claims against ${pieces.length} pieces of this evidence would send an estimated ${estimated.toLocaleString("en-US")} input tokens (about $${estimateCostUsd(estimated).toFixed(2)}), over the ${ceiling.toLocaleString("en-US")}-token ceiling for one call. Nothing was sent. Narrow the evidence with \`start_line\`/\`end_line\`, or check fewer claims at once.`
+    );
+  }
   const questions = {};
   input2.claims.forEach((_claim, index) => {
     questions[questionId(index)] = claimQuestion(index);
   });
-  const request = { state, questions };
-  if (signal !== void 0) request.signal = signal;
-  const result = await model.evaluate(request);
-  const answers = result.answers;
-  const claims = input2.claims.map((claim2, index) => {
-    const answer = answers[questionId(index)];
-    if (answer === void 0) {
-      return { claim: claim2, verdict: "not_addressed", probabilities: {}, confidence: 0, gate: "escalate" };
-    }
-    return {
-      claim: claim2,
-      verdict: normalizeVerdict(answer.choice),
-      probabilities: answer.probabilities,
-      confidence: answer.confidence,
-      gate: gateChoice(answer, thresholds)
-    };
+  const started = Date.now();
+  const results = await mapWithConcurrency(pieces, config2.maxConcurrency, async (piece) => {
+    const state = { evidence: piece.text, claims: [...input2.claims] };
+    const request = { state, questions };
+    if (signal !== void 0) request.signal = signal;
+    const result = await model.evaluate(request);
+    return { piece, result };
   });
+  const reportWhere = fromFile || pieces.length > 1;
+  const claims = input2.claims.map(
+    (claim2, index) => mergeClaim(
+      claim2,
+      results.map(({ piece, result }) => ({
+        piece,
+        answer: result.answers[questionId(index)]
+      })),
+      thresholds,
+      reportWhere
+    )
+  );
   const summary = {
     supported: claims.filter((c) => c.verdict === "supported").length,
     contradicted: claims.filter((c) => c.verdict === "contradicted").length,
     not_addressed: claims.filter((c) => c.verdict === "not_addressed").length,
+    conflicting: claims.filter((c) => c.verdict === "conflicting").length,
     needs_review: claims.filter((c) => c.gate !== "auto").length
   };
-  return {
+  const output2 = {
     claims,
     summary,
     all_supported: allSupported(claims),
     thresholds,
-    model: result.model,
-    usage: result.usage,
-    latency_ms: result.latency_ms
+    evidence_chunks: pieces.length,
+    model: results[0]?.result.model ?? model.name,
+    usage: sumUsage(results.map(({ result }) => result.usage)),
+    latency_ms: Date.now() - started
   };
+  if (source.path !== void 0) {
+    output2.evidence_path = source.path;
+    output2.est_cost_usd = estimateCostUsd(estimated);
+  }
+  return output2;
 }
 function normalizeVerdict(choice) {
   return VERDICTS.includes(choice) ? choice : "not_addressed";
@@ -37846,7 +38649,7 @@ function normalizeVerdict(choice) {
 
 // src/server.ts
 var SERVER_NAME = "jev-mcp";
-var SERVER_VERSION = "0.1.4";
+var SERVER_VERSION = "0.2.0";
 var ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 function ok(output2) {
   return {
@@ -37865,7 +38668,11 @@ function createServer(model, config2) {
   const toolConfig = {
     model: config2.model,
     thresholds: config2.thresholds,
-    maxConcurrency: config2.maxConcurrency
+    maxConcurrency: config2.maxConcurrency,
+    maxConcurrencyExplicit: config2.maxConcurrencyExplicit,
+    // The one place the file-reading tools learn which directory they are
+    // confined to. Everything under `src/files` refuses to leave it.
+    files: { root: config2.projectRoot }
   };
   const redact = (message) => config2.apiKey === null || config2.apiKey.length < 8 ? message : message.split(config2.apiKey).join("[redacted]");
   function wrap(run7) {

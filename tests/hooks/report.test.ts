@@ -114,6 +114,37 @@ describe("whyReport", () => {
     expect(whyReport(store)).toContain("no escalations");
   });
 
+  /**
+   * "Why did this fire" is usually answered by which leniency was or was not
+   * switched on, so every option in force has to be on the line.
+   */
+  it("names every policy option in force", () => {
+    store.append(
+      record({
+        policy: {
+          ignore_scope: false,
+          uncertain: "risky-lean",
+          lenient_scope: true,
+          trust_requested: true,
+          corroborate_uncertain: true,
+        },
+      }),
+    );
+    const report = whyReport(store, 1);
+    expect(report).toContain("uncertain=risky-lean");
+    expect(report).toContain("in_scope used");
+    expect(report).toContain("lenient_scope=true");
+    expect(report).toContain("trust_requested=true");
+    expect(report).toContain("corroborate_uncertain=true");
+  });
+
+  it("omits an option that was not recorded, rather than guessing a default", () => {
+    store.append(record({ policy: { ignore_scope: true, uncertain: "confirm" } }));
+    const report = whyReport(store, 1);
+    expect(report).toContain("in_scope ignored");
+    expect(report).not.toContain("corroborate_uncertain");
+  });
+
   it("shows the most recent escalations newest first, with signals and reasons", () => {
     store.append(record({ subject: "subject-alpha" }));
     store.append(record({ subject: "subject-beta" }));
@@ -153,6 +184,15 @@ describe("calibrateReport", () => {
     expect(report).toContain("How often each gate fired");
     expect(report).toContain("Replay at other auto thresholds");
     expect(report).toContain("auto 0.95");
+  });
+
+  it("writes a zero delta as 0%, not -0%", () => {
+    // Same threshold, same options: the replay reproduces today's count, so
+    // the change against now is nothing at all.
+    store.append(record({ tool_use_id: "t0" }));
+    const report = calibrateReport(testConfig(dir), store);
+    expect(report).not.toContain("-0%");
+    expect(report).toContain("0% vs now");
   });
 
   it("replays exactly: a higher threshold turns a 0.95 destructive into no escalation", () => {

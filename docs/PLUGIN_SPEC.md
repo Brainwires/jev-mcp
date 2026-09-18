@@ -47,6 +47,20 @@ Mirror the `Brainwires/fable-lite` plugin for manifest/marketplace/skill house s
   "ask" reason is shown to the USER; "deny" reason is shown to CLAUDE. Precedence deny>defer>ask>allow.
   A timed-out hook does not block. All matching hooks run in parallel.
 - PostToolUse in: tool_name, tool_input, tool_response. Out: `hookSpecificOutput.additionalContext`.
+  For Bash, a *successful* `tool_response` is `{stdout, stderr, interrupted, isImage}` — no exit code.
+- PostToolUseFailure fires INSTEAD of PostToolUse when a tool that started executing fails, and
+  carries the error as **top-level fields, not a `tool_response`**: `error` (string; for Bash a
+  command that ran and exited puts `Exit code N` on the first line, then stdout and stderr
+  interleaved), `is_interrupt?` (true when the failure arrived as an abort rather than a reported
+  error), `duration_ms?`. There is no documented `exit_code`, `isError` or `success` field for Bash.
+  Matches on tool name like PreToolUse. Out: `hookSpecificOutput.additionalContext`.
+  It does NOT fire for calls rejected before execution (unknown tool, schema failure, permission
+  denial). Key on `tool_name`, `is_interrupt` and the `Exit code N` first line; treat the rest of
+  `error` as display text, not a stable format.
+- **`Approval` is not a Claude Code event.** It is this repo's own `argv[2]` label for the
+  bookkeeping-only handler, registered in hooks.json under the real `PostToolUse` and
+  `PostToolUseFailure` events with `async: true`. An async hook cannot influence the call: its
+  `decision`/`permissionDecision` are ignored, which is exactly why the ledger lives there.
 - UserPromptSubmit in: prompt. Out: `hookSpecificOutput.additionalContext`.
 - Stop / SubagentStop in: stop_hook_active, last_assistant_message, background_tasks[], session_crons[].
   Out: top-level `{decision:"block", reason}`. Claude Code force-ends after 8 consecutive blocks.
@@ -137,7 +151,10 @@ argv[2] = event. Read all stdin, JSON.parse, dispatch. Each handler is a pure-is
 `(input, deps:{model: DecisionModel, config, store, now}) => Promise<HookOutput|undefined>` so tests inject
 a fake DecisionModel and temp dir. Global try/catch -> fail open. Hard wall-clock guard: race the handler
 against a 3500 ms timer -> fail open. Must not import the MCP SDK or zod (keep hook.mjs small; cold start
-target < 80 ms — measure and report `node dist/hook.mjs PreToolUse < fixture` wall time for a skip case).
+target **< 20 ms over bare `node` startup** — measure `node dist/hook.mjs PreToolUse < fixture` wall time
+for a skip case *and* `node -e ""` on the same machine, and report the difference. An absolute target is
+not meaningful: measured on Node 24 / macOS, `node -e ""` alone is 130 ms, the 0.1.4 bundle 150 ms and the
+0.2.0 bundle 140 ms, so the runtime dominates and a "< 80 ms" wall-clock figure was never reachable).
 `JEV_HOOKS_DISABLE=1` env -> all hooks no-op.
 
 ## Commands (markdown, fable-lite style frontmatter w/ description)

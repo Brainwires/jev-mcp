@@ -14,6 +14,7 @@
 import type { NoulAnswer, Question } from "../../decision/types.js";
 import { redactAndClamp } from "../redact.js";
 import { requestText } from "../store.js";
+import { EMPTY_LEDGER, verificationPolicy } from "../verification.js";
 import type { Deps, HookInput, HookOutput } from "../types.js";
 
 /** Below this, the message is an acknowledgement, not a report. */
@@ -56,6 +57,20 @@ const QUESTIONS: Record<string, Question> = {
       false: "`final_message` is about something else.",
     },
   },
+  /**
+   * Deliberately narrow and literal: this is the *claim*, not its truth. What
+   * the checks actually did is in the ledger, compared in code.
+   */
+  claims_verified: {
+    type: "noul",
+    instructions:
+      "Does `final_message` state that tests, a build, a type-check or a lint run passed or succeeded?",
+    criteria: {
+      true: "`final_message` says that tests pass, the build succeeds, the type-check is clean, the linter is happy, or equivalent — as something that has already happened.",
+      false:
+        "`final_message` makes no such claim: it does not mention running tests, a build, a type-check or a lint, or it says they were not run, are still failing, or should be run next.",
+    },
+  },
 };
 
 export interface StopSignals {
@@ -63,6 +78,7 @@ export interface StopSignals {
   admits_unfinished: number;
   asks_user: number;
   addresses_request: number;
+  claims_verified: number;
 }
 
 export interface StopPolicyResult {
@@ -140,29 +156,47 @@ export async function handleStop(input: HookInput, deps: Deps): Promise<HookOutp
       admits_unfinished: noul("admits_unfinished"),
       asks_user: noul("asks_user"),
       addresses_request: noul("addresses_request"),
+      claims_verified: noul("claims_verified"),
     };
 
     const policy = stopPolicy(signals, config.autoThreshold);
+    // The second rule, and the only one with evidence behind it: the message
+    // says the checks pass, and the ledger says the last one did not.
+    const verified = verificationPolicy(
+      signals.claims_verified,
+      session.verification ?? EMPTY_LEDGER,
+      config.autoThreshold,
+      deps.now(),
+    );
+
+    const blocked = policy.block || verified.block;
+    const decision = blocked ? "block" : verified.logOnly ? "unverified-claim" : "allow";
     store.append({
       ...base,
-      decision: policy.block ? "block" : "allow",
+      decision,
       signals: { ...signals },
-      reasons: policy.reasons,
+      reasons: [...policy.reasons, ...verified.reasons],
       model: result.model,
       latency_ms: result.latency_ms,
       input_tokens: result.usage.input_tokens,
     });
 
-    if (!policy.block) return undefined;
+    if (!blocked) return undefined;
 
     store.updateSession(sessionId, (state) => ({ ...state, stop_blocks: state.stop_blocks + 1 }), deps.now());
 
-    return {
-      decision: "block",
-      reason: `[jev] Your final message indicates requested work is still unfinished (p=${signals.admits_unfinished.toFixed(
-        2,
-      )}) and you are not blocked on the user. Continue with the remaining work, or state explicitly what blocks you.`,
-    };
+    // The stop-short rule is the older and broader of the two, so it speaks
+    // first when both fire.
+    if (policy.block) {
+      return {
+        decision: "block",
+        reason: `[jev] Your final message indicates requested work is still unfinished (p=${signals.admits_unfinished.toFixed(
+          2,
+        )}) and you are not blocked on the user. Continue with the remaining work, or state explicitly what blocks you.`,
+      };
+    }
+
+    return { decision: "block", reason: verified.reason as string };
   } catch (error) {
     store.append({
       ...base,

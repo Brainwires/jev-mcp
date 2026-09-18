@@ -15,12 +15,20 @@
  */
 
 import { isAbsolute, resolve, sep } from "node:path";
+import { isSensitivePath } from "../util/sensitive-path.js";
+
+/**
+ * Re-exported so that `src/hooks/*` and its tests keep one import site for the
+ * predicate. The definition lives in `src/util/sensitive-path.ts` because the
+ * MCP file layer needs the identical answer and must not import a hook module.
+ */
+export { isSensitivePath };
 
 export type Prefilter =
-  /** Plainly read-only: no Jev call, no output. */
-  | { kind: "skip"; reason: string }
+  /** Plainly read-only, or an ordinary in-project edit: no Jev call, no output. */
+  | { kind: "skip"; reason: string; writesInProject?: boolean }
   /** Send to Jev. */
-  | { kind: "judge"; reason: string }
+  | { kind: "judge"; reason: string; writesInProject?: boolean }
   /** Code is sure enough to escalate on its own. */
   | { kind: "escalate"; reason: string; pattern: string };
 
@@ -41,11 +49,48 @@ export interface BashFeatures {
   unbalanced: boolean;
 }
 
+/**
+ * One output redirect, with the word it points at.
+ *
+ * Kept separately from the token list because a redirect target is not an
+ * argument: `echo x > f` runs `echo x` and writes `f`, and deciding whether
+ * that is an ordinary edit means knowing which of the two `f` is.
+ */
+export interface Redirect {
+  /** `>`, `>>`, `&>`, or `>&` for a file-descriptor duplication. */
+  op: string;
+  /** The word that followed, empty when nothing did. */
+  target: string;
+  /** Index into `segments` of the command whose output is redirected. */
+  segment: number;
+  /**
+   * Not a write to a file in the project: `2>&1`, `>/dev/null`. These cannot
+   * escape anywhere, so they are not treated as writes at all.
+   */
+  special: boolean;
+}
+
+/** A here-document: input *data* for a command, not more command text. */
+export interface Heredoc {
+  delimiter: string;
+  /** `<<'EOF'` and `<<"EOF"` suppress expansion inside the body. */
+  quoted: boolean;
+  body: string;
+  segment: number;
+}
+
 export interface BashScan {
   /** One token list per pipeline/`&&`/`;` segment, empty ones dropped. */
   segments: string[][];
   features: BashFeatures;
+  /** Output redirects, in source order. */
+  redirects: Redirect[];
+  /** Here-documents whose bodies were consumed as data. */
+  heredocs: Heredoc[];
 }
+
+/** Writing here is not writing a file. */
+const NULL_SINKS = new Set(["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/zero"]);
 
 const SEPARATORS = new Set([";", "\n", "|", "&"]);
 
@@ -66,13 +111,22 @@ export function scanBash(command: string): BashScan {
     unbalanced: false,
   };
   const segments: string[][] = [];
+  const redirects: Redirect[] = [];
+  const heredocs: Heredoc[] = [];
   let tokens: string[] = [];
   let token = "";
   let started = false;
+  /** Set by `>`; the next completed token is its target. */
+  let pendingRedirect: Redirect | undefined;
 
   const endToken = (): void => {
     if (started) {
       tokens.push(token);
+      if (pendingRedirect !== undefined) {
+        pendingRedirect.target = token;
+        pendingRedirect.special = NULL_SINKS.has(token);
+        pendingRedirect = undefined;
+      }
       token = "";
       started = false;
     }
@@ -85,6 +139,45 @@ export function scanBash(command: string): BashScan {
   const push = (text: string): void => {
     token += text;
     started = true;
+  };
+
+  interface PendingHeredoc {
+    delimiter: string;
+    quoted: boolean;
+    dashed: boolean;
+    segment: number;
+  }
+  let pendingHeredocs: PendingHeredoc[] = [];
+
+  /**
+   * Swallow the bodies of every here-document opened on the line just ended.
+   *
+   * An unquoted delimiter means the shell expands the body, so a `$(…)` in
+   * there is executed; that sets the same feature flag an inline substitution
+   * would, and the command is judged rather than skipped.
+   */
+  const consumeHeredocBodies = (): void => {
+    for (const pending of pendingHeredocs) {
+      const lines: string[] = [];
+      for (;;) {
+        const newline = command.indexOf("\n", index);
+        const line = newline === -1 ? command.slice(index) : command.slice(index, newline);
+        index = newline === -1 ? command.length : newline + 1;
+        if ((pending.dashed ? line.replace(/^\t+/, "") : line) === pending.delimiter) break;
+        lines.push(line);
+        if (newline === -1) {
+          features.unbalanced = true; // Unterminated here-document.
+          break;
+        }
+      }
+      const body = lines.join("\n");
+      if (!pending.quoted) {
+        if (/\$\(|`/.test(body)) features.substitution = true;
+        else if (/\$/.test(body)) features.expansion = true;
+      }
+      heredocs.push({ delimiter: pending.delimiter, quoted: pending.quoted, body, segment: pending.segment });
+    }
+    pendingHeredocs = [];
   };
 
   let index = 0;
@@ -166,18 +259,77 @@ export function scanBash(command: string): BashScan {
     if (char === ">") {
       features.redirect = true;
       endToken();
+      let op = ">";
       index += 1;
-      while (command[index] === ">" || command[index] === "|" || command[index] === "(") {
-        if (command[index] === "(") features.substitution = true;
+      if (command[index] === ">") {
+        op = ">>";
+        index += 1;
+      } else if (command[index] === "|") {
         index += 1;
       }
+      if (command[index] === "(") {
+        features.substitution = true;
+        index += 1;
+        continue;
+      }
+      if (command[index] === "&") {
+        // `2>&1`, `>&2`: duplicating a file descriptor writes no file.
+        index += 1;
+        let fd = "";
+        while (index < command.length && /[0-9-]/.test(command[index] as string)) {
+          fd += command[index];
+          index += 1;
+        }
+        if (fd !== "") {
+          redirects.push({ op: `${op}&`, target: fd, segment: segments.length, special: true });
+          continue;
+        }
+      }
+      pendingRedirect = { op, target: "", segment: segments.length, special: false };
+      redirects.push(pendingRedirect);
       continue;
     }
 
     if (char === "<") {
       if (command[index + 1] === "(") features.substitution = true;
-      if (command[index + 1] === "<") features.heredoc = true;
       endToken();
+      if (command[index + 1] === "<" && command[index + 2] !== "<") {
+        // A here-document: the body is data, so it is consumed rather than
+        // tokenized as more command text. `<<<` (a here-string) is not.
+        features.heredoc = true;
+        index += 2;
+        let dashed = false;
+        if (command[index] === "-") {
+          dashed = true;
+          index += 1;
+        }
+        while (command[index] === " " || command[index] === "\t") index += 1;
+        let delimiter = "";
+        let quoted = false;
+        const quote = command[index];
+        if (quote === "'" || quote === '"') {
+          quoted = true;
+          index += 1;
+          while (index < command.length && command[index] !== quote) {
+            delimiter += command[index];
+            index += 1;
+          }
+          index += 1;
+        } else {
+          if (command[index] === "\\") {
+            quoted = true;
+            index += 1;
+          }
+          while (index < command.length && /[A-Za-z0-9_.-]/.test(command[index] as string)) {
+            delimiter += command[index];
+            index += 1;
+          }
+        }
+        if (delimiter === "") features.unbalanced = true;
+        else pendingHeredocs.push({ delimiter, quoted, dashed, segment: segments.length });
+        continue;
+      }
+      if (command[index + 1] === "<") features.heredoc = true;
       index += 1;
       while (command[index] === "<") index += 1;
       continue;
@@ -186,7 +338,11 @@ export function scanBash(command: string): BashScan {
     if (char === "&") {
       if (command[index + 1] === ">") {
         features.redirect = true;
+        endToken();
         index += 2;
+        if (command[index] === ">") index += 1;
+        pendingRedirect = { op: "&>", target: "", segment: segments.length, special: false };
+        redirects.push(pendingRedirect);
         continue;
       }
       endSegment();
@@ -197,6 +353,7 @@ export function scanBash(command: string): BashScan {
     if (SEPARATORS.has(char)) {
       endSegment();
       index += char === "|" && command[index + 1] === "|" ? 2 : 1;
+      if (char === "\n" && pendingHeredocs.length > 0) consumeHeredocBodies();
       continue;
     }
 
@@ -220,7 +377,9 @@ export function scanBash(command: string): BashScan {
   }
 
   endSegment();
-  return { segments, features };
+  // A here-document opened on the last line, with the body following it.
+  if (pendingHeredocs.length > 0) consumeHeredocBodies();
+  return { segments, features, redirects, heredocs };
 }
 
 // ------------------------------------------------------------- hard patterns
@@ -730,14 +889,123 @@ const INTERPRETERS = new Set([
 
 const PRIVILEGE = new Set(["sudo", "doas", "su", "runas", "pkexec"]);
 
+// ------------------------------------------------- writes equivalent to an Edit
+
+/**
+ * `sed` script shapes that provably cannot write a file of their own.
+ *
+ * `sed` is an editor with two ways to write that no flag announces: the `w`
+ * command (`sed -e 'w /etc/x'`) and the `w` flag on a substitution
+ * (`sed 's/a/b/w out'`). Rather than parse sed scripts, only these shapes are
+ * accepted, which covers what an agent actually types and refuses the rest.
+ */
+const SAFE_SED_COMMAND = [
+  // s/a/b/ with flags that are not `w` or `e`, any single-char delimiter.
+  /^s(.)(?:(?!\1)[^])*\1(?:(?!\1)[^])*\1[gilmpIMD0-9]*$/,
+  // Address-only delete or print: `3d`, `1,$p`, `/re/d`.
+  /^[0-9,$~+]*[dpq=]$/,
+  /^\/(?:[^/\\]|\\.)*\/[dpq]$/,
+] as const;
+
+export function sedScriptIsSafe(script: string): boolean {
+  const parts = script
+    .split(";")
+    .map((part) => part.trim())
+    .filter((part) => part !== "");
+  if (parts.length === 0) return false;
+  return parts.every((part) => SAFE_SED_COMMAND.some((pattern) => pattern.test(part)));
+}
+
+/** `-i` may carry its backup suffix attached (`-i.bak`) or as an operand (`-i ''`). */
+function sedInPlace(args: string[]): boolean {
+  return args.some((arg) => arg === "-i" || /^-i[^-]*$/.test(arg) || arg === "--in-place" || arg.startsWith("--in-place="));
+}
+
+/**
+ * The files a write-equivalent command edits, or `undefined` when the command
+ * is not one, or is one in a shape this code will not vouch for.
+ */
+function writeTargetsOf(command_: string, args: string[]): string[] | undefined {
+  if (command_ === "tee") {
+    // `tee` with no operand writes stdout only; every operand is a file.
+    const files = args.filter((arg) => !arg.startsWith("-") || arg === "-");
+    const flags = args.filter((arg) => arg.startsWith("-") && arg !== "-");
+    if (!flags.every((flag) => ["-a", "--append", "-i", "--ignore-interrupts", "-p"].includes(flag))) return undefined;
+    return files;
+  }
+
+  if (command_ === "sed") {
+    if (!sedInPlace(args)) return undefined;
+    const allowed = /^(-i[^-]*|--in-place(=.*)?|-e|--expression(=.*)?|-E|-r|-n|-s|--separate)$/;
+    const flags = args.filter((arg) => arg.startsWith("-") && arg !== "-");
+    if (!flags.every((flag) => allowed.test(flag))) return undefined;
+
+    // Walk the operands, honouring the flags that take a value.
+    const scripts: string[] = [];
+    const files: string[] = [];
+    let sawExpression = false;
+    let expectSuffix = false;
+    for (let i = 0; i < args.length; i += 1) {
+      const arg = args[i] as string;
+      if (arg === "-e" || arg === "--expression") {
+        const script = args[i + 1];
+        if (script === undefined) return undefined;
+        scripts.push(script);
+        sawExpression = true;
+        i += 1;
+        continue;
+      }
+      if (arg.startsWith("--expression=")) {
+        scripts.push(arg.slice("--expression=".length));
+        sawExpression = true;
+        continue;
+      }
+      if (arg === "-i" || arg === "--in-place") {
+        // BSD sed takes the backup suffix as the next operand; GNU attaches it.
+        // An empty or dot-prefixed next operand is a suffix, never a script.
+        const next = args[i + 1];
+        if (next !== undefined && (next === "" || next.startsWith("."))) expectSuffix = true;
+        continue;
+      }
+      if (arg.startsWith("-")) continue;
+      if (expectSuffix) {
+        expectSuffix = false;
+        continue;
+      }
+      if (!sawExpression && scripts.length === 0) scripts.push(arg);
+      else files.push(arg);
+    }
+
+    if (scripts.length === 0 || files.length === 0) return undefined;
+    if (!scripts.every((script) => sedScriptIsSafe(script))) return undefined;
+    return files;
+  }
+
+  return undefined;
+}
+
+/** Resolve a redirect or file operand against `cwd` and test containment. */
+function resolvesInside(cwd: string, target: string): boolean {
+  const root = resolve(cwd);
+  const absolute = isAbsolute(target) ? resolve(target) : resolve(root, target);
+  return absolute === root || absolute.startsWith(root.endsWith(sep) ? root : root + sep);
+}
+
 /**
  * Classify one Bash command.
  *
  * `skip` requires every segment to be recognizably read-only *and* the whole
- * command to be free of redirects, substitutions, variable expansion,
- * grouping, privilege escalation, and pipes into an interpreter.
+ * command to be free of substitutions, variable expansion, grouping, privilege
+ * escalation, and pipes into an interpreter.
+ *
+ * With `options`, one more shape skips: a command whose only effect beyond
+ * reading is writing files inside `cwd` — an output redirect, `sed -i`, `tee`,
+ * or a `cat > file <<'EOF'` heredoc. Those are Edits spelled as shell, and
+ * prompting for them while the Edit tool itself is silent taught users to stop
+ * reading prompts. Without `options` there is no `cwd` to judge a target
+ * against, so a redirect stays `judge` exactly as in 0.1.x.
  */
-export function prefilterBash(command: string): Prefilter {
+export function prefilterBash(command: string, options?: FilePrefilterOptions): Prefilter {
   const scan = scanBash(command);
   const flat = flatten(scan);
 
@@ -757,10 +1025,27 @@ export function prefilterBash(command: string): Prefilter {
   if (scan.segments.length === 0) return { kind: "skip", reason: "empty command" };
   if (scan.features.unbalanced) return { kind: "judge", reason: "unbalanced quoting" };
   if (scan.features.substitution) return { kind: "judge", reason: "command substitution" };
-  if (scan.features.redirect) return { kind: "judge", reason: "output redirect" };
   if (scan.features.grouping) return { kind: "judge", reason: "subshell or group" };
-  if (scan.features.heredoc) return { kind: "judge", reason: "here-document" };
   if (scan.features.expansion) return { kind: "judge", reason: "variable expansion" };
+
+  // Files this command would write, collected as they are recognized. Any
+  // write this code cannot account for returns `judge` on the spot.
+  const writes: string[] = [];
+  const fileWrites = scan.redirects.filter((redirect) => !redirect.special);
+
+  if (options === undefined) {
+    // No cwd to resolve a target against: 0.1.x behaviour, unchanged.
+    if (scan.features.redirect) return { kind: "judge", reason: "output redirect" };
+    if (scan.features.heredoc) return { kind: "judge", reason: "here-document" };
+  } else {
+    for (const redirect of fileWrites) {
+      if (redirect.target === "") return { kind: "judge", reason: "output redirect with no target" };
+      writes.push(redirect.target);
+    }
+    // A here-string is not consumed as data, so its words are still tokens.
+    const herestrings = scan.features.heredoc && scan.heredocs.length === 0;
+    if (herestrings) return { kind: "judge", reason: "here-string" };
+  }
 
   for (const [index, segment] of scan.segments.entries()) {
     const command_ = commandOf(segment);
@@ -790,6 +1075,17 @@ export function prefilterBash(command: string): Prefilter {
     const secret = secretArgument(args);
     if (secret !== undefined) return { kind: "judge", reason: `argument names sensitive material (${secret})` };
 
+    // A command whose whole job is writing a file the caller named: the same
+    // thing the Edit tool does, so it gets the same verdict — but only when
+    // there is a cwd to resolve its operands against.
+    if (options !== undefined) {
+      const targets = writeTargetsOf(command_, args);
+      if (targets !== undefined) {
+        writes.push(...targets.filter((target) => target !== "-"));
+        continue;
+      }
+    }
+
     const conditional = CONDITIONAL[command_];
     if (conditional !== undefined) {
       if (!conditional(args)) return { kind: "judge", reason: `${command_} invoked in a non-read-only shape` };
@@ -800,59 +1096,41 @@ export function prefilterBash(command: string): Prefilter {
     }
   }
 
-  return { kind: "skip", reason: "every segment is a read-only allowlisted command" };
+  if (writes.length === 0) return { kind: "skip", reason: "every segment is a read-only allowlisted command" };
+
+  // Every other segment reads, and the writes are all accounted for. Now they
+  // have to land somewhere ordinary, or this is a decision for a human.
+  const cwd = (options as FilePrefilterOptions).cwd;
+  for (const target of writes) {
+    if (isSensitivePath(target)) {
+      return { kind: "judge", reason: `writes a sensitive path (${target})`, writesInProject: false };
+    }
+    if (!resolvesInside(cwd, target)) {
+      return { kind: "judge", reason: `writes outside the working directory (${target})`, writesInProject: false };
+    }
+  }
+
+  const plural = writes.length === 1 ? "" : "s";
+  if ((options as FilePrefilterOptions).strict) {
+    return { kind: "judge", reason: `strict mode judges every edit`, writesInProject: true };
+  }
+  return {
+    kind: "skip",
+    reason: `writes ${writes.length} ordinary file${plural} inside the working directory`,
+    writesInProject: true,
+  };
 }
 
 // --------------------------------------------------------------- file writing
 
-const SENSITIVE_BASENAMES = [
-  /^\.env(\..*)?$/i,
-  /^id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i,
-  /^\.npmrc$/i,
-  /^\.netrc$/i,
-  /^\.pypirc$/i,
-  /^\.git-credentials$/i,
-  /^credentials$/i,
-  /^authorized_keys$/i,
-  /^known_hosts$/i,
-  /^\.(bash|zsh)(rc|_profile|env|profile|_login)$/i,
-  /^\.profile$/i,
-  /^\.bashrc$/i,
-  /^\.zshrc$/i,
-  /^\.zshenv$/i,
-  /^\.zprofile$/i,
-  /^\.bash_profile$/i,
-  /^\.bash_login$/i,
-  /^\.gitconfig$/i,
-];
-
-const SENSITIVE_EXTENSIONS = [/\.pem$/i, /\.p12$/i, /\.pfx$/i, /\.key$/i, /\.keystore$/i, /\.jks$/i];
-
-const SENSITIVE_DIRS = new Set([".ssh", ".aws", ".gnupg", ".config/gcloud", ".kube", ".docker"]);
-
-/** True when writing here is a decision a human should make. */
-export function isSensitivePath(path: string): boolean {
-  const normalized = path.replace(/\\/g, "/");
-  const parts = normalized.split("/").filter((part) => part !== "");
-  const base = parts[parts.length - 1] ?? "";
-
-  if (SENSITIVE_BASENAMES.some((pattern) => pattern.test(base))) return true;
-  if (SENSITIVE_EXTENSIONS.some((pattern) => pattern.test(base))) return true;
-  if (parts.some((part) => SENSITIVE_DIRS.has(part))) return true;
-  // Claude Code's own configuration: a hook that lets an agent rewrite the
-  // permission rules has defeated itself.
-  if (/\/\.claude\/settings[^/]*\.json$/i.test(`/${normalized}`)) return true;
-  if (/\/\.claude\/(settings|hooks)\//i.test(`/${normalized}`)) return true;
-  // Git internals, but not files tracked in the working tree.
-  if (parts.includes(".git")) return true;
-  return false;
-}
-
+/**
+ * Containment, for both absolute and relative paths.
+ *
+ * A relative path resolves against `cwd`, which is usually inside it — but
+ * `../../etc/passwd` is relative too, so it is resolved rather than assumed.
+ */
 export function isInside(cwd: string, path: string): boolean {
-  if (!isAbsolute(path)) return true; // Relative paths resolve against cwd.
-  const root = resolve(cwd);
-  const target = resolve(path);
-  return target === root || target.startsWith(root.endsWith(sep) ? root : root + sep);
+  return resolvesInside(cwd, path);
 }
 
 export interface FilePrefilterOptions {
@@ -865,8 +1143,8 @@ export function prefilterFileWrite(path: string | undefined, options: FilePrefil
   if (path === undefined || path === "") return { kind: "judge", reason: "no file path in the tool input" };
   if (isSensitivePath(path)) return { kind: "judge", reason: "sensitive path" };
   if (!isInside(options.cwd, path)) return { kind: "judge", reason: "path outside the working directory" };
-  if (options.strict) return { kind: "judge", reason: "strict mode judges every edit" };
-  return { kind: "skip", reason: "ordinary file inside the working directory" };
+  if (options.strict) return { kind: "judge", reason: "strict mode judges every edit", writesInProject: true };
+  return { kind: "skip", reason: "ordinary file inside the working directory", writesInProject: true };
 }
 
 // ----------------------------------------------------------------- mcp tools
@@ -915,7 +1193,7 @@ export function prefilter(input: PrefilterInput): Prefilter {
       return { kind: "judge", reason: "no command in the tool input" };
     }
     if (toolName === "PowerShell") return { kind: "judge", reason: "PowerShell is not tokenized here" };
-    return prefilterBash(command);
+    return prefilterBash(command, { cwd: input.cwd, strict: input.strict });
   }
 
   if (FILE_TOOLS.has(toolName)) {

@@ -28,12 +28,19 @@ function input(overrides: Partial<HookInput> = {}): HookInput {
   };
 }
 
-function answers(complete: number, unfinished: number, asks: number, addresses: number): Record<string, ReturnType<typeof noul>> {
+function answers(
+  complete: number,
+  unfinished: number,
+  asks: number,
+  addresses: number,
+  verified = 0.02,
+): Record<string, ReturnType<typeof noul>> {
   return {
     claims_complete: noul(complete),
     admits_unfinished: noul(unfinished),
     asks_user: noul(asks),
     addresses_request: noul(addresses),
+    claims_verified: noul(verified),
   };
 }
 
@@ -65,7 +72,13 @@ describe("stopPolicy truth table", () => {
   for (const [complete, unfinished, asks, addresses, expected, label] of cases) {
     it(`${expected ? "block" : "allow"}: ${label}`, () => {
       const result = stopPolicy(
-        { claims_complete: complete, admits_unfinished: unfinished, asks_user: asks, addresses_request: addresses },
+        {
+          claims_complete: complete,
+          admits_unfinished: unfinished,
+          asks_user: asks,
+          addresses_request: addresses,
+          claims_verified: NO,
+        },
         AUTO,
       );
       expect(result.block).toBe(expected);
@@ -74,7 +87,7 @@ describe("stopPolicy truth table", () => {
 
   it("explains itself when it blocks", () => {
     const result = stopPolicy(
-      { claims_complete: NO, admits_unfinished: YES, asks_user: NO, addresses_request: YES },
+      { claims_complete: NO, admits_unfinished: YES, asks_user: NO, addresses_request: YES, claims_verified: NO },
       AUTO,
     );
     expect(result.reasons.join(" ")).toContain("still outstanding");
@@ -191,5 +204,128 @@ describe("handleStop", () => {
       "final_message",
       "user_request",
     ]);
+  });
+});
+
+/**
+ * The verification ledger, end to end through the Stop handler.
+ *
+ * The bookkeeping half lives in `tests/hooks/verification.test.ts`; this is the
+ * wiring: does a claim that the checks pass actually meet the record of what
+ * the checks did, and does the ledger survive the things that should not clear
+ * it.
+ */
+describe("handleStop and the verification ledger", () => {
+  const CLAIM = "Fixed the parser and all tests pass now. Everything is green and ready to ship.";
+  const withPrompt = (deps: ReturnType<typeof makeDeps>): void => {
+    deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["fix the failing parser test"] }));
+  };
+  const claimsVerified = () => answers(YES, NO, NO, YES, YES);
+
+  it("blocks a claim that checks pass when the last check failed", async () => {
+    const deps = makeDeps(dir, { model: new FakeModel(claimsVerified) });
+    withPrompt(deps);
+    deps.store.updateSession("s1", (s) => ({
+      ...s,
+      verification: {
+        last: { kind: "test", ok: false, ts: deps.now() - 4 * 60_000, command: "npm test" },
+        edits_since: 0,
+      },
+    }));
+
+    const output = await handleStop(input({ last_assistant_message: CLAIM }), deps);
+    expect(output?.decision).toBe("block");
+    expect(output?.reason).toContain("[jev]");
+    expect(output?.reason).toContain("says checks pass");
+    expect(output?.reason).toContain("npm test");
+    expect(output?.reason).toContain("4 min ago");
+    expect(output?.reason).toContain("Re-run it, or correct the claim.");
+    expect(deps.store.readLog().at(-1)?.decision).toBe("block");
+    expect(deps.store.readSession("s1").stop_blocks).toBe(1);
+  });
+
+  it("says nothing when the last check passed and nothing has changed since", async () => {
+    const deps = makeDeps(dir, { model: new FakeModel(claimsVerified) });
+    withPrompt(deps);
+    deps.store.updateSession("s1", (s) => ({
+      ...s,
+      verification: { last: { kind: "test", ok: true, ts: deps.now() - 60_000, command: "npm test" }, edits_since: 0 },
+    }));
+    expect(await handleStop(input({ last_assistant_message: CLAIM }), deps)).toBeUndefined();
+    expect(deps.store.readLog().at(-1)?.decision).toBe("allow");
+  });
+
+  it("logs, but does not block, a claim with no verification on record", async () => {
+    const deps = makeDeps(dir, { model: new FakeModel(claimsVerified) });
+    withPrompt(deps);
+    expect(await handleStop(input({ last_assistant_message: CLAIM }), deps)).toBeUndefined();
+    const record = deps.store.readLog().at(-1);
+    expect(record?.decision).toBe("unverified-claim");
+    expect(record?.reasons?.join(" ")).toContain("no verification command on record");
+    expect(deps.store.readSession("s1").stop_blocks).toBe(0);
+  });
+
+  it("logs, but does not block, a claim made after edits landed on a passing run", async () => {
+    const deps = makeDeps(dir, { model: new FakeModel(claimsVerified) });
+    withPrompt(deps);
+    deps.store.updateSession("s1", (s) => ({
+      ...s,
+      verification: { last: { kind: "test", ok: true, ts: deps.now() - 60_000, command: "npm test" }, edits_since: 2 },
+    }));
+    expect(await handleStop(input({ last_assistant_message: CLAIM }), deps)).toBeUndefined();
+    expect(deps.store.readLog().at(-1)?.decision).toBe("unverified-claim");
+  });
+
+  it("does not block a message that never claimed the checks pass", async () => {
+    const deps = makeDeps(dir, { model: new FakeModel(() => answers(YES, NO, NO, YES, NO)) });
+    withPrompt(deps);
+    deps.store.updateSession("s1", (s) => ({
+      ...s,
+      verification: { last: { kind: "test", ok: false, ts: deps.now(), command: "npm test" }, edits_since: 0 },
+    }));
+    expect(await handleStop(input({ last_assistant_message: CLAIM }), deps)).toBeUndefined();
+    expect(deps.store.readLog().at(-1)?.decision).toBe("allow");
+  });
+
+  it("lets the stop-short rule speak first when both rules fire", async () => {
+    const deps = makeDeps(dir, { model: new FakeModel(() => answers(NO, YES, NO, YES, YES)) });
+    withPrompt(deps);
+    deps.store.updateSession("s1", (s) => ({
+      ...s,
+      verification: { last: { kind: "test", ok: false, ts: deps.now(), command: "npm test" }, edits_since: 0 },
+    }));
+    const output = await handleStop(input({ last_assistant_message: CLAIM }), deps);
+    expect(output?.decision).toBe("block");
+    expect(output?.reason).toContain("unfinished");
+    // Still one block, not two.
+    expect(deps.store.readSession("s1").stop_blocks).toBe(1);
+  });
+
+  it("asks claims_verified as part of the one request it already makes", async () => {
+    const model = new FakeModel(claimsVerified);
+    const deps = makeDeps(dir, { model });
+    withPrompt(deps);
+    await handleStop(input({ last_assistant_message: CLAIM }), deps);
+    expect(model.calls).toHaveLength(1);
+    expect(Object.keys(model.calls[0]!.questions).sort()).toEqual([
+      "addresses_request",
+      "admits_unfinished",
+      "asks_user",
+      "claims_complete",
+      "claims_verified",
+    ]);
+    // The ledger is compared in code; it is never sent to the model.
+    expect(JSON.stringify(model.calls[0]!.state)).not.toContain("npm test");
+  });
+
+  it("records the claims_verified signal for calibration even when nothing fires", async () => {
+    const deps = makeDeps(dir, { model: new FakeModel(claimsVerified) });
+    withPrompt(deps);
+    deps.store.updateSession("s1", (s) => ({
+      ...s,
+      verification: { last: { kind: "lint", ok: true, ts: deps.now(), command: "npm run lint" }, edits_since: 0 },
+    }));
+    await handleStop(input({ last_assistant_message: CLAIM }), deps);
+    expect(deps.store.readLog().at(-1)?.signals?.claims_verified).toBe(YES);
   });
 });

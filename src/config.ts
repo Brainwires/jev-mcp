@@ -9,6 +9,7 @@
  */
 
 import type { GateThresholds } from "./decision/types.js";
+import { resolveProjectRoot } from "./files/index.js";
 
 export interface Config {
   /** `null` when TYPESAFE_API_KEY is unset — the server still starts. */
@@ -19,6 +20,13 @@ export interface Config {
   maxRetries: number;
   thresholds: GateThresholds;
   maxConcurrency: number;
+  /**
+   * True when `JEV_MAX_CONCURRENCY` was set. File-source ranking fans out
+   * wider than the default, but an operator who named a number meant it.
+   */
+  maxConcurrencyExplicit: boolean;
+  /** Project root the file-reading tools are confined to. */
+  projectRoot: string;
 }
 
 export const DEFAULTS = {
@@ -98,5 +106,7 @@ export function loadConfig(env: Env = process.env): Config {
     maxRetries: readNumber(env, "JEV_MAX_RETRIES", DEFAULTS.maxRetries, 0, 10),
     thresholds: { auto, review },
     maxConcurrency: readNumber(env, "JEV_MAX_CONCURRENCY", DEFAULTS.maxConcurrency, 1, 32),
+    maxConcurrencyExplicit: (env.JEV_MAX_CONCURRENCY ?? "").trim() !== "",
+    projectRoot: resolveProjectRoot(env),
   };
 }

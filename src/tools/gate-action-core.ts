@@ -127,8 +127,35 @@ export interface GateActionPolicyOptions {
    * `destructive` nor `credential_exposure` leans yes (`p < 0.5`). Outward
    * reach and blast radius then stop being reasons to ask. The caller abstains
    * rather than approves, so the host's own permission flow still applies.
+   *
+   * The scope bar is `review`, not `auto`, and that is the whole point of the
+   * option. A push the user asked for is exactly the case this exists to stay
+   * silent on — it was added because a user was prompted for one — and Jev
+   * scores genuinely requested pushes at `in_scope` 0.72 to 0.81 in the logged
+   * data. An `auto` bar would almost never be met and the option would be dead
+   * code. A firm out-of-scope reading, anything destructive, and anything
+   * touching credentials all still escalate: `requested` cancels only the
+   * reach-and-radius reasons, never a risk signal.
    */
   trustRequested?: boolean | undefined;
+  /**
+   * Raise the bar for an *uncertain* signal to fire at all.
+   *
+   * An uncertain risk signal — `destructive`, `outward_facing` or
+   * `credential_exposure` in the uncertain band — fires only when something
+   * corroborates it: a wide blast radius, a second risk signal at `p >= 0.5`,
+   * or `in_scope` leaning no. And an uncertain `in_scope` under
+   * `lenientScope` needs corroboration that is *firm*, not merely leaning: a
+   * signal the policy would not act on alone cannot be what makes another one
+   * act.
+   *
+   * This is the noise fix. On the first day of real use, ten of twenty-three
+   * escalations were a single uncertain signal on an ordinary in-project edit,
+   * and a prompt for each of those is how a user learns to approve without
+   * reading. Hook-only: the MCP tool leaves it off, so its behaviour is
+   * unchanged.
+   */
+  corroborateUncertain?: boolean | undefined;
 }
 
 export interface GateActionPolicyInput {
@@ -173,6 +200,8 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
   const lenientScope = input.options?.lenientScope === true;
   const { signals } = input;
 
+  const corroborateUncertain = input.options?.corroborateUncertain === true;
+
   const requested =
     input.options?.trustRequested === true &&
     !ignoreScope &&
@@ -180,8 +209,14 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
     signals.destructive < 0.5 &&
     signals.credential_exposure < 0.5;
   const wideBlast = input.blast_radius >= HIGH_BLAST_RADIUS;
-  const corroborated =
-    wideBlast || signals.destructive >= 0.5 || signals.outward_facing >= 0.5 || signals.credential_exposure >= 0.5;
+  /**
+   * What counts as something else agreeing. With `corroborateUncertain` the
+   * corroborating signal has to be one the policy would act on by itself;
+   * otherwise a leaning-but-uncertain reading is enough, as in 0.1.x.
+   */
+  const corroborated = corroborateUncertain
+    ? wideBlast || RISK_SIGNALS.some((name) => signals[name] >= auto)
+    : wideBlast || RISK_SIGNALS.some((name) => signals[name] >= 0.5);
 
   const leans = {
     destructive: lean(input.signals.destructive, auto),
@@ -208,7 +243,14 @@ export function gateActionPolicy(input: GateActionPolicyInput): GateActionPolicy
     if (ignoreScope && signal === "in_scope") return false;
     if (signal === "in_scope" && (requested || (lenientScope && !corroborated))) return false;
     if (signal === "outward_facing" && requested) return false;
-    return uncertainMode === "confirm" || leansRisky(signal, input.signals[signal]);
+    if (uncertainMode !== "confirm" && !leansRisky(signal, input.signals[signal])) return false;
+    // An uncertain risk signal on its own is the single biggest source of
+    // prompts nobody needed. It has to be corroborated by something.
+    if (corroborateUncertain && (RISK_SIGNALS as readonly string[]).includes(signal)) {
+      const secondRiskSignal = RISK_SIGNALS.some((other) => other !== signal && signals[other] >= 0.5);
+      if (!wideBlast && !secondRiskSignal && leans.in_scope !== "no") return false;
+    }
+    return true;
   });
 
   for (const signal of uncertainSignals) {

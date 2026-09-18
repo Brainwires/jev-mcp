@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run type-check
+
+      - run: npm run test:run
+
+      - run: npm run build
+
+      # esbuild's output is deterministic for a fixed esbuild version and input, but not
+      # guaranteed identical across the two Node versions in this matrix (only the plugin
+      # bundling step runs under whichever Node built it). Run this freshness check on a
+      # single node version so the job can't fail from a harmless cross-version diff in the
+      # committed bundle rather than an actual stale build.
+      - name: committed plugin bundle is up to date
+        if: matrix.node-version == '20'
+        run: git diff --exit-code plugin/dist

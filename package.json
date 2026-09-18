@@ -1,6 +1,6 @@
 {
   "name": "jev-mcp",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "MCP server and embeddable decision layer for TypeSafe AI's Jev System One model",
   "license": "MIT",
@@ -19,13 +19,30 @@
   "files": [
     "dist",
     "plugin",
-    ".claude-plugin"
+    ".claude-plugin",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md"
   ],
   "engines": {
     "node": ">=20"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Brainwires/jev-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Brainwires/jev-mcp/issues"
+  },
+  "homepage": "https://github.com/Brainwires/jev-mcp#readme",
   "keywords": [
     "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "claude-code-plugin",
+    "hooks",
+    "guardrails",
     "typesafe",
     "jev",
     "system-one",
@@ -41,6 +58,7 @@
     "test": "vitest",
     "test:run": "vitest run",
     "smoke": "tsx scripts/smoke.ts",
+    "bump": "tsx scripts/bump.ts",
     "prepare": "tsc --project tsconfig.build.json"
   },
   "dependencies": {
