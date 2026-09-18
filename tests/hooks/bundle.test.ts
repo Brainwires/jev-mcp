@@ -34,7 +34,38 @@ describe("plugin/dist", () => {
 
   it("keeps the hook bundle small enough to start fast", () => {
     // Generous headroom; the point is to notice a dependency creeping in.
+    // 0.4.0 added the daemon, its control plane and the memo: about +19 KiB of
+    // first-party code, and no new dependency. The ceiling stays where it was.
     expect(statSync(hook).size).toBeLessThan(300 * 1024);
+  });
+
+  it("contains the daemon, so the http hooks have something to talk to", () => {
+    // There is no third bundle: `node hook.mjs daemon` is the server, which is
+    // what guarantees the handlers cannot drift between the two transports.
+    const text = readFileSync(hook, "utf8");
+    expect(text).toContain("/v1/hook/");
+    expect(text).toContain("/v1/health");
+    expect(text).toContain("/v1/session/start");
+    expect(text).toContain("jev-daemon");
+  });
+
+  it("uses only the node builtins the daemon is allowed to reach for", () => {
+    // `node:http`, `node:net`, `node:crypto` and `node:child_process` are the
+    // four 0.4.0 added. Anything else new here is worth a second look, because
+    // the reason this bundle has no dependencies is that it runs on every call.
+    const text = readFileSync(hook, "utf8");
+    const imported = new Set([...text.matchAll(/from\s+"(node:[a-z_/]+)"/g)].map((match) => match[1] as string));
+    expect([...imported].sort()).toEqual(
+      [
+        "node:child_process",
+        "node:crypto",
+        "node:fs",
+        "node:http",
+        "node:net",
+        "node:os",
+        "node:path",
+      ].sort(),
+    );
   });
 
   it("bundles the MCP SDK into the server", () => {

@@ -21,7 +21,7 @@ import * as verifyTool from "./tools/verify.js";
 import type { ToolConfig } from "./tools/shared.js";
 
 export const SERVER_NAME = "jev-mcp";
-export const SERVER_VERSION = "0.3.0";
+export const SERVER_VERSION = "0.4.0";
 
 /** Read-only, but every tool reaches an external API. */
 const ANNOTATIONS = { readOnlyHint: true, openWorldHint: true } as const;

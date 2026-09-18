@@ -15,6 +15,8 @@ import {
   safeSessionId,
   type DecisionRecord,
 } from "../../src/hooks/store.js";
+import { loadHookConfig } from "../../src/hooks/config.js";
+import { sessionConfigOf } from "../../src/hooks/daemon/registry.js";
 import { TRIP_TTL_MS, type Trip } from "../../src/hooks/tripwire.js";
 import { cleanup, tempDir } from "./helpers.js";
 
@@ -353,3 +355,49 @@ describe("nextPrompts", () => {
   });
 });
 
+
+describe("the session config snapshot on disk", () => {
+  it("survives a write and a read, so a replaced daemon can reload it", () => {
+    const store = new Store(dir);
+    const snapshot = sessionConfigOf(loadHookConfig({ JEV_GATE: "strict" }));
+    store.updateSession("s1", (state) => ({ ...state, config: snapshot }));
+    expect(store.readSession("s1").config).toEqual(snapshot);
+  });
+
+  it("drops a snapshot that is not an object, leaving validation to its consumer", () => {
+    const store = new Store(dir);
+    // A real write first, so the sessions directory exists to be corrupted.
+    store.writeSession("s2", { prompts: [], stop_blocks: 0 });
+    for (const bad of ['"off"', "42", "null", "[1,2]"]) {
+      writeFileSync(join(dir, "sessions", "s2.json"), `{"prompts":[],"stop_blocks":0,"config":${bad}}`);
+      expect(store.readSession("s2").config, bad).toBeUndefined();
+    }
+  });
+});
+
+describe("nextPrompts and a double-fired hook", () => {
+  it("drops an identical consecutive prompt", () => {
+    // UserPromptSubmit has both an http entry and a command fallback in 0.4.0.
+    // The fallback checks the port first and normally says nothing, but a lost
+    // race must be invisible rather than evict the request before it.
+    expect(nextPrompts(["make it public"], "make it public")).toEqual(["make it public"]);
+    expect(nextPrompts([], "first")).toEqual(["first"]);
+  });
+
+  it("still keeps a repeat that is not consecutive", () => {
+    // "go" twice with something in between is a real pair of instructions, and
+    // the dedupe is only about the *last* one. The short-prompt budget of two
+    // then does its usual job on the oldest.
+    const long = "rewrite the parser so it handles both quoting forms".padEnd(60, ".");
+    expect(nextPrompts([long, "go"], "go")).toEqual([long, "go"]);
+    // Three short prompts exceed the budget of two, so the oldest short goes.
+    expect(nextPrompts([long, "go", "wait"], "go")).toEqual([long, "wait", "go"]);
+  });
+
+  it("does not let a duplicate evict the substantive prompt before it", () => {
+    const long = "a".repeat(80);
+    let prompts = nextPrompts([], long);
+    for (let i = 0; i < 5; i += 1) prompts = nextPrompts(prompts, "ship it");
+    expect(prompts).toEqual([long, "ship it"]);
+  });
+});

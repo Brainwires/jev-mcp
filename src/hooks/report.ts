@@ -13,6 +13,9 @@ import { USD_PER_MTOK } from "../decision/pricing.js";
 import { gateActionPolicy, type GateActionSignals } from "../tools/gate-action-core.js";
 import { gateOutcome, MAX_NOTES_PER_PROMPT } from "./advisory.js";
 import type { HookConfig } from "./config.js";
+import { isAlive, probeHealth, type Health, type Probe } from "./daemon/control.js";
+import { PROTOCOL } from "./daemon/protocol.js";
+import { daemonLogPath, readDaemonState, type DaemonState } from "./daemon/state-file.js";
 import type { DecisionRecord, Store } from "./store.js";
 
 /** TypeSafe bills input tokens only. Defined in `src/decision/pricing.ts`. */
@@ -54,15 +57,149 @@ function median(values: number[]): number {
     : ((sorted[middle - 1] as number) + (sorted[middle] as number)) / 2;
 }
 
-export function statusReport(config: HookConfig, store: Store, now: number = Date.now()): string {
+/**
+ * Everything `/jev:status` and `/jev:daemon status` know about the daemon.
+ *
+ * Two independent sources, kept separate rather than reconciled: the state file
+ * the daemon writes (plus whether its pid is still alive) and a live 300 ms
+ * probe of the port. They disagree in a case that is common rather than
+ * exotic — a `/jev:*` command runs through the Bash tool, whose process may be
+ * sandboxed away from loopback sockets — and a report that collapsed them into
+ * one "up/down" would confidently say "down" about a daemon that is serving
+ * hooks perfectly well. So both are reported, and the wording says which is
+ * which.
+ */
+export interface DaemonView {
+  state: DaemonState | undefined;
+  /** The pid in the state file exists. Says nothing about whether it answers. */
+  alive: boolean;
+  probe: Probe["kind"] | "skipped";
+  health: Health | undefined;
+  logPath: string;
+}
+
+export async function daemonView(config: HookConfig, _now: number = Date.now()): Promise<DaemonView> {
+  const state = readDaemonState(config.dataDir);
+  const probe = await probeHealth(config.daemonPort, 300);
+  return {
+    state,
+    alive: state !== undefined && isAlive(state.pid),
+    probe: probe.kind,
+    health: probe.kind === "jev" ? probe.health : undefined,
+    logPath: daemonLogPath(config.dataDir),
+  };
+}
+
+function duration(raw: number): string {
+  if (!Number.isFinite(raw)) return "?";
+  // Clamped rather than rejected: the report's `now` is captured when the
+  // command starts, and a heartbeat written a moment later is legitimately in
+  // its future. "just now" is the right answer, not "?".
+  const ms = Math.max(0, raw);
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+/**
+ * The "Daemon" section, as lines.
+ *
+ * Shared by `/jev:status` and `/jev:daemon status` so the two can never
+ * disagree about what is running.
+ */
+export function daemonReport(config: HookConfig, view: DaemonView, now: number = Date.now()): string[] {
+  const lines = ["Daemon", `  port: 127.0.0.1:${config.daemonPort}   protocol: ${PROTOCOL}`];
+  const { state, health } = view;
+
+  if (health !== undefined) {
+    lines.push(
+      `  status: up, answering on this shell's loopback`,
+      `  pid ${health.pid}, version ${health.version}, protocol ${health.protocol}, up ${duration(health.uptime_ms)}`,
+      `  sessions registered: ${health.sessions}   auth: ${health.auth}${
+        health.auth === "none" ? " (no API key configured anywhere: unauthenticated, and nothing to spend)" : ""
+      }`,
+    );
+    if (health.protocol !== PROTOCOL) {
+      lines.push(
+        `  NOTE: it speaks protocol ${health.protocol} and this build speaks ${PROTOCOL}; the next session start replaces it.`,
+      );
+    }
+  } else if (state === undefined) {
+    lines.push("  status: down — no daemon.json in the data directory, so one has never run here.");
+  } else if (state.state === "port-conflict") {
+    lines.push(
+      `  status: PORT CONFLICT — something that is not jev answered on ${config.daemonPort}.`,
+      "  The http hooks post there and get nothing useful back, so they are inactive. They fail open:",
+      "  nothing is blocked. Free the port and restart the session.",
+    );
+  } else if (state.state === "stopped") {
+    lines.push(`  status: down — stopped ${duration(now - state.updated_at)} ago (pid ${state.pid} was its last).`);
+  } else if (view.alive) {
+    // The honest version of the sandbox case.
+    lines.push(
+      `  status: the state file says running and pid ${state.pid} is alive, but it is not reachable from this shell.`,
+      `  That is the normal reading for a /jev:* command: this process runs through the Bash tool, which may`,
+      `  be sandboxed away from loopback sockets. The hooks talk to it from Claude Code's own process.`,
+      `  last heartbeat: ${duration(now - state.updated_at)} ago${
+        now - state.updated_at > 60_000 ? " — stale for a 15 s heartbeat, so it may be wedged" : ""
+      }`,
+    );
+  } else {
+    lines.push(
+      `  status: down — the state file claims running, but pid ${state.pid} no longer exists.`,
+      `  Last heartbeat ${duration(now - state.updated_at)} ago. The next session start spawns a fresh one.`,
+    );
+  }
+
+  if (state !== undefined) {
+    lines.push(
+      `  state file: ${state.state}, version ${state.version}, restarts ${state.restarts}`,
+      `  bundle: ${state.bundle_path === "" ? "(unknown)" : state.bundle_path}`,
+    );
+  }
+
+  // Live counters when the probe got through; otherwise the state file's, which
+  // lag by up to one 15 s heartbeat and are labelled as such.
+  const counters = health?.counters ?? state?.counters;
+  if (counters !== undefined) {
+    const hooks = Object.entries(counters.hooks).sort((a, b) => b[1] - a[1]);
+    lines.push(
+      `  hooks served: ${hooks.length === 0 ? "(none yet)" : hooks.map(([event, n]) => `${event} ${n}`).join(", ")}`,
+      `  jev calls: ${counters.jev_calls}   memo hits: ${counters.memo_hits}   ` +
+        `timeouts: ${counters.jev_timeouts}   errors: ${counters.jev_errors}`,
+      `  sessions: ${counters.sessions_started} started, ${counters.sessions_ended} ended   ` +
+        `deadline overruns: ${counters.deadline_overruns}`,
+      `  rejected: ${counters.unauthorized} unauthorized, ${counters.protocol_mismatch} wrong protocol, ` +
+        `${counters.unknown_event} unknown event, ${counters.bad_request} unparseable, ${counters.oversize} oversize`,
+      health?.counters === undefined
+        ? "  counters read from the state file, which is rewritten every 15 s, so they lag by up to that."
+        : "  counters read live from the daemon.",
+    );
+  }
+  if (state !== undefined || health !== undefined) lines.push(`  log: ${view.logPath}`);
+
+  return lines;
+}
+
+export function statusReport(
+  config: HookConfig,
+  store: Store,
+  now: number = Date.now(),
+  daemon?: DaemonView,
+): string {
   const all = store.readLog();
   const recent = within(all, now, DAY_MS);
   const count = (...decisions: string[]): number =>
     recent.filter((r) => decisions.includes(r.decision ?? "")).length;
   // Model calls only. A `reissue-ran` record's latency_ms is the time from the
   // re-issue to the tool finishing, which is not a Jev call.
+  // Memo hits are excluded: they report 0 ms honestly, but a percentile over
+  // calls that never happened would flatter the real latency.
   const latencies = recent
-    .filter((r) => r.model !== undefined)
+    .filter((r) => r.model !== undefined && r.memo !== true)
     .map((r) => r.latency_ms)
     .filter((n): n is number => typeof n === "number");
   const tokens = recent.reduce((sum, r) => sum + (r.input_tokens ?? 0), 0);
@@ -113,6 +250,20 @@ export function statusReport(config: HookConfig, store: Store, now: number = Dat
   );
   if (lastError !== undefined) {
     lines.push(`  last error: ${lastError.ts} ${lastError.event} ${lastError.error ?? "(unspecified)"}`);
+  }
+
+  const memoHits = recent.filter((r) => r.memo === true).length;
+  if (memoHits > 0) {
+    lines.push(
+      `  of those, ${memoHits} were answered from the daemon's memo: no call, no tokens, and excluded above.`,
+    );
+  }
+
+  // Omitted rather than faked when the caller did not probe: `statusReport` is
+  // synchronous and a probe is not, so a caller that cannot await one (a test,
+  // a library embedding) gets the report it asked for and no invented facts.
+  if (daemon !== undefined) {
+    lines.push("", ...daemonReport(config, daemon, now));
   }
 
   return lines.join("\n");

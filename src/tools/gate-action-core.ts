@@ -343,6 +343,13 @@ export interface GateActionCoreResult {
   model: string;
   usage: { input_tokens: number; output_tokens: number };
   latency_ms: number;
+  /**
+   * The answer came from the daemon's in-memory cache: no call went out, so the
+   * zeroes above mean it. Passed straight through from the model rather than
+   * dropped, because a hook that logged a hit as a 0 ms, 0 token *real* call
+   * would make the plugin's own latency and cost reports fiction.
+   */
+  memo?: boolean;
 }
 
 export async function runGateAction(
@@ -395,6 +402,7 @@ export async function runGateAction(
     model: result.model,
     usage: result.usage,
     latency_ms: result.latency_ms,
+    ...(result.memo === true ? { memo: true } : {}),
   };
 }
 

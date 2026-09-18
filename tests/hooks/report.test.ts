@@ -9,7 +9,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { calibrateReport, statusReport, USD_PER_MTOK, whyReport } from "../../src/hooks/report.js";
+import type { Health } from "../../src/hooks/daemon/control.js";
+import { emptyCounters, type DaemonState } from "../../src/hooks/daemon/state-file.js";
+import {
+  calibrateReport,
+  daemonReport,
+  statusReport,
+  USD_PER_MTOK,
+  whyReport,
+  type DaemonView,
+} from "../../src/hooks/report.js";
 import type { DecisionRecord } from "../../src/hooks/store.js";
 import { Store } from "../../src/hooks/store.js";
 import { cleanup, tempDir, testConfig } from "./helpers.js";
@@ -427,5 +436,192 @@ describe("calibrateReport", () => {
   it("never prints the key", () => {
     store.append(record());
     expect(calibrateReport(testConfig(dir, { apiKey: "sk-super-secret" }), store)).not.toContain("sk-super-secret");
+  });
+});
+
+/**
+ * The Daemon section.
+ *
+ * The case that matters is the honest one: a `/jev:*` command runs through the
+ * Bash tool, whose process may be sandboxed away from loopback sockets, so a
+ * live daemon can be unreachable from the very shell reporting on it. Saying
+ * "down" there would be a lie, and a lie that sends someone debugging.
+ */
+describe("the daemon section", () => {
+  const view = (overrides: Partial<DaemonView> = {}): DaemonView => ({
+    state: undefined,
+    alive: false,
+    probe: "refused",
+    health: undefined,
+    logPath: "/tmp/jev/daemon.log",
+    ...overrides,
+  });
+
+  const state = (overrides: Partial<DaemonState> = {}): DaemonState => ({
+    pid: 4242,
+    port: 10522,
+    version: "0.4.0",
+    protocol: 1,
+    bundle_path: "/plugins/jev/dist/hook.mjs",
+    bundle_mtime: NOW - 86_400_000,
+    data_dir: "/tmp/jev",
+    started_at: NOW - 600_000,
+    updated_at: NOW - 5_000,
+    state: "running",
+    counters: { ...emptyCounters(), hooks: { PreToolUse: 42, Stop: 3 }, jev_calls: 12, memo_hits: 7 },
+    restarts: 2,
+    ...overrides,
+  });
+
+  const health = (overrides: Partial<Health> = {}): Health => ({
+    jev: true,
+    pid: 4242,
+    port: 10522,
+    version: "0.4.0",
+    protocol: 1,
+    bundle_path: "/plugins/jev/dist/hook.mjs",
+    bundle_mtime: NOW - 86_400_000,
+    started_at: NOW - 600_000,
+    uptime_ms: 600_000,
+    sessions: 2,
+    auth: "key",
+    ...overrides,
+  });
+
+  it("says up, with the pid and the uptime, when the probe got through", () => {
+    const lines = daemonReport(testConfig(dir), view({ state: state(), alive: true, probe: "jev", health: health() }), NOW).join("\n");
+    expect(lines).toContain("status: up");
+    expect(lines).toContain("pid 4242");
+    expect(lines).toContain("up 10m 0s");
+    expect(lines).toContain("sessions registered: 2");
+    expect(lines).toContain("restarts 2");
+  });
+
+  it("says the state file vouches for it rather than `down` when the probe fails but the pid is alive", () => {
+    const lines = daemonReport(testConfig(dir), view({ state: state(), alive: true, probe: "refused" }), NOW).join("\n");
+    expect(lines).toContain("the state file says running and pid 4242 is alive");
+    expect(lines).toContain("not reachable from this shell");
+    expect(lines).toContain("sandboxed");
+    expect(lines).not.toContain("status: down");
+  });
+
+  it("says down when the state file claims running and the pid is gone", () => {
+    const lines = daemonReport(testConfig(dir), view({ state: state(), alive: false }), NOW).join("\n");
+    expect(lines).toContain("status: down");
+    expect(lines).toContain("no longer exists");
+  });
+
+  it("says down when there has never been a daemon here", () => {
+    const lines = daemonReport(testConfig(dir), view(), NOW).join("\n");
+    expect(lines).toContain("status: down");
+    expect(lines).toContain("has never run here");
+  });
+
+  it("says down, with when, after a clean stop", () => {
+    const lines = daemonReport(
+      testConfig(dir),
+      view({ state: state({ state: "stopped", updated_at: NOW - 90_000 }) }),
+      NOW,
+    ).join("\n");
+    expect(lines).toContain("status: down — stopped 1m 30s ago");
+  });
+
+  it("shouts about a port conflict and says the hooks are inactive but fail open", () => {
+    const lines = daemonReport(testConfig(dir), view({ state: state({ state: "port-conflict" }) }), NOW).join("\n");
+    expect(lines).toContain("PORT CONFLICT");
+    expect(lines).toContain("inactive");
+    expect(lines).toContain("nothing is blocked");
+  });
+
+  it("flags a stale heartbeat on a daemon whose pid is alive", () => {
+    const lines = daemonReport(
+      testConfig(dir),
+      view({ state: state({ updated_at: NOW - 120_000 }), alive: true }),
+      NOW,
+    ).join("\n");
+    expect(lines).toContain("stale for a 15 s heartbeat");
+  });
+
+  it("reports hooks by event, memo hits and jev calls", () => {
+    const lines = daemonReport(testConfig(dir), view({ state: state(), alive: true }), NOW).join("\n");
+    expect(lines).toContain("hooks served: PreToolUse 42, Stop 3");
+    expect(lines).toContain("jev calls: 12");
+    expect(lines).toContain("memo hits: 7");
+    expect(lines).toContain("counters read from the state file");
+  });
+
+  it("prefers live counters when the probe got through, and says so", () => {
+    const lines = daemonReport(
+      testConfig(dir),
+      view({
+        state: state(),
+        alive: true,
+        probe: "jev",
+        health: health({ counters: { ...emptyCounters(), hooks: { PreToolUse: 99 } } }),
+      }),
+      NOW,
+    ).join("\n");
+    expect(lines).toContain("hooks served: PreToolUse 99");
+    expect(lines).toContain("counters read live from the daemon");
+  });
+
+  it("says so plainly when there is no key and the daemon is unauthenticated", () => {
+    const lines = daemonReport(
+      testConfig(dir),
+      view({ state: state(), alive: true, probe: "jev", health: health({ auth: "none" }) }),
+      NOW,
+    ).join("\n");
+    expect(lines).toContain("auth: none");
+    expect(lines).toContain("nothing to spend");
+  });
+
+  it("notices a daemon speaking another protocol and says it will be replaced", () => {
+    const lines = daemonReport(
+      testConfig(dir),
+      view({ state: state(), alive: true, probe: "jev", health: health({ protocol: 99 }) }),
+      NOW,
+    ).join("\n");
+    expect(lines).toContain("it speaks protocol 99");
+    expect(lines).toContain("replaces it");
+  });
+
+  it("never prints a key", () => {
+    const lines = daemonReport(
+      testConfig(dir, { apiKey: "sk-super-secret" }),
+      view({ state: state(), alive: true, probe: "jev", health: health() }),
+      NOW,
+    ).join("\n");
+    expect(lines).not.toContain("sk-super-secret");
+  });
+});
+
+describe("statusReport and the daemon", () => {
+  it("leaves the section out entirely when the caller did not probe", () => {
+    // `statusReport` is synchronous; a caller that cannot await a probe gets no
+    // daemon section rather than an invented one.
+    expect(statusReport(testConfig(dir), store, NOW)).not.toContain("Daemon");
+  });
+
+  it("appends the section when the caller passes a view", () => {
+    const report = statusReport(testConfig(dir), store, NOW, {
+      state: undefined,
+      alive: false,
+      probe: "refused",
+      health: undefined,
+      logPath: "/tmp/jev/daemon.log",
+    });
+    expect(report).toContain("Daemon");
+    expect(report).toContain("has never run here");
+  });
+
+  it("excludes memo hits from the latency percentiles and counts them separately", () => {
+    // A hit is honestly 0 ms, but a p50 over calls that never happened would
+    // flatter the real latency.
+    for (let i = 0; i < 4; i += 1) store.append(record({ latency_ms: 400 }));
+    for (let i = 0; i < 4; i += 1) store.append(record({ latency_ms: 0, input_tokens: 0, memo: true }));
+    const report = statusReport(testConfig(dir), store, NOW);
+    expect(report).toContain("(4 calls)");
+    expect(report).toContain("p50 400 ms");
+    expect(report).toContain("4 were answered from the daemon's memo");
   });
 });

@@ -2,12 +2,14 @@
 /**
  * Set the version in every place that carries one.
  *
- * There are five, and they have to agree: `package.json`, the lockfile,
+ * There are six, and they have to agree: `package.json`, the lockfile,
  * `plugin/.claude-plugin/plugin.json`, the plugin's entry in
- * `.claude-plugin/marketplace.json`, and `SERVER_VERSION` in `src/server.ts`
- * (which is what an MCP client reports). Four of them are easy to forget, and
- * a marketplace whose version disagrees with the plugin it installs is the kind
- * of bug that only shows up on someone else's machine.
+ * `.claude-plugin/marketplace.json`, `SERVER_VERSION` in `src/server.ts` (what
+ * an MCP client reports) and `HOOK_VERSION` in `src/hooks/version.ts` (what the
+ * daemon reports in `/v1/health`, and therefore what decides whether an update
+ * replaces a running one). Five of them are easy to forget, and a marketplace
+ * whose version disagrees with the plugin it installs is the kind of bug that
+ * only shows up on someone else's machine.
  *
  *   npm run bump -- 0.2.0
  *
@@ -86,6 +88,15 @@ const TRAILING_EDITS: Edit[] = [
     pattern: /^(export const SERVER_VERSION = ")([^"]+)(";)$/m,
     expected: 1,
     what: "SERVER_VERSION",
+  },
+  {
+    // The hook bundle cannot import `src/server.ts` (it pulls in the MCP SDK),
+    // so it carries its own copy. The daemon states it in `/v1/health`, which
+    // is what decides whether a running daemon gets replaced on an update.
+    file: "src/hooks/version.ts",
+    pattern: /^(export const HOOK_VERSION = ")([^"]+)(";)$/m,
+    expected: 1,
+    what: "HOOK_VERSION",
   },
 ];
 

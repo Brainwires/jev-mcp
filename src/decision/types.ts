@@ -95,6 +95,16 @@ export interface EvaluateResult<Q extends Record<string, Question> = Record<stri
   usage: Usage;
   /** Wall-clock time including retries. */
   latency_ms: number;
+  /**
+   * Set by a caching wrapper when this answer came from its cache rather than
+   * from the provider. Absent means "this call really happened".
+   *
+   * It is here rather than in the wrapper's own type because the whole point is
+   * that a caller logging cost and latency can tell the difference: a hit
+   * reports `latency_ms: 0` and `input_tokens: 0`, and without this flag those
+   * zeroes would be indistinguishable from an implausibly fast real call.
+   */
+  memo?: boolean;
 }
 
 export interface DecisionModel {

@@ -1,5 +1,8 @@
 # Security
 
+Security policy for **jevwire** ([Brainwires/jevwire](https://github.com/Brainwires/jevwire)),
+published on npm as `jev-mcp` and installed as the Claude Code plugin `jev`.
+
 ## What leaves the machine
 
 When a hook decides Jev needs to judge something, or when an MCP tool is pointed at file content,
@@ -48,6 +51,70 @@ $0.13) limits — see below.
   a read out of the project.
 - **The API key.** Never written to a settings file, never logged, never included in the decision
   log or the session file. `/jev:status` reports only whether a key is configured, never its value.
+
+## The daemon
+
+Since 0.4.0 most hooks are `type: "http"` posts to a daemon this plugin starts, rather than a fresh
+process per tool call. That moves a hook payload — a tool name and a redacted excerpt of its
+arguments — from a pipe between parent and child onto a TCP socket, so it is worth being precise
+about what that does and does not expose.
+
+**It binds loopback only.** `127.0.0.1:10522`. Not a configuration choice you can get wrong: the
+bind address is a literal in the code. Nothing outside the machine can reach it, whatever the
+firewall says.
+
+**It authenticates with your TypeSafe API key.** Every hook sends it, in either
+`Authorization: Bearer` or `X-Jev-Env-Key`, and the daemon accepts a request only if one of them
+matches the key it resolved for itself — compared with `timingSafeEqual` over sha256 digests, so the
+comparison does not leak the key's length or prefix by timing. An empty `Bearer ` counts as no
+credential rather than a wrong one, because the plugin option interpolates to an empty string when it
+is unset.
+
+**`/v1/health` is unauthenticated and carries no secret.** It has to be: it is how a starting hook
+tells "my daemon, current version" from "my daemon, stale" from "somebody else's server" before it
+has anywhere to send a credential. It reports a pid, a port, a version, a protocol number, the
+bundle's path and mtime, an uptime, a session count, whether auth is on, and counters. No key, no
+session content, no tool arguments. A test asserts the key does not appear in it.
+
+**There is no shutdown endpoint.** Stopping the daemon takes a signal, which takes being the same
+user. An HTTP route that could kill the process would be a route worth attacking.
+
+**A keyless install runs it unauthenticated**, and says so: `/v1/health` reports `auth: "none"` and
+`/jev:status` prints it. This is a deliberate choice rather than an oversight. Without a key the
+daemon cannot call Jev, so there is no spend to incur and no judgment to subvert; the alternative —
+inventing a separate secret so a keyless install could authenticate — would add a credential to
+manage for no gain. What an unauthenticated daemon will still do is accept a hook payload from any
+local process and write it to your decision log.
+
+### Residual risk: port squatting
+
+**A different local user who binds 10522 before the daemon does will receive the hook payloads and
+the API key in a request header.** The plugin detects that something is on the port and that it is
+not answering as jev — it marks `port-conflict`, tells you at session start, leaves the other process
+strictly alone (it never signals a process it cannot identify) and keeps its hooks inactive. But the
+detection happens on the *next* session start, and the hooks in a session already running would have
+been posting to whatever is there.
+
+Consequently: **multi-user hosts are not supported.** On a machine where you are the only user with
+a login, or where nobody untrusted can run code as another local user, the exposure is the same as
+any other loopback service. On a shared box, do not use the daemon: set `JEV_DAEMON_DISABLE=1` and
+the plugin falls back to a process per hook, which passes the payload over a pipe instead.
+
+A `daemon_secret` setting — a secret minted by the plugin rather than reused from the API key —
+would narrow this to "the squatter gets the payloads but not the key", and can be added later without
+a protocol change. It does not close it: a squatter is still receiving tool arguments.
+
+### What the daemon keeps in memory
+
+One `JevDecisionModel`, a registry of the sessions that said hello (session id, data directory, and
+the non-secret settings snapshot), and a memo of up to 256 recent Jev answers for five minutes, keyed
+by a sha256 of the request. The memo holds answers, not request text — but the key is derived from
+the request, so an attacker who could already guess an exact payload could confirm the guess by
+timing. That is not a meaningful escalation for anyone who can already post to the port.
+
+The memo also means a judgment can be *reused*: the same tool call inside five minutes gets the
+earlier answer rather than a fresh one. It is logged as `memo: true` with `latency_ms: 0` and zero
+tokens so the log never claims a call that did not happen.
 
 ## Where the log lives, and how to delete it
 
@@ -106,7 +173,7 @@ permission rules, not in this plugin.
 ## Reporting a vulnerability
 
 Please report security issues privately through GitHub's security advisory flow:
-<https://github.com/Brainwires/jev-mcp/security/advisories/new>.
+<https://github.com/Brainwires/jevwire/security/advisories/new>.
 
 Do not open a public issue for anything exploitable. This is a small project maintained on a
 best-effort basis, so there is no guaranteed response time — but reports are read, and a fix or an

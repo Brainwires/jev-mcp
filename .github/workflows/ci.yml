@@ -34,3 +34,35 @@ jobs:
       - name: committed plugin bundle is up to date
         if: matrix.node-version == '20'
         run: git diff --exit-code plugin/dist
+
+      # The daemon's control plane is the one part of the plugin whose bugs only
+      # appear under contention: two sessions starting at once must produce one
+      # daemon, and the O_EXCL lock is what makes that true. Running the whole
+      # end-to-end file twice at the same time is the cheapest way to notice a
+      # lock that was released too early or taken too late. Linux only — this
+      # is about the lock, not about the platform — and after the build so both
+      # runs use the same bundle.
+      - name: daemon end-to-end, twice concurrently
+        if: matrix.node-version == '20'
+        run: |
+          npx vitest run tests/hooks/daemon-e2e.test.ts &
+          first=$!
+          npx vitest run tests/hooks/daemon-e2e.test.ts &
+          second=$!
+          wait $first
+          status_first=$?
+          wait $second
+          status_second=$?
+          echo "first=$status_first second=$status_second"
+          test "$status_first" -eq 0 && test "$status_second" -eq 0
+
+      # Nothing may be left holding the daemon's real port. Every test picks an
+      # ephemeral one, and this is what proves it.
+      - name: no daemon left on the default port
+        if: matrix.node-version == '20'
+        run: |
+          if curl -fsS --max-time 2 http://127.0.0.1:10522/v1/health >/dev/null 2>&1; then
+            echo "a process is answering on 10522 after the test run" >&2
+            exit 1
+          fi
+          echo "10522 is clear"

@@ -28244,17 +28244,17 @@ var CompleteRequestSchema = RequestSchema.extend({
   method: literal("completion/complete"),
   params: CompleteRequestParamsSchema
 });
-function assertCompleteRequestPrompt(request) {
-  if (request.params.ref.type !== "ref/prompt") {
-    throw new TypeError(`Expected CompleteRequestPrompt, but got ${request.params.ref.type}`);
+function assertCompleteRequestPrompt(request2) {
+  if (request2.params.ref.type !== "ref/prompt") {
+    throw new TypeError(`Expected CompleteRequestPrompt, but got ${request2.params.ref.type}`);
   }
-  void request;
+  void request2;
 }
-function assertCompleteRequestResourceTemplate(request) {
-  if (request.params.ref.type !== "ref/resource") {
-    throw new TypeError(`Expected CompleteRequestResourceTemplate, but got ${request.params.ref.type}`);
+function assertCompleteRequestResourceTemplate(request2) {
+  if (request2.params.ref.type !== "ref/resource") {
+    throw new TypeError(`Expected CompleteRequestResourceTemplate, but got ${request2.params.ref.type}`);
   }
-  void request;
+  void request2;
 }
 var CompleteResultSchema = ResultSchema.extend({
   completion: looseObject({
@@ -29048,20 +29048,20 @@ function collectChunks(input2, options = {}) {
       skipped.ignored += 1;
       continue;
     }
-    const read = readTextFile(resolution.absolute, options.maxFileBytes ?? MAX_FILE_BYTES);
-    if (read.kind === "binary") {
+    const read2 = readTextFile(resolution.absolute, options.maxFileBytes ?? MAX_FILE_BYTES);
+    if (read2.kind === "binary") {
       skipped.binary += 1;
       continue;
     }
-    if (read.kind === "too_large") {
+    if (read2.kind === "too_large") {
       skipped.too_large += 1;
       continue;
     }
-    if (read.kind === "not_found") {
+    if (read2.kind === "not_found") {
       skipped.not_found += 1;
       continue;
     }
-    const fileChunks = chunkText(resolution.relative, read.text, options);
+    const fileChunks = chunkText(resolution.relative, read2.text, options);
     if (fileChunks.length === 0) continue;
     scanned += 1;
     chunks.push(...fileChunks);
@@ -29147,6 +29147,631 @@ function loadConfig(env = process.env) {
     maxConcurrency: readNumber(env, "JEV_MAX_CONCURRENCY", DEFAULTS.maxConcurrency, 1, 32),
     maxConcurrencyExplicit: (env.JEV_MAX_CONCURRENCY ?? "").trim() !== "",
     projectRoot: resolveProjectRoot(env)
+  };
+}
+
+// src/daemon-watchdog.ts
+import { existsSync } from "node:fs";
+import { join as join4 } from "node:path";
+
+// src/hooks/config.ts
+import { homedir } from "node:os";
+import { join as join2 } from "node:path";
+
+// src/hooks/daemon/protocol.ts
+var DEFAULT_PORT = 10522;
+var PROTOCOL = 1;
+var MAX_BODY_BYTES = 4 * 1024 * 1024;
+var DEFAULT_IDLE_MS = 30 * 60 * 1e3;
+var LAST_SESSION_GRACE_MS = 60 * 1e3;
+var HEARTBEAT_MS = 15 * 1e3;
+var LOCK_STALE_MS = 30 * 1e3;
+var PROBE_TIMEOUT_MS = 300;
+var WAIT_MS = 2e3;
+
+// src/hooks/config.ts
+var GATE_LEVELS = ["off", "advisory", "strict"];
+var GATE_MODE_MIGRATION = {
+  off: "off",
+  standard: "advisory",
+  strict: "strict"
+};
+var HOOK_DEFAULTS = {
+  baseUrl: "https://api.typesafe.ai",
+  model: "jev-latest",
+  timeoutMs: 1500,
+  maxRetries: 0,
+  gate: "advisory",
+  askOnTrip: false,
+  stopCheck: true,
+  screenResults: true,
+  routePrompts: false,
+  autoThreshold: 0.85,
+  reviewThreshold: 0.6,
+  daemonPort: DEFAULT_PORT,
+  daemonIdleMs: DEFAULT_IDLE_MS
+};
+function read(env, option, ...fallbacks) {
+  for (const key of [`CLAUDE_PLUGIN_OPTION_${option.toUpperCase()}`, ...fallbacks]) {
+    const raw = env[key];
+    if (raw !== void 0 && raw.trim() !== "") return raw.trim();
+  }
+  return void 0;
+}
+function readBool(env, option, fallback, warnings, ...aliases) {
+  const raw = read(env, option, ...aliases);
+  if (raw === void 0) return fallback;
+  const lowered = raw.toLowerCase();
+  if (["true", "1", "yes", "on"].includes(lowered)) return true;
+  if (["false", "0", "no", "off"].includes(lowered)) return false;
+  warnings.push(`${option}=${JSON.stringify(raw)} is not a boolean; using ${fallback}.`);
+  return fallback;
+}
+function readNumber2(env, option, fallback, min, max, warnings, ...aliases) {
+  const raw = read(env, option, ...aliases);
+  if (raw === void 0) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min || value > max) {
+    warnings.push(`${option}=${JSON.stringify(raw)} is not a number in [${min}, ${max}]; using ${fallback}.`);
+    return fallback;
+  }
+  return value;
+}
+function resolveDataDir(env = process.env, scriptPath = process.argv[1]) {
+  const explicit = env.CLAUDE_PLUGIN_DATA?.trim();
+  if (explicit !== void 0 && explicit !== "") return explicit;
+  const jev = env.JEV_HOOKS_DATA_DIR?.trim();
+  if (jev !== void 0 && jev !== "") return jev;
+  const dataRoot = join2(env.HOME?.trim() || homedir(), ".claude", "plugins", "data");
+  return join2(dataRoot, installIdFromScriptPath(scriptPath) ?? "jev");
+}
+function installIdFromScriptPath(scriptPath) {
+  if (scriptPath === void 0) return void 0;
+  const parts = scriptPath.replace(/\\/g, "/").split("/");
+  const cache = parts.lastIndexOf("cache");
+  if (cache < 1 || parts[cache - 1] !== "plugins") return void 0;
+  const marketplace = parts[cache + 1];
+  const plugin = parts[cache + 2];
+  if (!marketplace || !plugin || parts.length < cache + 5) return void 0;
+  return `${plugin}@${marketplace}`.replace(/[^A-Za-z0-9_-]/g, "-");
+}
+function loadHookConfig(env = process.env) {
+  const warnings = [];
+  const gateRaw = read(env, "gate", "JEV_GATE");
+  let gate2 = HOOK_DEFAULTS.gate;
+  if (gateRaw !== void 0) {
+    const lowered = gateRaw.toLowerCase();
+    if (GATE_LEVELS.includes(lowered)) {
+      gate2 = lowered;
+    } else {
+      warnings.push(`gate=${JSON.stringify(gateRaw)} is not one of ${GATE_LEVELS.join("|")}; using advisory.`);
+    }
+  } else {
+    const legacy = read(env, "gate_mode", "JEV_GATE_MODE");
+    if (legacy !== void 0) {
+      const mapped = GATE_MODE_MIGRATION[legacy.toLowerCase()];
+      if (mapped === void 0) {
+        warnings.push(
+          `gate_mode=${JSON.stringify(legacy)} is not one of off|standard|strict; using gate=advisory. Set "gate" in /plugin config.`
+        );
+      } else {
+        gate2 = mapped;
+        warnings.push(`gate_mode is deprecated; read as gate=${mapped}. Set "gate" in /plugin config.`);
+      }
+    }
+  }
+  if (read(env, "auto_mode", "JEV_AUTO_MODE") !== void 0) {
+    warnings.push("auto_mode is no longer used: every judgment is advisory to Claude and never prompts.");
+  }
+  const apiKey = read(env, "api_key", "TYPESAFE_API_KEY") ?? null;
+  const auto = readNumber2(env, "auto_threshold", HOOK_DEFAULTS.autoThreshold, 0, 1, warnings, "JEV_AUTO_THRESHOLD");
+  const review = readNumber2(
+    env,
+    "review_threshold",
+    Math.min(HOOK_DEFAULTS.reviewThreshold, auto),
+    0,
+    1,
+    warnings,
+    "JEV_REVIEW_THRESHOLD"
+  );
+  return {
+    apiKey,
+    baseUrl: (read(env, "base_url", "TYPESAFE_BASE_URL") ?? HOOK_DEFAULTS.baseUrl).replace(/\/+$/, ""),
+    model: read(env, "model", "JEV_MODEL") ?? HOOK_DEFAULTS.model,
+    timeoutMs: readNumber2(env, "timeout_ms", HOOK_DEFAULTS.timeoutMs, 100, 1e4, warnings, "JEV_HOOK_TIMEOUT_MS"),
+    maxRetries: HOOK_DEFAULTS.maxRetries,
+    gate: gate2,
+    askOnTrip: readBool(env, "ask_on_trip", HOOK_DEFAULTS.askOnTrip, warnings, "JEV_ASK_ON_TRIP"),
+    stopCheck: readBool(env, "stop_check", HOOK_DEFAULTS.stopCheck, warnings, "JEV_STOP_CHECK"),
+    screenResults: readBool(env, "screen_results", HOOK_DEFAULTS.screenResults, warnings, "JEV_SCREEN_RESULTS"),
+    routePrompts: readBool(env, "route_prompts", HOOK_DEFAULTS.routePrompts, warnings, "JEV_ROUTE_PROMPTS"),
+    autoThreshold: auto,
+    reviewThreshold: Math.min(review, auto),
+    // Port 0 is allowed and means "ask the OS": the tests use it so they never
+    // touch the real port, and nothing in a normal install sets it.
+    daemonPort: readNumber2(env, "daemon_port", HOOK_DEFAULTS.daemonPort, 0, 65535, warnings, "JEV_DAEMON_PORT"),
+    daemonIdleMs: readNumber2(
+      env,
+      "daemon_idle_ms",
+      HOOK_DEFAULTS.daemonIdleMs,
+      1e3,
+      24 * 60 * 60 * 1e3,
+      warnings,
+      "JEV_DAEMON_IDLE_MS"
+    ),
+    dataDir: resolveDataDir(env),
+    disabled: readBool(env, "hooks_disable", false, warnings, "JEV_HOOKS_DISABLE"),
+    warnings
+  };
+}
+
+// src/hooks/daemon/control.ts
+import { spawn } from "node:child_process";
+import { closeSync as closeSync2 } from "node:fs";
+import { connect } from "node:net";
+import { request } from "node:http";
+
+// src/hooks/daemon/state-file.ts
+import { closeSync, mkdirSync, openSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { statSync as statSync3 } from "node:fs";
+import { join as join3 } from "node:path";
+function emptyCounters() {
+  return {
+    hooks: {},
+    sessions_started: 0,
+    sessions_ended: 0,
+    jev_calls: 0,
+    jev_timeouts: 0,
+    jev_errors: 0,
+    memo_hits: 0,
+    unauthorized: 0,
+    protocol_mismatch: 0,
+    unknown_event: 0,
+    bad_request: 0,
+    oversize: 0,
+    deadline_overruns: 0,
+    errors: 0
+  };
+}
+function daemonStatePath(dataDir) {
+  return join3(dataDir, "daemon.json");
+}
+function daemonLockPath(dataDir) {
+  return join3(dataDir, "daemon.lock");
+}
+function daemonLogPath(dataDir) {
+  return join3(dataDir, "daemon.log");
+}
+function safe(fn, fallback) {
+  try {
+    return fn();
+  } catch {
+    return fallback;
+  }
+}
+function readCounters(raw) {
+  const base = emptyCounters();
+  if (typeof raw !== "object" || raw === null) return base;
+  const value = raw;
+  const hooks = {};
+  if (typeof value.hooks === "object" && value.hooks !== null) {
+    for (const [event, count] of Object.entries(value.hooks)) {
+      if (typeof count === "number" && Number.isFinite(count) && count >= 0) hooks[event] = Math.floor(count);
+    }
+  }
+  const counters = { ...base, hooks };
+  for (const key of Object.keys(base)) {
+    if (key === "hooks") continue;
+    const count = value[key];
+    if (typeof count === "number" && Number.isFinite(count) && count >= 0) {
+      counters[key] = Math.floor(count);
+    }
+  }
+  return counters;
+}
+function readDaemonState(dataDir) {
+  return safe(() => {
+    const parsed = JSON.parse(readFileSync2(daemonStatePath(dataDir), "utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return void 0;
+    const value = parsed;
+    const pid = value.pid;
+    const port = value.port;
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1) return void 0;
+    if (typeof port !== "number" || !Number.isInteger(port) || port < 0 || port > 65535) return void 0;
+    const runState = value.state;
+    return {
+      pid,
+      port,
+      version: typeof value.version === "string" ? value.version : "unknown",
+      protocol: typeof value.protocol === "number" ? value.protocol : PROTOCOL,
+      bundle_path: typeof value.bundle_path === "string" ? value.bundle_path : "",
+      bundle_mtime: typeof value.bundle_mtime === "number" ? value.bundle_mtime : 0,
+      data_dir: typeof value.data_dir === "string" ? value.data_dir : dataDir,
+      started_at: typeof value.started_at === "number" ? value.started_at : 0,
+      updated_at: typeof value.updated_at === "number" ? value.updated_at : 0,
+      state: runState === "running" || runState === "stopped" || runState === "port-conflict" ? runState : "stopped",
+      counters: readCounters(value.counters),
+      restarts: typeof value.restarts === "number" && value.restarts >= 0 ? Math.floor(value.restarts) : 0
+    };
+  }, void 0);
+}
+function writeDaemonState(dataDir, state) {
+  safe(() => mkdirSync(dataDir, { recursive: true }), void 0);
+  safe(() => {
+    const temp = `${daemonStatePath(dataDir)}.${process.pid}.tmp`;
+    writeFileSync(temp, `${JSON.stringify(state)}
+`, "utf8");
+    renameSync(temp, daemonStatePath(dataDir));
+  }, void 0);
+}
+function bundleIdentity(scriptPath = process.argv[1]) {
+  const path = scriptPath ?? "";
+  return { path, mtime: safe(() => Math.floor(statSync3(path).mtimeMs), 0) };
+}
+function tryAcquireLock(dataDir, now, isAlive2, staleMs) {
+  safe(() => mkdirSync(dataDir, { recursive: true }), void 0);
+  const path = daemonLockPath(dataDir);
+  try {
+    const fd = openSync(path, "wx");
+    try {
+      writeFileSync(fd, `${process.pid} ${now}
+`, "utf8");
+    } finally {
+      closeSync(fd);
+    }
+    return true;
+  } catch {
+    const raw = safe(() => readFileSync2(path, "utf8"), "");
+    const [pidText, tsText] = raw.trim().split(/\s+/);
+    const pid = Number(pidText);
+    const ts = Number(tsText);
+    const dead = !Number.isInteger(pid) || pid <= 1 || !isAlive2(pid);
+    const old = !Number.isFinite(ts) || now - ts > staleMs;
+    if (dead || old) {
+      safe(() => unlinkSync(path), void 0);
+      return safe(() => {
+        const fd = openSync(path, "wx");
+        try {
+          writeFileSync(fd, `${process.pid} ${now}
+`, "utf8");
+        } finally {
+          closeSync(fd);
+        }
+        return true;
+      }, false);
+    }
+    return false;
+  }
+}
+function releaseLock(dataDir) {
+  safe(() => unlinkSync(daemonLockPath(dataDir)), void 0);
+}
+function openLog(dataDir) {
+  safe(() => mkdirSync(dataDir, { recursive: true }), void 0);
+  return safe(() => openSync(daemonLogPath(dataDir), "w"), -1);
+}
+
+// src/hooks/version.ts
+var HOOK_VERSION = "0.4.0";
+
+// src/hooks/daemon/control.ts
+function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error62) {
+    return error62.code === "EPERM";
+  }
+}
+function sleep(ms) {
+  return new Promise((resolve2) => {
+    setTimeout(resolve2, ms);
+  });
+}
+function probeHealth(port, timeoutMs = PROBE_TIMEOUT_MS) {
+  return new Promise((resolve2) => {
+    let settled = false;
+    const finish = (probe) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve2(probe);
+    };
+    const req = request(
+      { host: "127.0.0.1", port, path: "/v1/health", method: "GET", timeout: timeoutMs },
+      (res) => {
+        const chunks = [];
+        let size = 0;
+        res.on("data", (chunk) => {
+          size += chunk.byteLength;
+          if (size > 64 * 1024) {
+            res.destroy();
+            finish({ kind: "foreign" });
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on("end", () => {
+          if (res.statusCode !== 200) {
+            finish({ kind: "foreign" });
+            return;
+          }
+          try {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            if (typeof parsed === "object" && parsed !== null && parsed.jev === true && typeof parsed.pid === "number") {
+              finish({ kind: "jev", health: parsed });
+              return;
+            }
+          } catch {
+          }
+          finish({ kind: "foreign" });
+        });
+        res.on("error", () => finish({ kind: "foreign" }));
+      }
+    );
+    const timer = setTimeout(() => {
+      req.destroy();
+      finish({ kind: "silent" });
+    }, timeoutMs + 50);
+    req.on("timeout", () => {
+      req.destroy();
+      finish({ kind: "silent" });
+    });
+    req.on("error", (error62) => {
+      finish(error62.code === "ECONNREFUSED" || error62.code === "ECONNRESET" ? { kind: "refused" } : { kind: "silent" });
+    });
+    req.end();
+  });
+}
+function portBusy(port, timeoutMs = 200) {
+  return new Promise((resolve2) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (busy) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve2(busy);
+    };
+    socket.setTimeout(timeoutMs, () => finish(true));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+async function waitForPortFree(port, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (!await portBusy(port, 100)) return true;
+    await sleep(50);
+  }
+  return !await portBusy(port, 100);
+}
+async function waitForHealth(port, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  for (; ; ) {
+    const probe = await probeHealth(port, PROBE_TIMEOUT_MS);
+    if (probe.kind === "jev") return probe.health;
+    if (Date.now() >= deadline) return void 0;
+    await sleep(50);
+  }
+}
+async function withLock(dataDir, fn, waitMs = WAIT_MS + 500) {
+  const deadline = Date.now() + waitMs;
+  for (; ; ) {
+    if (tryAcquireLock(dataDir, Date.now(), isAlive, LOCK_STALE_MS)) {
+      try {
+        return await fn();
+      } finally {
+        releaseLock(dataDir);
+      }
+    }
+    if (Date.now() >= deadline) return void 0;
+    await sleep(50);
+  }
+}
+async function spawnDaemon(options) {
+  const logFd = openLog(options.dataDir);
+  try {
+    const env = {};
+    for (const [key, value] of Object.entries(options.env)) {
+      if (value !== void 0) env[key] = value;
+    }
+    env.JEV_DAEMON_PORT = String(options.port);
+    env.CLAUDE_PLUGIN_DATA = options.dataDir;
+    const child = spawn(
+      options.nodePath ?? process.execPath,
+      [options.bundlePath, "daemon", "--port", String(options.port)],
+      {
+        detached: true,
+        stdio: ["ignore", logFd === -1 ? "ignore" : logFd, logFd === -1 ? "ignore" : logFd],
+        windowsHide: true,
+        env
+      }
+    );
+    child.on("error", () => void 0);
+    child.unref();
+  } catch {
+    return false;
+  } finally {
+    if (logFd !== -1) {
+      try {
+        closeSync2(logFd);
+      } catch {
+      }
+    }
+  }
+  const budget = options.waitMs ?? WAIT_MS;
+  if (options.port === 0) {
+    const deadline = Date.now() + budget;
+    while (Date.now() < deadline) {
+      const state = readDaemonState(options.dataDir);
+      if (state?.state === "running" && state.port > 0) return true;
+      await sleep(50);
+    }
+    return false;
+  }
+  return await waitForHealth(options.port, budget) !== void 0;
+}
+async function terminate(pid, port, budgetMs = WAIT_MS) {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+  }
+  if (await waitForPortFree(port, budgetMs)) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+  }
+  await waitForPortFree(port, 500);
+}
+function recordConflict(options, previous) {
+  const bundle = bundleIdentity(options.bundlePath);
+  const now = Date.now();
+  writeDaemonState(options.dataDir, {
+    pid: previous?.pid ?? process.pid,
+    port: options.port,
+    version: HOOK_VERSION,
+    protocol: PROTOCOL,
+    bundle_path: bundle.path,
+    bundle_mtime: bundle.mtime,
+    data_dir: options.dataDir,
+    started_at: previous?.started_at ?? now,
+    updated_at: now,
+    state: "port-conflict",
+    counters: previous?.counters ?? emptyCounters(),
+    restarts: previous?.restarts ?? 0
+  });
+}
+async function replaceDaemon(options) {
+  const probe = await probeHealth(options.port, PROBE_TIMEOUT_MS);
+  if (probe.kind === "foreign") {
+    recordConflict(options, readDaemonState(options.dataDir));
+    return "conflict";
+  }
+  const previous = readDaemonState(options.dataDir);
+  const pid = probe.kind === "jev" ? probe.health.pid : previous?.pid;
+  const budget = options.waitMs ?? WAIT_MS;
+  if (pid !== void 0 && pid !== process.pid && isAlive(pid)) {
+    await terminate(pid, options.port, budget);
+  }
+  const result = await withLock(
+    options.dataDir,
+    async () => await spawnDaemon(options) ? "replaced" : "failed",
+    budget + 500
+  );
+  return result ?? "failed";
+}
+async function ensureDaemon(options) {
+  try {
+    const budget = options.waitMs ?? WAIT_MS;
+    const mine = bundleIdentity(options.bundlePath);
+    const probe = await probeHealth(options.port, PROBE_TIMEOUT_MS);
+    if (probe.kind === "jev") {
+      const stale = probe.health.protocol !== PROTOCOL || mine.mtime > 0 && probe.health.bundle_mtime > 0 && probe.health.bundle_mtime < mine.mtime;
+      if (!stale) return "running";
+      return await replaceDaemon(options);
+    }
+    if (probe.kind === "foreign") {
+      recordConflict(options, readDaemonState(options.dataDir));
+      return "conflict";
+    }
+    const previous = readDaemonState(options.dataDir);
+    if (probe.kind === "silent") {
+      const pid = previous?.pid;
+      if (previous !== void 0 && previous.state === "running" && previous.port === options.port && pid !== void 0 && pid !== process.pid && isAlive(pid)) {
+        if ((await probeHealth(options.port, 1e3)).kind === "jev") return "running";
+        await terminate(pid, options.port, budget);
+        const result2 = await withLock(
+          options.dataDir,
+          async () => await spawnDaemon(options) ? "replaced" : "failed",
+          budget + 500
+        );
+        return result2 ?? "failed";
+      }
+      recordConflict(options, previous);
+      return "conflict";
+    }
+    const result = await withLock(
+      options.dataDir,
+      async () => {
+        const second = await probeHealth(options.port, PROBE_TIMEOUT_MS);
+        if (second.kind === "jev") {
+          const stale = second.health.protocol !== PROTOCOL || mine.mtime > 0 && second.health.bundle_mtime > 0 && second.health.bundle_mtime < mine.mtime;
+          return stale ? void 0 : "running";
+        }
+        if (second.kind === "foreign") {
+          recordConflict(options, previous);
+          return "conflict";
+        }
+        return await spawnDaemon(options) ? "started" : "failed";
+      },
+      budget + 500
+    );
+    if (result === void 0) {
+      const third = await probeHealth(options.port, PROBE_TIMEOUT_MS);
+      if (third.kind === "jev") {
+        const stale = third.health.protocol !== PROTOCOL || mine.mtime > 0 && third.health.bundle_mtime > 0 && third.health.bundle_mtime < mine.mtime;
+        return stale ? await replaceDaemon(options) : "running";
+      }
+      return "failed";
+    }
+    return result;
+  } catch {
+    return "failed";
+  }
+}
+
+// src/daemon-watchdog.ts
+var WATCHDOG_INTERVAL_MS = 1e4;
+function resolveBundlePath(env) {
+  for (const raw of [env.JEV_PLUGIN_ROOT, env.CLAUDE_PLUGIN_ROOT]) {
+    const root = raw?.trim();
+    if (root === void 0 || root === "" || root.includes("${")) continue;
+    const candidate = join4(root, "dist", "hook.mjs");
+    if (existsSync(candidate)) return candidate;
+  }
+  return void 0;
+}
+function startDaemonWatchdog(env = process.env, intervalMs = WATCHDOG_INTERVAL_MS, waitMs) {
+  if ((env.JEV_PLUGIN_DAEMON ?? "").trim() !== "1") return void 0;
+  const bundlePath = resolveBundlePath(env);
+  if (bundlePath === void 0) return void 0;
+  const config2 = loadHookConfig(env);
+  const stats = { runs: 0, failures: 0, last: void 0 };
+  let inFlight = false;
+  let stopped = false;
+  const tick = async () => {
+    if (inFlight || stopped) return;
+    inFlight = true;
+    stats.runs += 1;
+    try {
+      const result = await ensureDaemon({
+        dataDir: config2.dataDir,
+        port: config2.daemonPort,
+        bundlePath,
+        env,
+        ...waitMs !== void 0 ? { waitMs } : {}
+      });
+      stats.last = result;
+      if (result === "failed" || result === "conflict") stats.failures += 1;
+    } catch {
+      stats.failures += 1;
+      stats.last = "failed";
+    } finally {
+      inFlight = false;
+    }
+  };
+  const timer = setInterval(() => void tick(), intervalMs);
+  timer.unref();
+  void tick();
+  return {
+    stop: () => {
+      stopped = true;
+      clearInterval(timer);
+    },
+    stats: () => ({ ...stats }),
+    tick
   };
 }
 
@@ -29313,16 +29938,16 @@ var JevDecisionModel = class {
       throw new JevError("No fetch implementation available. Node 20+ or an injected `fetch` is required.");
     }
   }
-  async evaluate(request) {
-    const questions = request.questions;
+  async evaluate(request2) {
+    const questions = request2.questions;
     validateQuestions(questions);
-    checkBudget(request.state, questions, this.budgetLimits);
-    const model = request.model ?? this.name;
+    checkBudget(request2.state, questions, this.budgetLimits);
+    const model = request2.model ?? this.name;
     const started = Date.now();
     const body = await this.send(
       "/v1/systemone",
-      { state: request.state, model, questions },
-      request.signal
+      { state: request2.state, model, questions },
+      request2.signal
     );
     const latency_ms = Date.now() - started;
     const parsed = this.parseEvaluateResponse(body, questions);
@@ -35027,8 +35652,8 @@ var Protocol = class {
     this._taskStore = _options?.taskStore;
     this._taskMessageQueue = _options?.taskMessageQueue;
     if (this._taskStore) {
-      this.setRequestHandler(GetTaskRequestSchema, async (request, extra) => {
-        const task = await this._taskStore.getTask(request.params.taskId, extra.sessionId);
+      this.setRequestHandler(GetTaskRequestSchema, async (request2, extra) => {
+        const task = await this._taskStore.getTask(request2.params.taskId, extra.sessionId);
         if (!task) {
           throw new McpError(ErrorCode.InvalidParams, "Failed to retrieve task: Task not found");
         }
@@ -35036,9 +35661,9 @@ var Protocol = class {
           ...task
         };
       });
-      this.setRequestHandler(GetTaskPayloadRequestSchema, async (request, extra) => {
+      this.setRequestHandler(GetTaskPayloadRequestSchema, async (request2, extra) => {
         const handleTaskResult = async () => {
-          const taskId = request.params.taskId;
+          const taskId = request2.params.taskId;
           if (this._taskMessageQueue) {
             let queuedMessage;
             while (queuedMessage = await this._taskMessageQueue.dequeue(taskId, extra.sessionId)) {
@@ -35089,9 +35714,9 @@ var Protocol = class {
         };
         return await handleTaskResult();
       });
-      this.setRequestHandler(ListTasksRequestSchema, async (request, extra) => {
+      this.setRequestHandler(ListTasksRequestSchema, async (request2, extra) => {
         try {
-          const { tasks, nextCursor } = await this._taskStore.listTasks(request.params?.cursor, extra.sessionId);
+          const { tasks, nextCursor } = await this._taskStore.listTasks(request2.params?.cursor, extra.sessionId);
           return {
             tasks,
             nextCursor,
@@ -35101,20 +35726,20 @@ var Protocol = class {
           throw new McpError(ErrorCode.InvalidParams, `Failed to list tasks: ${error62 instanceof Error ? error62.message : String(error62)}`);
         }
       });
-      this.setRequestHandler(CancelTaskRequestSchema, async (request, extra) => {
+      this.setRequestHandler(CancelTaskRequestSchema, async (request2, extra) => {
         try {
-          const task = await this._taskStore.getTask(request.params.taskId, extra.sessionId);
+          const task = await this._taskStore.getTask(request2.params.taskId, extra.sessionId);
           if (!task) {
-            throw new McpError(ErrorCode.InvalidParams, `Task not found: ${request.params.taskId}`);
+            throw new McpError(ErrorCode.InvalidParams, `Task not found: ${request2.params.taskId}`);
           }
           if (isTerminal(task.status)) {
             throw new McpError(ErrorCode.InvalidParams, `Cannot cancel task in terminal status: ${task.status}`);
           }
-          await this._taskStore.updateTaskStatus(request.params.taskId, "cancelled", "Client cancelled task execution.", extra.sessionId);
-          this._clearTaskQueue(request.params.taskId);
-          const cancelledTask = await this._taskStore.getTask(request.params.taskId, extra.sessionId);
+          await this._taskStore.updateTaskStatus(request2.params.taskId, "cancelled", "Client cancelled task execution.", extra.sessionId);
+          this._clearTaskQueue(request2.params.taskId);
+          const cancelledTask = await this._taskStore.getTask(request2.params.taskId, extra.sessionId);
           if (!cancelledTask) {
-            throw new McpError(ErrorCode.InvalidParams, `Task not found after cancellation: ${request.params.taskId}`);
+            throw new McpError(ErrorCode.InvalidParams, `Task not found after cancellation: ${request2.params.taskId}`);
           }
           return {
             _meta: {},
@@ -35235,14 +35860,14 @@ var Protocol = class {
     }
     Promise.resolve().then(() => handler(notification)).catch((error62) => this._onerror(new Error(`Uncaught error in notification handler: ${error62}`)));
   }
-  _onrequest(request, extra) {
-    const handler = this._requestHandlers.get(request.method) ?? this.fallbackRequestHandler;
+  _onrequest(request2, extra) {
+    const handler = this._requestHandlers.get(request2.method) ?? this.fallbackRequestHandler;
     const capturedTransport = this._transport;
-    const relatedTaskId = request.params?._meta?.[RELATED_TASK_META_KEY]?.taskId;
+    const relatedTaskId = request2.params?._meta?.[RELATED_TASK_META_KEY]?.taskId;
     if (handler === void 0) {
       const errorResponse = {
         jsonrpc: "2.0",
-        id: request.id,
+        id: request2.id,
         error: {
           code: ErrorCode.MethodNotFound,
           message: "Method not found"
@@ -35260,17 +35885,17 @@ var Protocol = class {
       return;
     }
     const abortController = new AbortController();
-    this._requestHandlerAbortControllers.set(request.id, abortController);
-    const taskCreationParams = isTaskAugmentedRequestParams(request.params) ? request.params.task : void 0;
-    const taskStore = this._taskStore ? this.requestTaskStore(request, capturedTransport?.sessionId) : void 0;
+    this._requestHandlerAbortControllers.set(request2.id, abortController);
+    const taskCreationParams = isTaskAugmentedRequestParams(request2.params) ? request2.params.task : void 0;
+    const taskStore = this._taskStore ? this.requestTaskStore(request2, capturedTransport?.sessionId) : void 0;
     const fullExtra = {
       signal: abortController.signal,
       sessionId: capturedTransport?.sessionId,
-      _meta: request.params?._meta,
+      _meta: request2.params?._meta,
       sendNotification: async (notification) => {
         if (abortController.signal.aborted)
           return;
-        const notificationOptions = { relatedRequestId: request.id };
+        const notificationOptions = { relatedRequestId: request2.id };
         if (relatedTaskId) {
           notificationOptions.relatedTask = { taskId: relatedTaskId };
         }
@@ -35280,7 +35905,7 @@ var Protocol = class {
         if (abortController.signal.aborted) {
           throw new McpError(ErrorCode.ConnectionClosed, "Request was cancelled");
         }
-        const requestOptions = { ...options, relatedRequestId: request.id };
+        const requestOptions = { ...options, relatedRequestId: request2.id };
         if (relatedTaskId && !requestOptions.relatedTask) {
           requestOptions.relatedTask = { taskId: relatedTaskId };
         }
@@ -35291,7 +35916,7 @@ var Protocol = class {
         return await this.request(r, resultSchema, requestOptions);
       },
       authInfo: extra?.authInfo,
-      requestId: request.id,
+      requestId: request2.id,
       requestInfo: extra?.requestInfo,
       taskId: relatedTaskId,
       taskStore,
@@ -35301,16 +35926,16 @@ var Protocol = class {
     };
     Promise.resolve().then(() => {
       if (taskCreationParams) {
-        this.assertTaskHandlerCapability(request.method);
+        this.assertTaskHandlerCapability(request2.method);
       }
-    }).then(() => handler(request, fullExtra)).then(async (result) => {
+    }).then(() => handler(request2, fullExtra)).then(async (result) => {
       if (abortController.signal.aborted) {
         return;
       }
       const response = {
         result,
         jsonrpc: "2.0",
-        id: request.id
+        id: request2.id
       };
       if (relatedTaskId && this._taskMessageQueue) {
         await this._enqueueTaskMessage(relatedTaskId, {
@@ -35327,7 +35952,7 @@ var Protocol = class {
       }
       const errorResponse = {
         jsonrpc: "2.0",
-        id: request.id,
+        id: request2.id,
         error: {
           code: Number.isSafeInteger(error62["code"]) ? error62["code"] : ErrorCode.InternalError,
           message: error62.message ?? "Internal error",
@@ -35344,8 +35969,8 @@ var Protocol = class {
         await capturedTransport?.send(errorResponse);
       }
     }).catch((error62) => this._onerror(new Error(`Failed to send response: ${error62}`))).finally(() => {
-      if (this._requestHandlerAbortControllers.get(request.id) === abortController) {
-        this._requestHandlerAbortControllers.delete(request.id);
+      if (this._requestHandlerAbortControllers.get(request2.id) === abortController) {
+        this._requestHandlerAbortControllers.delete(request2.id);
       }
     });
   }
@@ -35449,11 +36074,11 @@ var Protocol = class {
    *
    * @experimental Use `client.experimental.tasks.requestStream()` to access this method.
    */
-  async *requestStream(request, resultSchema, options) {
+  async *requestStream(request2, resultSchema, options) {
     const { task } = options ?? {};
     if (!task) {
       try {
-        const result = await this.request(request, resultSchema, options);
+        const result = await this.request(request2, resultSchema, options);
         yield { type: "result", result };
       } catch (error62) {
         yield {
@@ -35465,7 +36090,7 @@ var Protocol = class {
     }
     let taskId;
     try {
-      const createResult = await this.request(request, CreateTaskResultSchema, options);
+      const createResult = await this.request(request2, CreateTaskResultSchema, options);
       if (createResult.task) {
         taskId = createResult.task.taskId;
         yield { type: "taskCreated", task: createResult.task };
@@ -35513,7 +36138,7 @@ var Protocol = class {
    *
    * Do not use this method to emit notifications! Use notification() instead.
    */
-  request(request, resultSchema, options) {
+  request(request2, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
     return new Promise((resolve2, reject) => {
       const earlyReject = (error62) => {
@@ -35525,9 +36150,9 @@ var Protocol = class {
       }
       if (this._options?.enforceStrictCapabilities === true) {
         try {
-          this.assertCapabilityForMethod(request.method);
+          this.assertCapabilityForMethod(request2.method);
           if (task) {
-            this.assertTaskCapability(request.method);
+            this.assertTaskCapability(request2.method);
           }
         } catch (e) {
           earlyReject(e);
@@ -35537,16 +36162,16 @@ var Protocol = class {
       options?.signal?.throwIfAborted();
       const messageId = this._requestMessageId++;
       const jsonrpcRequest = {
-        ...request,
+        ...request2,
         jsonrpc: "2.0",
         id: messageId
       };
       if (options?.onprogress) {
         this._progressHandlers.set(messageId, options.onprogress);
         jsonrpcRequest.params = {
-          ...request.params,
+          ...request2.params,
           _meta: {
-            ...request.params?._meta || {},
+            ...request2.params?._meta || {},
             progressToken: messageId
           }
         };
@@ -35750,8 +36375,8 @@ var Protocol = class {
   setRequestHandler(requestSchema, handler) {
     const method = getMethodLiteral(requestSchema);
     this.assertRequestHandlerCapability(method);
-    this._requestHandlers.set(method, (request, extra) => {
-      const parsed = parseWithCompat(requestSchema, request);
+    this._requestHandlers.set(method, (request2, extra) => {
+      const parsed = parseWithCompat(requestSchema, request2);
       return Promise.resolve(handler(parsed, extra));
     });
   }
@@ -35866,19 +36491,19 @@ var Protocol = class {
       }, { once: true });
     });
   }
-  requestTaskStore(request, sessionId) {
+  requestTaskStore(request2, sessionId) {
     const taskStore = this._taskStore;
     if (!taskStore) {
       throw new Error("No task store configured");
     }
     return {
       createTask: async (taskParams) => {
-        if (!request) {
+        if (!request2) {
           throw new Error("No request provided");
         }
-        return await taskStore.createTask(taskParams, request.id, {
-          method: request.method,
-          params: request.params
+        return await taskStore.createTask(taskParams, request2.id, {
+          method: request2.method,
+          params: request2.params
         }, sessionId);
       },
       getTask: async (taskId) => {
@@ -36039,8 +36664,8 @@ var ExperimentalServerTasks = class {
    *
    * @experimental
    */
-  requestStream(request, resultSchema, options) {
-    return this._server.requestStream(request, resultSchema, options);
+  requestStream(request2, resultSchema, options) {
+    return this._server.requestStream(request2, resultSchema, options);
   }
   /**
    * Sends a sampling request and returns an AsyncGenerator that yields response messages.
@@ -36285,12 +36910,12 @@ var Server = class extends Protocol {
     this._capabilities = options?.capabilities ?? {};
     this._instructions = options?.instructions;
     this._jsonSchemaValidator = options?.jsonSchemaValidator ?? new AjvJsonSchemaValidator();
-    this.setRequestHandler(InitializeRequestSchema, (request) => this._oninitialize(request));
+    this.setRequestHandler(InitializeRequestSchema, (request2) => this._oninitialize(request2));
     this.setNotificationHandler(InitializedNotificationSchema, () => this.oninitialized?.());
     if (this._capabilities.logging) {
-      this.setRequestHandler(SetLevelRequestSchema, async (request, extra) => {
+      this.setRequestHandler(SetLevelRequestSchema, async (request2, extra) => {
         const transportSessionId = extra.sessionId || extra.requestInfo?.headers["mcp-session-id"] || void 0;
-        const { level } = request.params;
+        const { level } = request2.params;
         const parseResult = LoggingLevelSchema.safeParse(level);
         if (parseResult.success) {
           this._loggingLevels.set(transportSessionId, parseResult.data);
@@ -36340,14 +36965,14 @@ var Server = class extends Protocol {
     }
     const method = methodValue;
     if (method === "tools/call") {
-      const wrappedHandler = async (request, extra) => {
-        const validatedRequest = safeParse3(CallToolRequestSchema, request);
+      const wrappedHandler = async (request2, extra) => {
+        const validatedRequest = safeParse3(CallToolRequestSchema, request2);
         if (!validatedRequest.success) {
           const errorMessage = validatedRequest.error instanceof Error ? validatedRequest.error.message : String(validatedRequest.error);
           throw new McpError(ErrorCode.InvalidParams, `Invalid tools/call request: ${errorMessage}`);
         }
         const { params } = validatedRequest.data;
-        const result = await Promise.resolve(handler(request, extra));
+        const result = await Promise.resolve(handler(request2, extra));
         if (params.task) {
           const taskValidationResult = safeParse3(CreateTaskResultSchema, result);
           if (!taskValidationResult.success) {
@@ -36478,10 +37103,10 @@ var Server = class extends Protocol {
     }
     assertToolsCallTaskCapability(this._capabilities.tasks?.requests, method, "Server");
   }
-  async _oninitialize(request) {
-    const requestedVersion = request.params.protocolVersion;
-    this._clientCapabilities = request.params.capabilities;
-    this._clientVersion = request.params.clientInfo;
+  async _oninitialize(request2) {
+    const requestedVersion = request2.params.protocolVersion;
+    this._clientCapabilities = request2.params.capabilities;
+    this._clientVersion = request2.params.clientInfo;
     const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(requestedVersion) ? requestedVersion : LATEST_PROTOCOL_VERSION;
     return {
       protocolVersion,
@@ -36808,33 +37433,33 @@ var McpServer = class {
         return toolDefinition;
       })
     }));
-    this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    this.server.setRequestHandler(CallToolRequestSchema, async (request2, extra) => {
       try {
-        const tool = this._registeredTools[request.params.name];
+        const tool = this._registeredTools[request2.params.name];
         if (!tool) {
-          throw new McpError(ErrorCode.InvalidParams, `Tool ${request.params.name} not found`);
+          throw new McpError(ErrorCode.InvalidParams, `Tool ${request2.params.name} not found`);
         }
         if (!tool.enabled) {
-          throw new McpError(ErrorCode.InvalidParams, `Tool ${request.params.name} disabled`);
+          throw new McpError(ErrorCode.InvalidParams, `Tool ${request2.params.name} disabled`);
         }
-        const isTaskRequest = !!request.params.task;
+        const isTaskRequest = !!request2.params.task;
         const taskSupport = tool.execution?.taskSupport;
         const isTaskHandler = "createTask" in tool.handler;
         if ((taskSupport === "required" || taskSupport === "optional") && !isTaskHandler) {
-          throw new McpError(ErrorCode.InternalError, `Tool ${request.params.name} has taskSupport '${taskSupport}' but was not registered with registerToolTask`);
+          throw new McpError(ErrorCode.InternalError, `Tool ${request2.params.name} has taskSupport '${taskSupport}' but was not registered with registerToolTask`);
         }
         if (taskSupport === "required" && !isTaskRequest) {
-          throw new McpError(ErrorCode.MethodNotFound, `Tool ${request.params.name} requires task augmentation (taskSupport: 'required')`);
+          throw new McpError(ErrorCode.MethodNotFound, `Tool ${request2.params.name} requires task augmentation (taskSupport: 'required')`);
         }
         if (taskSupport === "optional" && !isTaskRequest && isTaskHandler) {
-          return await this.handleAutomaticTaskPolling(tool, request, extra);
+          return await this.handleAutomaticTaskPolling(tool, request2, extra);
         }
-        const args = await this.validateToolInput(tool, request.params.arguments, request.params.name);
+        const args = await this.validateToolInput(tool, request2.params.arguments, request2.params.name);
         const result = await this.executeToolHandler(tool, args, extra);
         if (isTaskRequest) {
           return result;
         }
-        await this.validateToolOutput(tool, result, request.params.name);
+        await this.validateToolOutput(tool, result, request2.params.name);
         return result;
       } catch (error62) {
         if (error62 instanceof McpError) {
@@ -36935,11 +37560,11 @@ var McpServer = class {
   /**
    * Handles automatic task polling for tools with taskSupport 'optional'.
    */
-  async handleAutomaticTaskPolling(tool, request, extra) {
+  async handleAutomaticTaskPolling(tool, request2, extra) {
     if (!extra.taskStore) {
       throw new Error("No task store provided for task-capable tool.");
     }
-    const args = await this.validateToolInput(tool, request.params.arguments, request.params.name);
+    const args = await this.validateToolInput(tool, request2.params.arguments, request2.params.name);
     const handler = tool.handler;
     const taskExtra = { ...extra, taskStore: extra.taskStore };
     const createTaskResult = args ? await Promise.resolve(handler.createTask(args, taskExtra)) : (
@@ -36967,21 +37592,21 @@ var McpServer = class {
     this.server.registerCapabilities({
       completions: {}
     });
-    this.server.setRequestHandler(CompleteRequestSchema, async (request) => {
-      switch (request.params.ref.type) {
+    this.server.setRequestHandler(CompleteRequestSchema, async (request2) => {
+      switch (request2.params.ref.type) {
         case "ref/prompt":
-          assertCompleteRequestPrompt(request);
-          return this.handlePromptCompletion(request, request.params.ref);
+          assertCompleteRequestPrompt(request2);
+          return this.handlePromptCompletion(request2, request2.params.ref);
         case "ref/resource":
-          assertCompleteRequestResourceTemplate(request);
-          return this.handleResourceCompletion(request, request.params.ref);
+          assertCompleteRequestResourceTemplate(request2);
+          return this.handleResourceCompletion(request2, request2.params.ref);
         default:
-          throw new McpError(ErrorCode.InvalidParams, `Invalid completion reference: ${request.params.ref}`);
+          throw new McpError(ErrorCode.InvalidParams, `Invalid completion reference: ${request2.params.ref}`);
       }
     });
     this._completionHandlerInitialized = true;
   }
-  async handlePromptCompletion(request, ref) {
+  async handlePromptCompletion(request2, ref) {
     const prompt = this._registeredPrompts[ref.name];
     if (!prompt) {
       throw new McpError(ErrorCode.InvalidParams, `Prompt ${ref.name} not found`);
@@ -36993,7 +37618,7 @@ var McpServer = class {
       return EMPTY_COMPLETION_RESULT;
     }
     const promptShape = getObjectShape(prompt.argsSchema);
-    const field = promptShape?.[request.params.argument.name];
+    const field = promptShape?.[request2.params.argument.name];
     if (!isCompletable(field)) {
       return EMPTY_COMPLETION_RESULT;
     }
@@ -37001,22 +37626,22 @@ var McpServer = class {
     if (!completer) {
       return EMPTY_COMPLETION_RESULT;
     }
-    const suggestions = await completer(request.params.argument.value, request.params.context);
+    const suggestions = await completer(request2.params.argument.value, request2.params.context);
     return createCompletionResult(suggestions);
   }
-  async handleResourceCompletion(request, ref) {
+  async handleResourceCompletion(request2, ref) {
     const template = Object.values(this._registeredResourceTemplates).find((t) => t.resourceTemplate.uriTemplate.toString() === ref.uri);
     if (!template) {
       if (this._registeredResources[ref.uri]) {
         return EMPTY_COMPLETION_RESULT;
       }
-      throw new McpError(ErrorCode.InvalidParams, `Resource template ${request.params.ref.uri} not found`);
+      throw new McpError(ErrorCode.InvalidParams, `Resource template ${request2.params.ref.uri} not found`);
     }
-    const completer = template.resourceTemplate.completeCallback(request.params.argument.name);
+    const completer = template.resourceTemplate.completeCallback(request2.params.argument.name);
     if (!completer) {
       return EMPTY_COMPLETION_RESULT;
     }
-    const suggestions = await completer(request.params.argument.value, request.params.context);
+    const suggestions = await completer(request2.params.argument.value, request2.params.context);
     return createCompletionResult(suggestions);
   }
   setResourceRequestHandlers() {
@@ -37031,7 +37656,7 @@ var McpServer = class {
         listChanged: true
       }
     });
-    this.server.setRequestHandler(ListResourcesRequestSchema, async (request, extra) => {
+    this.server.setRequestHandler(ListResourcesRequestSchema, async (request2, extra) => {
       const resources = Object.entries(this._registeredResources).filter(([_, resource]) => resource.enabled).map(([uri, resource]) => ({
         uri,
         name: resource.name,
@@ -37061,8 +37686,8 @@ var McpServer = class {
       }));
       return { resourceTemplates };
     });
-    this.server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
-      const uri = new URL(request.params.uri);
+    this.server.setRequestHandler(ReadResourceRequestSchema, async (request2, extra) => {
+      const uri = new URL(request2.params.uri);
       const resource = this._registeredResources[uri.toString()];
       if (resource) {
         if (!resource.enabled) {
@@ -37101,21 +37726,21 @@ var McpServer = class {
         };
       })
     }));
-    this.server.setRequestHandler(GetPromptRequestSchema, async (request, extra) => {
-      const prompt = this._registeredPrompts[request.params.name];
+    this.server.setRequestHandler(GetPromptRequestSchema, async (request2, extra) => {
+      const prompt = this._registeredPrompts[request2.params.name];
       if (!prompt) {
-        throw new McpError(ErrorCode.InvalidParams, `Prompt ${request.params.name} not found`);
+        throw new McpError(ErrorCode.InvalidParams, `Prompt ${request2.params.name} not found`);
       }
       if (!prompt.enabled) {
-        throw new McpError(ErrorCode.InvalidParams, `Prompt ${request.params.name} disabled`);
+        throw new McpError(ErrorCode.InvalidParams, `Prompt ${request2.params.name} disabled`);
       }
       if (prompt.argsSchema) {
         const argsObj = normalizeObjectSchema(prompt.argsSchema);
-        const parseResult = await safeParseAsync3(argsObj, request.params.arguments);
+        const parseResult = await safeParseAsync3(argsObj, request2.params.arguments);
         if (!parseResult.success) {
           const error62 = "error" in parseResult ? parseResult.error : "Unknown error";
           const errorMessage = getParseErrorMessage(error62);
-          throw new McpError(ErrorCode.InvalidParams, `Invalid arguments for prompt ${request.params.name}: ${errorMessage}`);
+          throw new McpError(ErrorCode.InvalidParams, `Invalid arguments for prompt ${request2.params.name}: ${errorMessage}`);
         }
         const args = parseResult.data;
         const cb = prompt.callback;
@@ -37690,10 +38315,10 @@ async function run(model, input2, config2, signal) {
   for (const [id, question] of Object.entries(input2.questions)) {
     questions[id] = toQuestion(question);
   }
-  const request = { state: toState(input2.state), questions };
-  if (input2.model !== void 0) request.model = input2.model;
-  if (signal !== void 0) request.signal = signal;
-  const result = await model.evaluate(request);
+  const request2 = { state: toState(input2.state), questions };
+  if (input2.model !== void 0) request2.model = input2.model;
+  if (signal !== void 0) request2.signal = signal;
+  const result = await model.evaluate(request2);
   const answers = {};
   for (const [id, answer] of Object.entries(result.answers)) {
     answers[id] = augment(answer, thresholds);
@@ -37837,9 +38462,9 @@ async function runGateAction(model, input2, config2, signal) {
   const thresholds = resolveThresholds(config2.thresholds, input2.thresholds);
   const state = { action: input2.action, user_request: input2.user_request };
   if (input2.context !== void 0) state.context = input2.context;
-  const request = { state, questions: QUESTIONS };
-  if (signal !== void 0) request.signal = signal;
-  const result = await model.evaluate(request);
+  const request2 = { state, questions: QUESTIONS };
+  if (signal !== void 0) request2.signal = signal;
+  const result = await model.evaluate(request2);
   const answers = result.answers;
   const signals = {
     destructive: noul(answers.destructive),
@@ -37869,7 +38494,8 @@ async function runGateAction(model, input2, config2, signal) {
     thresholds,
     model: result.model,
     usage: result.usage,
-    latency_ms: result.latency_ms
+    latency_ms: result.latency_ms,
+    ...result.memo === true ? { memo: true } : {}
   };
 }
 function noul(answer) {
@@ -38094,9 +38720,9 @@ async function run4(model, input2, config2, signal) {
     last_step: input2.last_step,
     result: input2.result
   };
-  const request = { state, questions: QUESTIONS2 };
-  if (signal !== void 0) request.signal = signal;
-  const result = await model.evaluate(request);
+  const request2 = { state, questions: QUESTIONS2 };
+  if (signal !== void 0) request2.signal = signal;
+  const result = await model.evaluate(request2);
   const answers = result.answers;
   const choiceAnswer = answers.next;
   const choice = {
@@ -38251,8 +38877,8 @@ function chunkCandidates(query, entries, extra, limits = DEFAULT_BUDGET_LIMITS, 
       );
     }
     const attempt = [...current, entry];
-    const request = buildRequest(query, attempt, extra);
-    if (fitsBudget(request.state, request.questions, limits)) {
+    const request2 = buildRequest(query, attempt, extra);
+    if (fitsBudget(request2.state, request2.questions, limits)) {
       current = attempt;
     } else {
       chunks.push(current);
@@ -38329,9 +38955,9 @@ async function run5(model, input2, config2, signal) {
   const started = Date.now();
   const results = await mapWithConcurrency(chunks, concurrency, async (chunk) => {
     const { state, questions } = buildRequest(input2.query, chunk, input2.instructions);
-    const request = { state, questions };
-    if (signal !== void 0) request.signal = signal;
-    const result = await model.evaluate(request);
+    const request2 = { state, questions };
+    if (signal !== void 0) request2.signal = signal;
+    const result = await model.evaluate(request2);
     return { chunk, result };
   });
   const scored = [];
@@ -38555,20 +39181,20 @@ function readEvidenceFile(input2, options) {
   if (resolution.kind === "not_found") {
     throw new FileSelectionError("not_found", `${named} is not a readable file under ${root}.`);
   }
-  const read = readTextFile(resolution.absolute, options.maxFileBytes);
-  if (read.kind === "binary") {
+  const read2 = readTextFile(resolution.absolute, options.maxFileBytes);
+  if (read2.kind === "binary") {
     throw new FileSelectionError("nothing_readable", `${resolution.relative} looks like a binary file.`);
   }
-  if (read.kind === "too_large") {
+  if (read2.kind === "too_large") {
     throw new FileSelectionError(
       "nothing_readable",
       `${resolution.relative} is over the size limit for one call. Use \`start_line\`/\`end_line\` to name a window.`
     );
   }
-  if (read.kind === "not_found") {
+  if (read2.kind === "not_found") {
     throw new FileSelectionError("not_found", `${resolution.relative} could not be read.`);
   }
-  const lines = read.text.split("\n");
+  const lines = read2.text.split("\n");
   const first = Math.min(input2.start_line ?? 1, lines.length);
   const last = Math.min(input2.end_line ?? lines.length, lines.length);
   if (last < first) {
@@ -38611,9 +39237,9 @@ async function run6(model, input2, config2, signal) {
   const started = Date.now();
   const results = await mapWithConcurrency(pieces, config2.maxConcurrency, async (piece) => {
     const state = { evidence: piece.text, claims: [...input2.claims] };
-    const request = { state, questions };
-    if (signal !== void 0) request.signal = signal;
-    const result = await model.evaluate(request);
+    const request2 = { state, questions };
+    if (signal !== void 0) request2.signal = signal;
+    const result = await model.evaluate(request2);
     return { piece, result };
   });
   const reportWhere = fromFile || pieces.length > 1;
@@ -38657,7 +39283,7 @@ function normalizeVerdict(choice) {
 
 // src/server.ts
 var SERVER_NAME = "jev-mcp";
-var SERVER_VERSION = "0.3.0";
+var SERVER_VERSION = "0.4.0";
 var ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 function ok(output2) {
   return {
@@ -38776,6 +39402,8 @@ async function main() {
   const server = createServer(model, config2);
   await server.connect(new StdioServerTransport());
   log(`v${SERVER_VERSION} ready on stdio (model ${config2.model}, base ${config2.baseUrl}).`);
+  const watchdog = startDaemonWatchdog();
+  if (watchdog !== void 0) log("watching the hook daemon every 10 s (JEV_PLUGIN_DAEMON=1).");
 }
 main().catch((error62) => {
   log(`fatal: ${error62 instanceof Error ? error62.message : String(error62)}`);

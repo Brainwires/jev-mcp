@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Answer } from "../../src/decision/types.js";
 import { MAX_NOTES_PER_PROMPT } from "../../src/hooks/advisory.js";
 import { handlePreToolUse } from "../../src/hooks/handlers/pre-tool-use.js";
+import { MemoizedModel } from "../../src/hooks/memo.js";
 import { fingerprint, tripIdOf, TRIP_TTL_MS } from "../../src/hooks/tripwire.js";
 import type { HookInput } from "../../src/hooks/types.js";
 import { FakeModel, noul, score } from "../helpers/fake-model.js";
@@ -554,5 +555,48 @@ describe("the flow around the table", () => {
     const deps = rig({ model: new FakeModel(CREDENTIAL), config: { gate: "strict" } });
     await handlePreToolUse(input(), deps);
     expect(deps.store.readLog().at(-1)?.policy).toMatchObject({ uncertain: "confirm", lenient_scope: false });
+  });
+});
+
+/**
+ * A cached judgment must never be logged as a real call.
+ *
+ * The daemon's memo is the only thing in the plugin that can produce a 0 ms,
+ * 0-token answer, and `/jev:status` reports latency percentiles and token spend
+ * off this log. A hit that lost its `memo` flag on the way through the gate
+ * would show up as an implausibly fast real call and quietly flatter both.
+ */
+describe("a memo hit in the decision log", () => {
+  it("is recorded as memo, with its zeroes labelled", async () => {
+    const answers = {
+      destructive: noul(0.99),
+      outward_facing: noul(0.02),
+      in_scope: noul(0.3),
+      credential_exposure: noul(0.01),
+      blast_radius: score(1, ["one file", "a directory", "a project", "a system"], 0.9),
+    };
+    const memo = new MemoizedModel(new FakeModel(() => answers));
+    const deps = makeDeps(dir, { model: memo });
+    deps.store.updateSession("s1", (s) => ({ ...s, prompts: ["clean up"] }));
+
+    const input = {
+      session_id: "s1",
+      cwd: "/home/dev/project",
+      permission_mode: "default" as const,
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "npm install" },
+    };
+    await handlePreToolUse(input, deps);
+    await handlePreToolUse(input, deps);
+
+    const judged = deps.store.readLog().filter((r) => r.model !== undefined);
+    expect(judged).toHaveLength(2);
+    expect(judged[0]?.memo).toBeUndefined();
+    expect(judged[0]?.latency_ms).toBeGreaterThan(0);
+    expect(judged[1]?.memo).toBe(true);
+    expect(judged[1]?.latency_ms).toBe(0);
+    expect(judged[1]?.input_tokens).toBe(0);
+    expect(memo.stats()).toMatchObject({ hits: 1, misses: 1 });
   });
 });

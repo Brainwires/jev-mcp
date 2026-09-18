@@ -25,7 +25,7 @@ import { gateOutcome, bands, NOTE_DEDUPE_TTL_MS } from "../advisory.js";
 import { runGateAction } from "../../tools/gate-action-core.js";
 import { prefilter } from "../prefilter.js";
 import { compactJson, redactAndClamp } from "../redact.js";
-import { requestText } from "../store.js";
+import { modelCost, requestText } from "../store.js";
 import type { DecisionRecord } from "../store.js";
 import { fingerprint, tripIdOf, MAX_REASON_CHARS, type Trip } from "../tripwire.js";
 import {
@@ -265,9 +265,7 @@ export async function handlePreToolUse(input: HookInput, deps: Deps): Promise<Ho
         corroborate_uncertain: policyOptions.corroborateUncertain,
       },
       reasons: result.reasons,
-      model: result.model,
-      latency_ms: result.latency_ms,
-      input_tokens: result.usage.input_tokens,
+      ...modelCost(result),
     };
     if (input.tool_use_id !== undefined) record.tool_use_id = input.tool_use_id;
 

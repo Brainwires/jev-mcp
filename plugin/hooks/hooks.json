@@ -1,5 +1,5 @@
 {
-  "description": "jev: advisory judgments at the harness boundaries, addressed to Claude rather than to you. A hook can hand Claude a note about a call that already ran, or deny a call once with a reason Claude can answer by re-issuing it with `# jev:intended <why>`. None of them can emit permissionDecision \"allow\", and none of them prompts you unless you set ask_on_trip. Every hook exits 0 with empty stdout on any error. Set JEV_HOOKS_DISABLE=1 to turn all of them off, or gate=off for the tool gate alone.",
+  "description": "jev: advisory judgments at the harness boundaries, addressed to Claude rather than to you. A hook can hand Claude a note about a call that already ran, or deny a call once with a reason Claude can answer by re-issuing it with `# jev:intended <why>`. None of them can emit permissionDecision \"allow\", and none of them prompts you unless you set ask_on_trip. Since 0.4.0 the hot-path hooks are `type: \"http\"` posts to a loopback daemon on 127.0.0.1:10522 that SessionStart starts; when it is not there they fail open in silence, which is what Claude Code does with a refused connection. Every command hook exits 0 with empty stdout on any error. Set JEV_HOOKS_DISABLE=1 to turn all of them off, gate=off for the tool gate alone, or JEV_DAEMON_DISABLE=1 to stop SessionStart starting a daemon.",
   "hooks": {
     "SessionStart": [
       {
@@ -17,10 +17,21 @@
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/hook.mjs\" UserPromptSubmit",
+            "type": "http",
+            "url": "http://127.0.0.1:10522/v1/hook/UserPromptSubmit",
             "timeout": 5,
-            "statusMessage": "jev: reading the request"
+            "statusMessage": "jev: reading the request",
+            "headers": {
+              "Authorization": "Bearer $CLAUDE_PLUGIN_OPTION_API_KEY",
+              "X-Jev-Env-Key": "$TYPESAFE_API_KEY",
+              "X-Jev-Protocol": "1"
+            },
+            "allowedEnvVars": ["CLAUDE_PLUGIN_OPTION_API_KEY", "TYPESAFE_API_KEY"]
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/hook.mjs\" UserPromptSubmit --fallback",
+            "timeout": 5
           }
         ]
       }
@@ -30,10 +41,16 @@
         "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|mcp__.*",
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/hook.mjs\" PreToolUse",
+            "type": "http",
+            "url": "http://127.0.0.1:10522/v1/hook/PreToolUse",
             "timeout": 5,
-            "statusMessage": "jev: checking this action"
+            "statusMessage": "jev: checking this action",
+            "headers": {
+              "Authorization": "Bearer $CLAUDE_PLUGIN_OPTION_API_KEY",
+              "X-Jev-Env-Key": "$TYPESAFE_API_KEY",
+              "X-Jev-Protocol": "1"
+            },
+            "allowedEnvVars": ["CLAUDE_PLUGIN_OPTION_API_KEY", "TYPESAFE_API_KEY"]
           }
         ]
       }
@@ -43,10 +60,16 @@
         "matcher": "WebFetch|WebSearch|mcp__.*",
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/hook.mjs\" PostToolUse",
+            "type": "http",
+            "url": "http://127.0.0.1:10522/v1/hook/PostToolUse",
             "timeout": 5,
-            "statusMessage": "jev: screening this result"
+            "statusMessage": "jev: screening this result",
+            "headers": {
+              "Authorization": "Bearer $CLAUDE_PLUGIN_OPTION_API_KEY",
+              "X-Jev-Env-Key": "$TYPESAFE_API_KEY",
+              "X-Jev-Protocol": "1"
+            },
+            "allowedEnvVars": ["CLAUDE_PLUGIN_OPTION_API_KEY", "TYPESAFE_API_KEY"]
           }
         ]
       },
@@ -54,10 +77,15 @@
         "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/hook.mjs\" Approval",
+            "type": "http",
+            "url": "http://127.0.0.1:10522/v1/hook/Approval",
             "timeout": 5,
-            "async": true
+            "headers": {
+              "Authorization": "Bearer $CLAUDE_PLUGIN_OPTION_API_KEY",
+              "X-Jev-Env-Key": "$TYPESAFE_API_KEY",
+              "X-Jev-Protocol": "1"
+            },
+            "allowedEnvVars": ["CLAUDE_PLUGIN_OPTION_API_KEY", "TYPESAFE_API_KEY"]
           }
         ]
       }
@@ -67,10 +95,15 @@
         "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|mcp__.*",
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/hook.mjs\" Approval",
+            "type": "http",
+            "url": "http://127.0.0.1:10522/v1/hook/Approval",
             "timeout": 5,
-            "async": true
+            "headers": {
+              "Authorization": "Bearer $CLAUDE_PLUGIN_OPTION_API_KEY",
+              "X-Jev-Env-Key": "$TYPESAFE_API_KEY",
+              "X-Jev-Protocol": "1"
+            },
+            "allowedEnvVars": ["CLAUDE_PLUGIN_OPTION_API_KEY", "TYPESAFE_API_KEY"]
           }
         ]
       }
@@ -79,10 +112,33 @@
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/hook.mjs\" Stop",
+            "type": "http",
+            "url": "http://127.0.0.1:10522/v1/hook/Stop",
             "timeout": 5,
-            "statusMessage": "jev: checking the final message"
+            "statusMessage": "jev: checking the final message",
+            "headers": {
+              "Authorization": "Bearer $CLAUDE_PLUGIN_OPTION_API_KEY",
+              "X-Jev-Env-Key": "$TYPESAFE_API_KEY",
+              "X-Jev-Protocol": "1"
+            },
+            "allowedEnvVars": ["CLAUDE_PLUGIN_OPTION_API_KEY", "TYPESAFE_API_KEY"]
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:10522/v1/hook/SessionEnd",
+            "timeout": 2,
+            "headers": {
+              "Authorization": "Bearer $CLAUDE_PLUGIN_OPTION_API_KEY",
+              "X-Jev-Env-Key": "$TYPESAFE_API_KEY",
+              "X-Jev-Protocol": "1"
+            },
+            "allowedEnvVars": ["CLAUDE_PLUGIN_OPTION_API_KEY", "TYPESAFE_API_KEY"]
           }
         ]
       }

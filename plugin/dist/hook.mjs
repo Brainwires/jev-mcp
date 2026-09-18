@@ -180,9 +180,9 @@ function computeBackoffMs(attempt, random = Math.random) {
   const ceiling = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt);
   return Math.round(ceiling * (0.5 + 0.5 * random()));
 }
-function parseRetryAfter(header, now = Date.now()) {
-  if (header === null) return null;
-  const trimmed = header.trim();
+function parseRetryAfter(header2, now = Date.now()) {
+  if (header2 === null) return null;
+  const trimmed = header2.trim();
   if (trimmed === "") return null;
   if (/^\d+(\.\d+)?$/.test(trimmed)) {
     const ms = Number(trimmed) * 1e3;
@@ -220,16 +220,16 @@ var JevDecisionModel = class {
       throw new JevError("No fetch implementation available. Node 20+ or an injected `fetch` is required.");
     }
   }
-  async evaluate(request) {
-    const questions = request.questions;
+  async evaluate(request2) {
+    const questions = request2.questions;
     validateQuestions(questions);
-    checkBudget(request.state, questions, this.budgetLimits);
-    const model = request.model ?? this.name;
+    checkBudget(request2.state, questions, this.budgetLimits);
+    const model = request2.model ?? this.name;
     const started = Date.now();
     const body = await this.send(
       "/v1/systemone",
-      { state: request.state, model, questions },
-      request.signal
+      { state: request2.state, model, questions },
+      request2.signal
     );
     const latency_ms = Date.now() - started;
     const parsed = this.parseEvaluateResponse(body, questions);
@@ -456,6 +456,19 @@ function isRetryableStatus(status) {
 // src/hooks/config.ts
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+// src/hooks/daemon/protocol.ts
+var DEFAULT_PORT = 10522;
+var PROTOCOL = 1;
+var MAX_BODY_BYTES = 4 * 1024 * 1024;
+var DEFAULT_IDLE_MS = 30 * 60 * 1e3;
+var LAST_SESSION_GRACE_MS = 60 * 1e3;
+var HEARTBEAT_MS = 15 * 1e3;
+var LOCK_STALE_MS = 30 * 1e3;
+var PROBE_TIMEOUT_MS = 300;
+var WAIT_MS = 2e3;
+
+// src/hooks/config.ts
 var GATE_LEVELS = ["off", "advisory", "strict"];
 var GATE_MODE_MIGRATION = {
   off: "off",
@@ -473,7 +486,9 @@ var HOOK_DEFAULTS = {
   screenResults: true,
   routePrompts: false,
   autoThreshold: 0.85,
-  reviewThreshold: 0.6
+  reviewThreshold: 0.6,
+  daemonPort: DEFAULT_PORT,
+  daemonIdleMs: DEFAULT_IDLE_MS
 };
 function read(env, option, ...fallbacks) {
   for (const key of [`CLAUDE_PLUGIN_OPTION_${option.toUpperCase()}`, ...fallbacks]) {
@@ -571,28 +586,630 @@ function loadHookConfig(env = process.env) {
     routePrompts: readBool(env, "route_prompts", HOOK_DEFAULTS.routePrompts, warnings, "JEV_ROUTE_PROMPTS"),
     autoThreshold: auto,
     reviewThreshold: Math.min(review, auto),
+    // Port 0 is allowed and means "ask the OS": the tests use it so they never
+    // touch the real port, and nothing in a normal install sets it.
+    daemonPort: readNumber(env, "daemon_port", HOOK_DEFAULTS.daemonPort, 0, 65535, warnings, "JEV_DAEMON_PORT"),
+    daemonIdleMs: readNumber(
+      env,
+      "daemon_idle_ms",
+      HOOK_DEFAULTS.daemonIdleMs,
+      1e3,
+      24 * 60 * 60 * 1e3,
+      warnings,
+      "JEV_DAEMON_IDLE_MS"
+    ),
     dataDir: resolveDataDir(env),
     disabled: readBool(env, "hooks_disable", false, warnings, "JEV_HOOKS_DISABLE"),
     warnings
   };
 }
 
+// src/hooks/daemon/control.ts
+import { spawn } from "node:child_process";
+import { closeSync as closeSync2 } from "node:fs";
+import { connect } from "node:net";
+import { request } from "node:http";
+
+// src/hooks/daemon/state-file.ts
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { statSync } from "node:fs";
+import { join as join2 } from "node:path";
+function emptyCounters() {
+  return {
+    hooks: {},
+    sessions_started: 0,
+    sessions_ended: 0,
+    jev_calls: 0,
+    jev_timeouts: 0,
+    jev_errors: 0,
+    memo_hits: 0,
+    unauthorized: 0,
+    protocol_mismatch: 0,
+    unknown_event: 0,
+    bad_request: 0,
+    oversize: 0,
+    deadline_overruns: 0,
+    errors: 0
+  };
+}
+function daemonStatePath(dataDir) {
+  return join2(dataDir, "daemon.json");
+}
+function daemonLockPath(dataDir) {
+  return join2(dataDir, "daemon.lock");
+}
+function daemonLogPath(dataDir) {
+  return join2(dataDir, "daemon.log");
+}
+function safe(fn, fallback) {
+  try {
+    return fn();
+  } catch {
+    return fallback;
+  }
+}
+function readCounters(raw) {
+  const base = emptyCounters();
+  if (typeof raw !== "object" || raw === null) return base;
+  const value = raw;
+  const hooks = {};
+  if (typeof value.hooks === "object" && value.hooks !== null) {
+    for (const [event, count] of Object.entries(value.hooks)) {
+      if (typeof count === "number" && Number.isFinite(count) && count >= 0) hooks[event] = Math.floor(count);
+    }
+  }
+  const counters = { ...base, hooks };
+  for (const key of Object.keys(base)) {
+    if (key === "hooks") continue;
+    const count = value[key];
+    if (typeof count === "number" && Number.isFinite(count) && count >= 0) {
+      counters[key] = Math.floor(count);
+    }
+  }
+  return counters;
+}
+function readDaemonState(dataDir) {
+  return safe(() => {
+    const parsed = JSON.parse(readFileSync(daemonStatePath(dataDir), "utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return void 0;
+    const value = parsed;
+    const pid = value.pid;
+    const port = value.port;
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1) return void 0;
+    if (typeof port !== "number" || !Number.isInteger(port) || port < 0 || port > 65535) return void 0;
+    const runState = value.state;
+    return {
+      pid,
+      port,
+      version: typeof value.version === "string" ? value.version : "unknown",
+      protocol: typeof value.protocol === "number" ? value.protocol : PROTOCOL,
+      bundle_path: typeof value.bundle_path === "string" ? value.bundle_path : "",
+      bundle_mtime: typeof value.bundle_mtime === "number" ? value.bundle_mtime : 0,
+      data_dir: typeof value.data_dir === "string" ? value.data_dir : dataDir,
+      started_at: typeof value.started_at === "number" ? value.started_at : 0,
+      updated_at: typeof value.updated_at === "number" ? value.updated_at : 0,
+      state: runState === "running" || runState === "stopped" || runState === "port-conflict" ? runState : "stopped",
+      counters: readCounters(value.counters),
+      restarts: typeof value.restarts === "number" && value.restarts >= 0 ? Math.floor(value.restarts) : 0
+    };
+  }, void 0);
+}
+function writeDaemonState(dataDir, state) {
+  safe(() => mkdirSync(dataDir, { recursive: true }), void 0);
+  safe(() => {
+    const temp = `${daemonStatePath(dataDir)}.${process.pid}.tmp`;
+    writeFileSync(temp, `${JSON.stringify(state)}
+`, "utf8");
+    renameSync(temp, daemonStatePath(dataDir));
+  }, void 0);
+}
+function markStopped(dataDir, runState = "stopped", now = Date.now()) {
+  const state = readDaemonState(dataDir);
+  if (state === void 0) return;
+  writeDaemonState(dataDir, { ...state, state: runState, updated_at: now });
+}
+function bundleIdentity(scriptPath = process.argv[1]) {
+  const path = scriptPath ?? "";
+  return { path, mtime: safe(() => Math.floor(statSync(path).mtimeMs), 0) };
+}
+function tryAcquireLock(dataDir, now, isAlive2, staleMs) {
+  safe(() => mkdirSync(dataDir, { recursive: true }), void 0);
+  const path = daemonLockPath(dataDir);
+  try {
+    const fd = openSync(path, "wx");
+    try {
+      writeFileSync(fd, `${process.pid} ${now}
+`, "utf8");
+    } finally {
+      closeSync(fd);
+    }
+    return true;
+  } catch {
+    const raw = safe(() => readFileSync(path, "utf8"), "");
+    const [pidText, tsText] = raw.trim().split(/\s+/);
+    const pid = Number(pidText);
+    const ts = Number(tsText);
+    const dead = !Number.isInteger(pid) || pid <= 1 || !isAlive2(pid);
+    const old = !Number.isFinite(ts) || now - ts > staleMs;
+    if (dead || old) {
+      safe(() => unlinkSync(path), void 0);
+      return safe(() => {
+        const fd = openSync(path, "wx");
+        try {
+          writeFileSync(fd, `${process.pid} ${now}
+`, "utf8");
+        } finally {
+          closeSync(fd);
+        }
+        return true;
+      }, false);
+    }
+    return false;
+  }
+}
+function releaseLock(dataDir) {
+  safe(() => unlinkSync(daemonLockPath(dataDir)), void 0);
+}
+function openLog(dataDir) {
+  safe(() => mkdirSync(dataDir, { recursive: true }), void 0);
+  return safe(() => openSync(daemonLogPath(dataDir), "w"), -1);
+}
+
+// src/hooks/version.ts
+var HOOK_VERSION = "0.4.0";
+
+// src/hooks/daemon/control.ts
+function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+function sleep(ms) {
+  return new Promise((resolve2) => {
+    setTimeout(resolve2, ms);
+  });
+}
+function probeHealth(port, timeoutMs = PROBE_TIMEOUT_MS) {
+  return new Promise((resolve2) => {
+    let settled = false;
+    const finish = (probe) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve2(probe);
+    };
+    const req = request(
+      { host: "127.0.0.1", port, path: "/v1/health", method: "GET", timeout: timeoutMs },
+      (res) => {
+        const chunks = [];
+        let size = 0;
+        res.on("data", (chunk) => {
+          size += chunk.byteLength;
+          if (size > 64 * 1024) {
+            res.destroy();
+            finish({ kind: "foreign" });
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on("end", () => {
+          if (res.statusCode !== 200) {
+            finish({ kind: "foreign" });
+            return;
+          }
+          try {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            if (typeof parsed === "object" && parsed !== null && parsed.jev === true && typeof parsed.pid === "number") {
+              finish({ kind: "jev", health: parsed });
+              return;
+            }
+          } catch {
+          }
+          finish({ kind: "foreign" });
+        });
+        res.on("error", () => finish({ kind: "foreign" }));
+      }
+    );
+    const timer = setTimeout(() => {
+      req.destroy();
+      finish({ kind: "silent" });
+    }, timeoutMs + 50);
+    req.on("timeout", () => {
+      req.destroy();
+      finish({ kind: "silent" });
+    });
+    req.on("error", (error) => {
+      finish(error.code === "ECONNREFUSED" || error.code === "ECONNRESET" ? { kind: "refused" } : { kind: "silent" });
+    });
+    req.end();
+  });
+}
+function portBusy(port, timeoutMs = 200) {
+  return new Promise((resolve2) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (busy) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve2(busy);
+    };
+    socket.setTimeout(timeoutMs, () => finish(true));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+async function waitForPortFree(port, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (!await portBusy(port, 100)) return true;
+    await sleep(50);
+  }
+  return !await portBusy(port, 100);
+}
+async function waitForHealth(port, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  for (; ; ) {
+    const probe = await probeHealth(port, PROBE_TIMEOUT_MS);
+    if (probe.kind === "jev") return probe.health;
+    if (Date.now() >= deadline) return void 0;
+    await sleep(50);
+  }
+}
+async function withLock(dataDir, fn, waitMs = WAIT_MS + 500) {
+  const deadline = Date.now() + waitMs;
+  for (; ; ) {
+    if (tryAcquireLock(dataDir, Date.now(), isAlive, LOCK_STALE_MS)) {
+      try {
+        return await fn();
+      } finally {
+        releaseLock(dataDir);
+      }
+    }
+    if (Date.now() >= deadline) return void 0;
+    await sleep(50);
+  }
+}
+async function spawnDaemon(options) {
+  const logFd = openLog(options.dataDir);
+  try {
+    const env = {};
+    for (const [key, value] of Object.entries(options.env)) {
+      if (value !== void 0) env[key] = value;
+    }
+    env.JEV_DAEMON_PORT = String(options.port);
+    env.CLAUDE_PLUGIN_DATA = options.dataDir;
+    const child = spawn(
+      options.nodePath ?? process.execPath,
+      [options.bundlePath, "daemon", "--port", String(options.port)],
+      {
+        detached: true,
+        stdio: ["ignore", logFd === -1 ? "ignore" : logFd, logFd === -1 ? "ignore" : logFd],
+        windowsHide: true,
+        env
+      }
+    );
+    child.on("error", () => void 0);
+    child.unref();
+  } catch {
+    return false;
+  } finally {
+    if (logFd !== -1) {
+      try {
+        closeSync2(logFd);
+      } catch {
+      }
+    }
+  }
+  const budget = options.waitMs ?? WAIT_MS;
+  if (options.port === 0) {
+    const deadline = Date.now() + budget;
+    while (Date.now() < deadline) {
+      const state = readDaemonState(options.dataDir);
+      if (state?.state === "running" && state.port > 0) return true;
+      await sleep(50);
+    }
+    return false;
+  }
+  return await waitForHealth(options.port, budget) !== void 0;
+}
+async function terminate(pid, port, budgetMs = WAIT_MS) {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+  }
+  if (await waitForPortFree(port, budgetMs)) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+  }
+  await waitForPortFree(port, 500);
+}
+async function waitForExit(pid, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  while (isAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await sleep(25);
+  }
+  return true;
+}
+function recordConflict(options, previous) {
+  const bundle = bundleIdentity(options.bundlePath);
+  const now = Date.now();
+  writeDaemonState(options.dataDir, {
+    pid: previous?.pid ?? process.pid,
+    port: options.port,
+    version: HOOK_VERSION,
+    protocol: PROTOCOL,
+    bundle_path: bundle.path,
+    bundle_mtime: bundle.mtime,
+    data_dir: options.dataDir,
+    started_at: previous?.started_at ?? now,
+    updated_at: now,
+    state: "port-conflict",
+    counters: previous?.counters ?? emptyCounters(),
+    restarts: previous?.restarts ?? 0
+  });
+}
+async function replaceDaemon(options) {
+  const probe = await probeHealth(options.port, PROBE_TIMEOUT_MS);
+  if (probe.kind === "foreign") {
+    recordConflict(options, readDaemonState(options.dataDir));
+    return "conflict";
+  }
+  const previous = readDaemonState(options.dataDir);
+  const pid = probe.kind === "jev" ? probe.health.pid : previous?.pid;
+  const budget = options.waitMs ?? WAIT_MS;
+  if (pid !== void 0 && pid !== process.pid && isAlive(pid)) {
+    await terminate(pid, options.port, budget);
+  }
+  const result = await withLock(
+    options.dataDir,
+    async () => await spawnDaemon(options) ? "replaced" : "failed",
+    budget + 500
+  );
+  return result ?? "failed";
+}
+async function ensureDaemon(options) {
+  try {
+    const budget = options.waitMs ?? WAIT_MS;
+    const mine = bundleIdentity(options.bundlePath);
+    const probe = await probeHealth(options.port, PROBE_TIMEOUT_MS);
+    if (probe.kind === "jev") {
+      const stale = probe.health.protocol !== PROTOCOL || mine.mtime > 0 && probe.health.bundle_mtime > 0 && probe.health.bundle_mtime < mine.mtime;
+      if (!stale) return "running";
+      return await replaceDaemon(options);
+    }
+    if (probe.kind === "foreign") {
+      recordConflict(options, readDaemonState(options.dataDir));
+      return "conflict";
+    }
+    const previous = readDaemonState(options.dataDir);
+    if (probe.kind === "silent") {
+      const pid = previous?.pid;
+      if (previous !== void 0 && previous.state === "running" && previous.port === options.port && pid !== void 0 && pid !== process.pid && isAlive(pid)) {
+        if ((await probeHealth(options.port, 1e3)).kind === "jev") return "running";
+        await terminate(pid, options.port, budget);
+        const result2 = await withLock(
+          options.dataDir,
+          async () => await spawnDaemon(options) ? "replaced" : "failed",
+          budget + 500
+        );
+        return result2 ?? "failed";
+      }
+      recordConflict(options, previous);
+      return "conflict";
+    }
+    const result = await withLock(
+      options.dataDir,
+      async () => {
+        const second = await probeHealth(options.port, PROBE_TIMEOUT_MS);
+        if (second.kind === "jev") {
+          const stale = second.health.protocol !== PROTOCOL || mine.mtime > 0 && second.health.bundle_mtime > 0 && second.health.bundle_mtime < mine.mtime;
+          return stale ? void 0 : "running";
+        }
+        if (second.kind === "foreign") {
+          recordConflict(options, previous);
+          return "conflict";
+        }
+        return await spawnDaemon(options) ? "started" : "failed";
+      },
+      budget + 500
+    );
+    if (result === void 0) {
+      const third = await probeHealth(options.port, PROBE_TIMEOUT_MS);
+      if (third.kind === "jev") {
+        const stale = third.health.protocol !== PROTOCOL || mine.mtime > 0 && third.health.bundle_mtime > 0 && third.health.bundle_mtime < mine.mtime;
+        return stale ? await replaceDaemon(options) : "running";
+      }
+      return "failed";
+    }
+    return result;
+  } catch {
+    return "failed";
+  }
+}
+async function stopDaemon(dataDir, port, waitMs = WAIT_MS) {
+  const probe = await probeHealth(port, PROBE_TIMEOUT_MS);
+  const state = readDaemonState(dataDir);
+  const pid = probe.kind === "jev" ? probe.health.pid : state?.state === "running" ? state.pid : void 0;
+  if (probe.kind === "foreign") return "not-running";
+  if (pid === void 0 || pid === process.pid || !isAlive(pid)) {
+    if (state !== void 0 && state.state === "running") markStopped(dataDir);
+    return "not-running";
+  }
+  await terminate(pid, port, waitMs);
+  if (!await waitForExit(pid, waitMs)) return "failed";
+  const after = readDaemonState(dataDir);
+  if (after !== void 0 && after.state === "running") markStopped(dataDir);
+  return "stopped";
+}
+
+// src/hooks/memo.ts
+import { createHash } from "node:crypto";
+var MEMO_MAX_ENTRIES = 256;
+var MEMO_TTL_MS = 5 * 60 * 1e3;
+var DEFAULT_CONCURRENCY = 4;
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const entries = Object.entries(value).filter(([, item]) => item !== void 0).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+}
+function memoKey(model, state, questions) {
+  return createHash("sha256").update(canonicalJson({ model: model ?? null, state, questions })).digest("hex");
+}
+function isTimeout(error) {
+  const name = error?.name;
+  return typeof name === "string" && (name.includes("Timeout") || name === "AbortError");
+}
+var MemoizedModel = class {
+  name;
+  inner;
+  maxEntries;
+  ttlMs;
+  now;
+  entries = /* @__PURE__ */ new Map();
+  hits = 0;
+  misses = 0;
+  errors = 0;
+  timeouts = 0;
+  constructor(inner, options = {}) {
+    this.inner = inner;
+    this.name = inner.name;
+    this.maxEntries = options.maxEntries ?? MEMO_MAX_ENTRIES;
+    this.ttlMs = options.ttlMs ?? MEMO_TTL_MS;
+    this.now = options.now ?? (() => Date.now());
+  }
+  stats() {
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      errors: this.errors,
+      timeouts: this.timeouts,
+      entries: this.entries.size
+    };
+  }
+  async evaluate(request2) {
+    const key = memoKey(request2.model, request2.state, request2.questions);
+    const now = this.now();
+    const hit = this.entries.get(key);
+    if (hit !== void 0) {
+      if (now - hit.ts <= this.ttlMs) {
+        this.entries.delete(key);
+        this.entries.set(key, { ...hit, ts: hit.ts });
+        this.hits += 1;
+        return {
+          ...hit.result,
+          latency_ms: 0,
+          usage: { input_tokens: 0, output_tokens: 0 },
+          memo: true
+        };
+      }
+      this.entries.delete(key);
+    }
+    this.misses += 1;
+    let result;
+    try {
+      result = await this.inner.evaluate(request2);
+    } catch (error) {
+      this.errors += 1;
+      if (isTimeout(error)) this.timeouts += 1;
+      throw error;
+    }
+    this.entries.set(key, { key, ts: this.now(), result });
+    while (this.entries.size > this.maxEntries) {
+      const oldest = this.entries.keys().next();
+      if (oldest.done === true) break;
+      this.entries.delete(oldest.value);
+    }
+    return result;
+  }
+  async choice(state, question) {
+    const result = await this.evaluate({ state, questions: { q: { type: "choice", ...question } } });
+    return result.answers.q;
+  }
+  async score(state, question) {
+    const result = await this.evaluate({ state, questions: { q: { type: "score", ...question } } });
+    return result.answers.q;
+  }
+  async probability(state, question) {
+    const result = await this.evaluate({ state, questions: { q: { type: "noul", ...question } } });
+    return result.answers.q.noul;
+  }
+};
+var LimitedModel = class {
+  name;
+  inner;
+  limit;
+  active = 0;
+  waiting = [];
+  constructor(inner, limit = DEFAULT_CONCURRENCY) {
+    this.inner = inner;
+    this.name = inner.name;
+    this.limit = Math.max(1, Math.floor(limit));
+  }
+  /** In-flight calls right now, for the tests and the counters. */
+  get inFlight() {
+    return this.active;
+  }
+  async acquire() {
+    if (this.active < this.limit) {
+      this.active += 1;
+      return;
+    }
+    await new Promise((resolve2) => {
+      this.waiting.push(resolve2);
+    });
+    this.active += 1;
+  }
+  release() {
+    this.active -= 1;
+    const next = this.waiting.shift();
+    if (next !== void 0) next();
+  }
+  async evaluate(request2) {
+    await this.acquire();
+    try {
+      return await this.inner.evaluate(request2);
+    } finally {
+      this.release();
+    }
+  }
+  async choice(state, question) {
+    const result = await this.evaluate({ state, questions: { q: { type: "choice", ...question } } });
+    return result.answers.q;
+  }
+  async score(state, question) {
+    const result = await this.evaluate({ state, questions: { q: { type: "score", ...question } } });
+    return result.answers.q;
+  }
+  async probability(state, question) {
+    const result = await this.evaluate({ state, questions: { q: { type: "noul", ...question } } });
+    return result.answers.q.noul;
+  }
+};
+
 // src/hooks/store.ts
 import {
   appendFileSync,
   existsSync,
-  mkdirSync,
+  mkdirSync as mkdirSync2,
   readdirSync,
-  readFileSync,
-  renameSync,
-  statSync,
-  unlinkSync,
-  writeFileSync
+  readFileSync as readFileSync2,
+  renameSync as renameSync2,
+  statSync as statSync2,
+  unlinkSync as unlinkSync2,
+  writeFileSync as writeFileSync2
 } from "node:fs";
-import { join as join2 } from "node:path";
+import { join as join3 } from "node:path";
 
 // src/hooks/tripwire.ts
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 var TRIP_TTL_MS = 30 * 60 * 1e3;
 var MAX_TRIPS = 20;
 var MIN_AFFIRM_CHARS = 12;
@@ -657,7 +1274,7 @@ function canonicalAction(toolName, toolInput) {
 }
 function fingerprint(toolName, toolInput) {
   const canonical = canonicalAction(toolName, toolInput);
-  return createHash("sha256").update(`${toolName}\0${canonical}`).digest("hex").slice(0, 16);
+  return createHash2("sha256").update(`${toolName}\0${canonical}`).digest("hex").slice(0, 16);
 }
 function tripIdOf(fingerprintHex) {
   return `t-${fingerprintHex.slice(0, 8)}`;
@@ -1874,6 +2491,7 @@ var MAX_SHORT_PROMPTS = 2;
 function nextPrompts(existing, prompt) {
   const text = prompt.trim();
   if (text === "") return [...existing];
+  if (existing[existing.length - 1] === text) return [...existing];
   const all = [...existing, text];
   const isShort = (p2) => p2.length < SHORT_PROMPT_CHARS;
   let short = all.filter(isShort).length;
@@ -1914,7 +2532,15 @@ var PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1e3;
 var MAX_PENDING = 20;
 var MAX_NOTED = 40;
 var EMPTY_SESSION = { prompts: [], stop_blocks: 0 };
-function safe(fn, fallback) {
+function modelCost(result) {
+  return {
+    model: result.model,
+    latency_ms: result.latency_ms,
+    input_tokens: result.usage.input_tokens,
+    ...result.memo === true ? { memo: true } : {}
+  };
+}
+function safe2(fn, fallback) {
   try {
     return fn();
   } catch {
@@ -1943,23 +2569,23 @@ var Store = class {
     this.dir = dir;
   }
   ensureDir(sub) {
-    const target = sub === void 0 ? this.dir : join2(this.dir, sub);
-    safe(() => mkdirSync(target, { recursive: true }), void 0);
+    const target = sub === void 0 ? this.dir : join3(this.dir, sub);
+    safe2(() => mkdirSync2(target, { recursive: true }), void 0);
     return target;
   }
   sessionPath(sessionId) {
-    return join2(this.dir, "sessions", `${safeSessionId(sessionId)}.json`);
+    return join3(this.dir, "sessions", `${safeSessionId(sessionId)}.json`);
   }
   get logPath() {
-    return join2(this.dir, "decisions.jsonl");
+    return join3(this.dir, "decisions.jsonl");
   }
   /** The `/jev:off` fallback when a command cannot learn the session id. */
   get globalDisablePath() {
-    return join2(this.dir, "disabled");
+    return join3(this.dir, "disabled");
   }
   readSession(sessionId) {
-    return safe(() => {
-      const raw = readFileSync(this.sessionPath(sessionId), "utf8");
+    return safe2(() => {
+      const raw = readFileSync2(this.sessionPath(sessionId), "utf8");
       const parsed = JSON.parse(raw);
       if (typeof parsed !== "object" || parsed === null) return { ...EMPTY_SESSION };
       const state = parsed;
@@ -1969,6 +2595,9 @@ var Store = class {
       };
       if (state.disabled === true) session.disabled = true;
       if (state.key_warned === true) session.key_warned = true;
+      if (typeof state.config === "object" && state.config !== null && !Array.isArray(state.config)) {
+        session.config = state.config;
+      }
       if (Array.isArray(state.pending_reissues)) {
         session.pending_reissues = state.pending_reissues.filter(
           (p2) => typeof p2 === "object" && p2 !== null && typeof p2.tool_use_id === "string"
@@ -1995,8 +2624,8 @@ var Store = class {
   }
   writeSession(sessionId, state, now = Date.now()) {
     this.ensureDir("sessions");
-    safe(() => {
-      writeFileSync(this.sessionPath(sessionId), `${JSON.stringify({ ...state, updated: now })}
+    safe2(() => {
+      writeFileSync2(this.sessionPath(sessionId), `${JSON.stringify({ ...state, updated: now })}
 `, "utf8");
     }, void 0);
   }
@@ -2007,17 +2636,17 @@ var Store = class {
   }
   /** Session-scoped or global `/jev:off`. */
   isDisabled(sessionId) {
-    if (safe(() => existsSync(this.globalDisablePath), false)) return true;
+    if (safe2(() => existsSync(this.globalDisablePath), false)) return true;
     return this.readSession(sessionId).disabled === true;
   }
   setDisabled(sessionId, disabled) {
     if (sessionId === null) {
       this.ensureDir();
       if (disabled) {
-        safe(() => writeFileSync(this.globalDisablePath, `${(/* @__PURE__ */ new Date()).toISOString()}
+        safe2(() => writeFileSync2(this.globalDisablePath, `${(/* @__PURE__ */ new Date()).toISOString()}
 `, "utf8"), void 0);
       } else {
-        safe(() => unlinkSync(this.globalDisablePath), void 0);
+        safe2(() => unlinkSync2(this.globalDisablePath), void 0);
       }
       return { scope: "global", path: this.globalDisablePath };
     }
@@ -2027,7 +2656,7 @@ var Store = class {
       else delete next.disabled;
       return next;
     });
-    if (!disabled) safe(() => unlinkSync(this.globalDisablePath), void 0);
+    if (!disabled) safe2(() => unlinkSync2(this.globalDisablePath), void 0);
     return { scope: "session", path: this.sessionPath(sessionId) };
   }
   /** Record that a re-issue was let through, so PostToolUse can see it ran. */
@@ -2145,10 +2774,10 @@ var Store = class {
   /** One `appendFileSync` call, so concurrent hooks cannot interleave a line. */
   append(record) {
     this.ensureDir();
-    safe(() => {
-      const size = safe(() => statSync(this.logPath).size, 0);
+    safe2(() => {
+      const size = safe2(() => statSync2(this.logPath).size, 0);
       if (size >= LOG_ROTATE_BYTES) {
-        safe(() => renameSync(this.logPath, join2(this.dir, "decisions.1.jsonl")), void 0);
+        safe2(() => renameSync2(this.logPath, join3(this.dir, "decisions.1.jsonl")), void 0);
       }
       appendFileSync(this.logPath, `${JSON.stringify(record)}
 `, "utf8");
@@ -2156,13 +2785,13 @@ var Store = class {
   }
   /** Read the log back, newest last. Malformed lines are skipped. */
   readLog() {
-    const files = [join2(this.dir, "decisions.1.jsonl"), this.logPath];
+    const files = [join3(this.dir, "decisions.1.jsonl"), this.logPath];
     const out = [];
     for (const file of files) {
-      const raw = safe(() => readFileSync(file, "utf8"), "");
+      const raw = safe2(() => readFileSync2(file, "utf8"), "");
       for (const line of raw.split("\n")) {
         if (line.trim() === "") continue;
-        const parsed = safe(() => JSON.parse(line), null);
+        const parsed = safe2(() => JSON.parse(line), null);
         if (parsed !== null && typeof parsed === "object") out.push(parsed);
       }
     }
@@ -2173,26 +2802,94 @@ var Store = class {
    * UserPromptSubmit, which is the one hook with time to spare.
    */
   pruneSessions(now = Date.now()) {
-    const marker = join2(this.dir, "last-prune");
-    const last = safe(() => Number(readFileSync(marker, "utf8").trim()), 0);
+    const marker = join3(this.dir, "last-prune");
+    const last = safe2(() => Number(readFileSync2(marker, "utf8").trim()), 0);
     if (Number.isFinite(last) && now - last < PRUNE_INTERVAL_MS) return 0;
     this.ensureDir();
-    safe(() => writeFileSync(marker, String(now), "utf8"), void 0);
-    const dir = join2(this.dir, "sessions");
-    const names = safe(() => readdirSync(dir), []);
+    safe2(() => writeFileSync2(marker, String(now), "utf8"), void 0);
+    const dir = join3(this.dir, "sessions");
+    const names = safe2(() => readdirSync(dir), []);
     let removed = 0;
     for (const name of names) {
       if (!name.endsWith(".json")) continue;
-      const path = join2(dir, name);
-      const mtime = safe(() => statSync(path).mtimeMs, now);
+      const path = join3(dir, name);
+      const mtime = safe2(() => statSync2(path).mtimeMs, now);
       if (now - mtime > SESSION_TTL_MS) {
-        safe(() => unlinkSync(path), void 0);
+        safe2(() => unlinkSync2(path), void 0);
         removed += 1;
       }
     }
     return removed;
   }
 };
+
+// src/hooks/daemon/registry.ts
+function sessionConfigOf(config) {
+  const { apiKey: _apiKey, warnings: _warnings, dataDir: _dataDir, disabled: _disabled, ...rest } = config;
+  return rest;
+}
+function hookConfigFrom(snapshot, apiKey, dataDir) {
+  return { ...snapshot, apiKey, dataDir, disabled: false, warnings: [] };
+}
+function num(value, fallback, min, max) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) return fallback;
+  return value;
+}
+function bool(value, fallback) {
+  return typeof value === "boolean" ? value : fallback;
+}
+function str(value, fallback) {
+  return typeof value === "string" && value.trim() !== "" ? value : fallback;
+}
+function readSessionConfig(raw, fallback) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return void 0;
+  const value = raw;
+  const gateRaw = value.gate;
+  const gate = typeof gateRaw === "string" && GATE_LEVELS.includes(gateRaw) ? gateRaw : fallback.gate;
+  const auto = num(value.autoThreshold, fallback.autoThreshold, 0, 1);
+  return {
+    baseUrl: str(value.baseUrl, fallback.baseUrl),
+    model: str(value.model, fallback.model),
+    timeoutMs: num(value.timeoutMs, fallback.timeoutMs, 100, 1e4),
+    maxRetries: num(value.maxRetries, fallback.maxRetries, 0, 10),
+    gate,
+    askOnTrip: bool(value.askOnTrip, fallback.askOnTrip),
+    stopCheck: bool(value.stopCheck, fallback.stopCheck),
+    screenResults: bool(value.screenResults, fallback.screenResults),
+    routePrompts: bool(value.routePrompts, fallback.routePrompts),
+    autoThreshold: auto,
+    reviewThreshold: Math.min(num(value.reviewThreshold, fallback.reviewThreshold, 0, 1), auto),
+    daemonPort: num(value.daemonPort, fallback.daemonPort, 0, 65535),
+    daemonIdleMs: num(value.daemonIdleMs, fallback.daemonIdleMs, 1e3, 24 * 60 * 60 * 1e3)
+  };
+}
+var SessionRegistry = class {
+  sessions = /* @__PURE__ */ new Map();
+  now;
+  constructor(now = () => Date.now()) {
+    this.now = now;
+  }
+  start(id, dataDir, config) {
+    const entry = { id, dataDir, config, started_at: this.now() };
+    this.sessions.set(id, entry);
+    return entry;
+  }
+  end(id) {
+    return this.sessions.delete(id);
+  }
+  get(id) {
+    return this.sessions.get(id);
+  }
+  count() {
+    return this.sessions.size;
+  }
+  ids() {
+    return [...this.sessions.keys()];
+  }
+};
+
+// src/hooks/daemon/server.ts
+import { createServer } from "node:http";
 
 // src/hooks/wording.ts
 var MAX_SUBJECT_CHARS = 80;
@@ -2407,9 +3104,7 @@ async function handlePostToolUse(input, deps) {
       ...base,
       decision: flagged ? "flagged" : "clean",
       signals,
-      model: result.model,
-      latency_ms: result.latency_ms,
-      input_tokens: result.usage.input_tokens
+      ...modelCost(result)
     });
     if (!flagged) return void 0;
     return {
@@ -2567,9 +3262,9 @@ async function runGateAction(model, input, config, signal) {
   const thresholds = resolveThresholds(config.thresholds, input.thresholds);
   const state = { action: input.action, user_request: input.user_request };
   if (input.context !== void 0) state.context = input.context;
-  const request = { state, questions: QUESTIONS2 };
-  if (signal !== void 0) request.signal = signal;
-  const result = await model.evaluate(request);
+  const request2 = { state, questions: QUESTIONS2 };
+  if (signal !== void 0) request2.signal = signal;
+  const result = await model.evaluate(request2);
   const answers = result.answers;
   const signals = {
     destructive: noul(answers.destructive),
@@ -2599,7 +3294,8 @@ async function runGateAction(model, input, config, signal) {
     thresholds,
     model: result.model,
     usage: result.usage,
-    latency_ms: result.latency_ms
+    latency_ms: result.latency_ms,
+    ...result.memo === true ? { memo: true } : {}
   };
 }
 function noul(answer) {
@@ -2828,9 +3524,7 @@ async function handlePreToolUse(input, deps) {
         corroborate_uncertain: policyOptions.corroborateUncertain
       },
       reasons: result.reasons,
-      model: result.model,
-      latency_ms: result.latency_ms,
-      input_tokens: result.usage.input_tokens
+      ...modelCost(result)
     };
     if (input.tool_use_id !== void 0) record.tool_use_id = input.tool_use_id;
     const outcome = gateOutcome({
@@ -2918,6 +3612,11 @@ async function handlePreToolUse(input, deps) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// src/hooks/handlers/session-end.ts
+async function handleSessionEnd(_input, _deps) {
+  return void 0;
 }
 
 // src/hooks/handlers/session-start.ts
@@ -3057,9 +3756,7 @@ async function handleStop(input, deps) {
       decision,
       signals: { ...signals },
       reasons: [...policy.reasons, ...verified.reasons],
-      model: result.model,
-      latency_ms: result.latency_ms,
-      input_tokens: result.usage.input_tokens
+      ...modelCost(result)
     });
     if (!blocked) return void 0;
     store.updateSession(sessionId, (state) => ({ ...state, stop_blocks: state.stop_blocks + 1 }), deps.now());
@@ -3154,7 +3851,7 @@ async function handleUserPromptSubmit(input, deps) {
     const signals = { kind_confidence: confidence };
     if (typeof ambiguity?.score === "number") signals.ambiguity = ambiguity.score;
     if (kind === void 0 || confidence < config.autoThreshold) {
-      store.append({ ...base, decision: "low-confidence", signals, model: result.model, latency_ms: result.latency_ms, input_tokens: result.usage.input_tokens });
+      store.append({ ...base, decision: "low-confidence", signals, ...modelCost(result) });
       return void 0;
     }
     const lines = [`[jev] task kind: ${kind.choice} (conf ${confidence.toFixed(2)})`];
@@ -3165,9 +3862,7 @@ async function handleUserPromptSubmit(input, deps) {
       ...base,
       decision: kind.choice,
       signals,
-      model: result.model,
-      latency_ms: result.latency_ms,
-      input_tokens: result.usage.input_tokens
+      ...modelCost(result)
     });
     return {
       hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: lines.join("\n") }
@@ -3182,6 +3877,515 @@ async function handleUserPromptSubmit(input, deps) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// src/hooks/dispatch.ts
+var WALL_CLOCK_MS = 3500;
+var HANDLERS = {
+  PreToolUse: handlePreToolUse,
+  PostToolUse: handlePostToolUse,
+  PostToolUseFailure: handlePostToolUse,
+  /** Correlation bookkeeping only. Answers nothing. */
+  Approval: handleApproval,
+  UserPromptSubmit: handleUserPromptSubmit,
+  Stop: handleStop,
+  SubagentStop: handleStop,
+  SessionStart: handleSessionStart,
+  SessionEnd: handleSessionEnd
+};
+async function withDeadline(work, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      work,
+      new Promise((resolve2) => {
+        timer = setTimeout(() => resolve2(void 0), ms);
+      })
+    ]);
+  } finally {
+    if (timer !== void 0) clearTimeout(timer);
+  }
+}
+async function runEvent(event, raw, deps) {
+  const handler = HANDLERS[event];
+  if (handler === void 0) return void 0;
+  let input;
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return void 0;
+    input = parsed;
+  } catch {
+    return void 0;
+  }
+  if (input.hook_event_name === void 0) input.hook_event_name = event;
+  return handler(input, deps);
+}
+
+// src/hooks/daemon/auth.ts
+import { createHash as createHash3, timingSafeEqual } from "node:crypto";
+function authMode(expectedKey) {
+  return expectedKey === null || expectedKey === "" ? "none" : "key";
+}
+function header(headers, name) {
+  const raw = headers[name] ?? headers[name.toLowerCase()];
+  if (raw === void 0) return void 0;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === "string" ? value : void 0;
+}
+function credentials(headers) {
+  const found = [];
+  const authorization = header(headers, "authorization")?.trim();
+  if (authorization !== void 0) {
+    const match = /^Bearer\s*(.*)$/i.exec(authorization);
+    const token = (match?.[1] ?? "").trim();
+    if (token !== "") found.push(token);
+  }
+  const envKey = header(headers, "x-jev-env-key")?.trim();
+  if (envKey !== void 0 && envKey !== "") found.push(envKey);
+  return found;
+}
+function sameSecret(a, b) {
+  const left = createHash3("sha256").update(a, "utf8").digest();
+  const right = createHash3("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(left, right);
+}
+function authorize(headers, expectedKey) {
+  if (authMode(expectedKey) === "none") return true;
+  const expected = expectedKey;
+  for (const candidate of credentials(headers)) {
+    if (sameSecret(candidate, expected)) return true;
+  }
+  return false;
+}
+
+// src/hooks/daemon/server.ts
+var HOOK_PREFIX = "/v1/hook/";
+function bump(counters, key) {
+  counters[key] += 1;
+}
+function merge(counters, extra) {
+  return { ...counters, ...extra?.() ?? {}, hooks: { ...counters.hooks } };
+}
+function respond(res, status, body) {
+  const text = status === 204 ? "" : `${JSON.stringify(body ?? {})}`;
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(text),
+    // Nothing here is cacheable and nothing here is for a browser.
+    "cache-control": "no-store"
+  });
+  res.end(text);
+}
+function readBody(req, max) {
+  return new Promise((resolve2) => {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve2(value);
+    };
+    req.on("data", (chunk) => {
+      const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      size += buffer.byteLength;
+      if (size > max) {
+        finish("too-large");
+        req.destroy();
+        return;
+      }
+      chunks.push(buffer);
+    });
+    req.on("end", () => finish(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", () => finish(""));
+    req.on("aborted", () => finish(""));
+  });
+}
+function sessionIdOf(parsed) {
+  const raw = parsed.session_id;
+  return typeof raw === "string" && raw.trim() !== "" ? raw.trim() : "unknown";
+}
+async function startDaemon(options) {
+  const counters = emptyCounters();
+  const bundle = bundleIdentity();
+  const startedAt = Date.now();
+  const idleMs = options.idleMs ?? DEFAULT_IDLE_MS;
+  const graceMs = options.lastSessionGraceMs ?? LAST_SESSION_GRACE_MS;
+  const wallClockMs = options.wallClockMs ?? WALL_CLOCK_MS;
+  let idleTimer;
+  let graceTimer;
+  let closing = false;
+  let handlePort = options.port;
+  const clearGrace = () => {
+    if (graceTimer !== void 0) {
+      clearTimeout(graceTimer);
+      graceTimer = void 0;
+    }
+  };
+  const touch = () => {
+    if (closing || idleMs <= 0) return;
+    if (idleTimer !== void 0) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      options.onExitRequested();
+    }, idleMs);
+  };
+  const armGrace = () => {
+    clearGrace();
+    if (closing || graceMs <= 0) return;
+    graceTimer = setTimeout(() => {
+      if (options.registry.count() === 0) options.onExitRequested();
+    }, graceMs);
+  };
+  const health = () => ({
+    // The marker `ensureDaemon` looks for: something else on this port will not
+    // have it, and that is the difference between "replace" and "conflict".
+    jev: true,
+    pid: process.pid,
+    port: handlePort,
+    version: HOOK_VERSION,
+    protocol: PROTOCOL,
+    bundle_path: bundle.path,
+    bundle_mtime: bundle.mtime,
+    started_at: startedAt,
+    uptime_ms: Date.now() - startedAt,
+    sessions: options.registry.count(),
+    auth: authMode(options.expectedKey),
+    counters: merge(counters, options.modelStats)
+  });
+  const onRequest = (req, res) => {
+    void (async () => {
+      try {
+        const url = (req.url ?? "/").split("?")[0] ?? "/";
+        if (url === "/v1/health") {
+          if (req.method !== "GET" && req.method !== "HEAD") {
+            req.resume();
+            respond(res, 405, {});
+            return;
+          }
+          req.resume();
+          respond(res, 200, health());
+          return;
+        }
+        if (!authorize(req.headers, options.expectedKey)) {
+          bump(counters, "unauthorized");
+          req.resume();
+          respond(res, 401, {});
+          return;
+        }
+        if (req.method !== "POST") {
+          req.resume();
+          respond(res, 405, {});
+          return;
+        }
+        const isHook = url.startsWith(HOOK_PREFIX);
+        const event = isHook ? decodeURIComponent(url.slice(HOOK_PREFIX.length)) : "";
+        if (isHook && HANDLERS[event] === void 0) {
+          bump(counters, "unknown_event");
+          req.resume();
+          respond(res, 404, {});
+          return;
+        }
+        if (!isHook && url !== "/v1/session/start" && url !== "/v1/session/end") {
+          req.resume();
+          respond(res, 404, {});
+          return;
+        }
+        const declared = req.headers["x-jev-protocol"];
+        const declaredText = Array.isArray(declared) ? declared[0] : declared;
+        if (typeof declaredText === "string" && declaredText.trim() !== "" && declaredText.trim() !== String(PROTOCOL)) {
+          bump(counters, "protocol_mismatch");
+          req.resume();
+          respond(res, 409, {});
+          return;
+        }
+        const raw = await readBody(req, MAX_BODY_BYTES);
+        if (raw === "too-large") {
+          bump(counters, "oversize");
+          respond(res, 413, {});
+          return;
+        }
+        let parsed;
+        try {
+          const value = JSON.parse(raw);
+          if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object");
+          parsed = value;
+        } catch {
+          bump(counters, "bad_request");
+          respond(res, 200, {});
+          return;
+        }
+        touch();
+        const sessionId = sessionIdOf(parsed);
+        if (url === "/v1/session/start") {
+          const fallback = sessionConfigOf(options.depsFor(sessionId).config);
+          const config = readSessionConfig(parsed.config, fallback) ?? fallback;
+          const dataDirRaw = parsed.data_dir;
+          const dataDir = typeof dataDirRaw === "string" && dataDirRaw.trim() !== "" ? dataDirRaw.trim() : options.depsFor(sessionId).config.dataDir;
+          options.registry.start(sessionId, dataDir, config);
+          bump(counters, "sessions_started");
+          clearGrace();
+          respond(res, 200, {});
+          return;
+        }
+        if (url === "/v1/session/end") {
+          options.registry.end(sessionId);
+          bump(counters, "sessions_ended");
+          if (options.registry.count() === 0) armGrace();
+          respond(res, 200, {});
+          return;
+        }
+        counters.hooks[event] = (counters.hooks[event] ?? 0) + 1;
+        const deps = options.depsFor(sessionId);
+        if (event === "Approval") {
+          respond(res, 200, {});
+          void runEvent(event, raw, deps).catch(() => void 0);
+          return;
+        }
+        const output = await withDeadlineCounted(runEvent(event, raw, deps), wallClockMs, counters);
+        if (event === "SessionEnd") {
+          options.registry.end(sessionId);
+          bump(counters, "sessions_ended");
+          if (options.registry.count() === 0) armGrace();
+        }
+        respond(res, 200, output ?? {});
+      } catch {
+        bump(counters, "errors");
+        try {
+          req.resume();
+          respond(res, 500, {});
+        } catch {
+          res.destroy();
+        }
+      }
+    })();
+  };
+  const server = createServer(onRequest);
+  await new Promise((resolve2, reject) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      const address = server.address();
+      handlePort = typeof address === "object" && address !== null ? address.port : options.port;
+      resolve2();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(options.port, "127.0.0.1");
+  });
+  touch();
+  return {
+    port: handlePort,
+    startedAt,
+    stats: () => merge(counters, options.modelStats),
+    close: async () => {
+      closing = true;
+      if (idleTimer !== void 0) clearTimeout(idleTimer);
+      clearGrace();
+      await new Promise((resolve2) => {
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(force);
+          resolve2();
+        };
+        const force = setTimeout(() => {
+          server.closeAllConnections();
+          done();
+        }, WALL_CLOCK_MS);
+        server.close(() => done());
+        server.closeIdleConnections();
+      });
+    }
+  };
+}
+async function withDeadlineCounted(work, ms, counters) {
+  let timer;
+  try {
+    return await Promise.race([
+      work,
+      new Promise((resolve2) => {
+        timer = setTimeout(() => {
+          bump(counters, "deadline_overruns");
+          resolve2(void 0);
+        }, ms);
+      })
+    ]);
+  } finally {
+    if (timer !== void 0) clearTimeout(timer);
+  }
+}
+
+// src/hooks/daemon/main.ts
+var DRAIN_MS = 3500;
+function parsePort(argv) {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === void 0) continue;
+    const inline = /^--port=(.*)$/.exec(arg);
+    const raw = inline !== null ? inline[1] : arg === "--port" ? argv[i + 1] : void 0;
+    if (raw === void 0) continue;
+    const value = Number(raw);
+    if (Number.isInteger(value) && value >= 0 && value <= 65535) return value;
+  }
+  return void 0;
+}
+function buildDaemonModel(config) {
+  if (config.apiKey === null) return { model: null, memo: void 0 };
+  const client = new JevDecisionModel({
+    apiKey: config.apiKey,
+    baseUrl: config.baseUrl,
+    model: config.model,
+    timeoutMs: config.timeoutMs,
+    maxRetries: config.maxRetries
+  });
+  const memo = new MemoizedModel(new LimitedModel(client));
+  return { model: memo, memo };
+}
+function makeDepsFor(config, model, registry) {
+  const own = sessionConfigOf(config);
+  const stores = /* @__PURE__ */ new Map();
+  const storeFor = (dir) => {
+    const existing = stores.get(dir);
+    if (existing !== void 0) return existing;
+    const store = new Store(dir);
+    stores.set(dir, store);
+    return store;
+  };
+  return (sessionId) => {
+    const entry = registry.get(sessionId);
+    if (entry !== void 0) {
+      return {
+        model,
+        config: hookConfigFrom(entry.config, config.apiKey, entry.dataDir),
+        store: storeFor(entry.dataDir),
+        now: () => Date.now()
+      };
+    }
+    const store = storeFor(config.dataDir);
+    const persisted = readSessionConfig(store.readSession(sessionId).config, own);
+    if (persisted !== void 0) {
+      registry.start(sessionId, config.dataDir, persisted);
+      return {
+        model,
+        config: hookConfigFrom(persisted, config.apiKey, config.dataDir),
+        store,
+        now: () => Date.now()
+      };
+    }
+    return { model, config, store, now: () => Date.now() };
+  };
+}
+function stateFrom(config, handle, counters, restarts, run) {
+  const bundle = bundleIdentity();
+  return {
+    pid: process.pid,
+    port: handle.port,
+    version: HOOK_VERSION,
+    protocol: PROTOCOL,
+    bundle_path: bundle.path,
+    bundle_mtime: bundle.mtime,
+    data_dir: config.dataDir,
+    started_at: handle.startedAt,
+    updated_at: Date.now(),
+    state: run,
+    counters,
+    restarts
+  };
+}
+function modelStatsOf(memo) {
+  if (memo === void 0) return void 0;
+  return () => {
+    const stats = memo.stats();
+    return {
+      jev_calls: stats.misses,
+      memo_hits: stats.hits,
+      jev_timeouts: stats.timeouts,
+      jev_errors: stats.errors
+    };
+  };
+}
+async function runDaemon(argv, env) {
+  const config = loadHookConfig(env);
+  const port = parsePort(argv) ?? config.daemonPort;
+  const previous = readDaemonState(config.dataDir);
+  const restarts = previous === void 0 ? 0 : previous.restarts + 1;
+  const { model, memo } = buildDaemonModel(config);
+  const modelStats = modelStatsOf(memo);
+  const registry = new SessionRegistry();
+  const depsFor = makeDepsFor(config, model, registry);
+  let stopping = false;
+  let handle;
+  let heartbeat;
+  const shutdown = (reason) => {
+    if (stopping) return;
+    stopping = true;
+    if (heartbeat !== void 0) clearInterval(heartbeat);
+    void (async () => {
+      if (handle !== void 0) {
+        await Promise.race([handle.close(), new Promise((resolve2) => setTimeout(resolve2, DRAIN_MS))]);
+        writeDaemonState(config.dataDir, stateFrom(config, handle, handle.stats(), restarts, "stopped"));
+      }
+      process.stderr.write(`[jev-daemon] stopped (${reason})
+`);
+      process.exit(0);
+    })();
+  };
+  try {
+    handle = await startDaemon({
+      port,
+      expectedKey: config.apiKey,
+      depsFor,
+      registry,
+      idleMs: config.daemonIdleMs,
+      onExitRequested: () => shutdown("idle"),
+      ...modelStats !== void 0 ? { modelStats } : {}
+    });
+  } catch (error) {
+    const code = error.code;
+    const bundle = bundleIdentity();
+    writeDaemonState(config.dataDir, {
+      pid: process.pid,
+      port,
+      version: HOOK_VERSION,
+      protocol: PROTOCOL,
+      bundle_path: bundle.path,
+      bundle_mtime: bundle.mtime,
+      data_dir: config.dataDir,
+      started_at: Date.now(),
+      updated_at: Date.now(),
+      state: code === "EADDRINUSE" ? "port-conflict" : "stopped",
+      counters: emptyCounters(),
+      restarts
+    });
+    process.stderr.write(`[jev-daemon] cannot listen on 127.0.0.1:${port}: ${String(code ?? error)}
+`);
+    process.exit(0);
+  }
+  const live = handle;
+  writeDaemonState(config.dataDir, stateFrom(config, live, live.stats(), restarts, "running"));
+  heartbeat = setInterval(() => {
+    writeDaemonState(config.dataDir, stateFrom(config, live, live.stats(), restarts, "running"));
+  }, HEARTBEAT_MS);
+  heartbeat.unref();
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("uncaughtException", (error) => {
+    process.stderr.write(`[jev-daemon] uncaught: ${String(error)}
+`);
+    shutdown("uncaught");
+  });
+  process.on("unhandledRejection", (reason) => {
+    process.stderr.write(`[jev-daemon] unhandled rejection: ${String(reason)}
+`);
+  });
+  process.stderr.write(
+    `[jev-daemon] v${HOOK_VERSION} protocol ${PROTOCOL} listening on 127.0.0.1:${live.port}, data ${config.dataDir}, auth ${config.apiKey === null ? "none" : "key"}, restarts ${restarts}
+`
+  );
 }
 
 // src/decision/pricing.ts
@@ -3217,11 +4421,89 @@ function median(values) {
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
-function statusReport(config, store, now = Date.now()) {
+async function daemonView(config, _now = Date.now()) {
+  const state = readDaemonState(config.dataDir);
+  const probe = await probeHealth(config.daemonPort, 300);
+  return {
+    state,
+    alive: state !== void 0 && isAlive(state.pid),
+    probe: probe.kind,
+    health: probe.kind === "jev" ? probe.health : void 0,
+    logPath: daemonLogPath(config.dataDir)
+  };
+}
+function duration(raw) {
+  if (!Number.isFinite(raw)) return "?";
+  const ms = Math.max(0, raw);
+  const seconds = Math.floor(ms / 1e3);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+function daemonReport(config, view, now = Date.now()) {
+  const lines = ["Daemon", `  port: 127.0.0.1:${config.daemonPort}   protocol: ${PROTOCOL}`];
+  const { state, health } = view;
+  if (health !== void 0) {
+    lines.push(
+      `  status: up, answering on this shell's loopback`,
+      `  pid ${health.pid}, version ${health.version}, protocol ${health.protocol}, up ${duration(health.uptime_ms)}`,
+      `  sessions registered: ${health.sessions}   auth: ${health.auth}${health.auth === "none" ? " (no API key configured anywhere: unauthenticated, and nothing to spend)" : ""}`
+    );
+    if (health.protocol !== PROTOCOL) {
+      lines.push(
+        `  NOTE: it speaks protocol ${health.protocol} and this build speaks ${PROTOCOL}; the next session start replaces it.`
+      );
+    }
+  } else if (state === void 0) {
+    lines.push("  status: down \u2014 no daemon.json in the data directory, so one has never run here.");
+  } else if (state.state === "port-conflict") {
+    lines.push(
+      `  status: PORT CONFLICT \u2014 something that is not jev answered on ${config.daemonPort}.`,
+      "  The http hooks post there and get nothing useful back, so they are inactive. They fail open:",
+      "  nothing is blocked. Free the port and restart the session."
+    );
+  } else if (state.state === "stopped") {
+    lines.push(`  status: down \u2014 stopped ${duration(now - state.updated_at)} ago (pid ${state.pid} was its last).`);
+  } else if (view.alive) {
+    lines.push(
+      `  status: the state file says running and pid ${state.pid} is alive, but it is not reachable from this shell.`,
+      `  That is the normal reading for a /jev:* command: this process runs through the Bash tool, which may`,
+      `  be sandboxed away from loopback sockets. The hooks talk to it from Claude Code's own process.`,
+      `  last heartbeat: ${duration(now - state.updated_at)} ago${now - state.updated_at > 6e4 ? " \u2014 stale for a 15 s heartbeat, so it may be wedged" : ""}`
+    );
+  } else {
+    lines.push(
+      `  status: down \u2014 the state file claims running, but pid ${state.pid} no longer exists.`,
+      `  Last heartbeat ${duration(now - state.updated_at)} ago. The next session start spawns a fresh one.`
+    );
+  }
+  if (state !== void 0) {
+    lines.push(
+      `  state file: ${state.state}, version ${state.version}, restarts ${state.restarts}`,
+      `  bundle: ${state.bundle_path === "" ? "(unknown)" : state.bundle_path}`
+    );
+  }
+  const counters = health?.counters ?? state?.counters;
+  if (counters !== void 0) {
+    const hooks = Object.entries(counters.hooks).sort((a, b) => b[1] - a[1]);
+    lines.push(
+      `  hooks served: ${hooks.length === 0 ? "(none yet)" : hooks.map(([event, n]) => `${event} ${n}`).join(", ")}`,
+      `  jev calls: ${counters.jev_calls}   memo hits: ${counters.memo_hits}   timeouts: ${counters.jev_timeouts}   errors: ${counters.jev_errors}`,
+      `  sessions: ${counters.sessions_started} started, ${counters.sessions_ended} ended   deadline overruns: ${counters.deadline_overruns}`,
+      `  rejected: ${counters.unauthorized} unauthorized, ${counters.protocol_mismatch} wrong protocol, ${counters.unknown_event} unknown event, ${counters.bad_request} unparseable, ${counters.oversize} oversize`,
+      health?.counters === void 0 ? "  counters read from the state file, which is rewritten every 15 s, so they lag by up to that." : "  counters read live from the daemon."
+    );
+  }
+  if (state !== void 0 || health !== void 0) lines.push(`  log: ${view.logPath}`);
+  return lines;
+}
+function statusReport(config, store, now = Date.now(), daemon) {
   const all = store.readLog();
   const recent = within(all, now, DAY_MS);
   const count = (...decisions) => recent.filter((r) => decisions.includes(r.decision ?? "")).length;
-  const latencies = recent.filter((r) => r.model !== void 0).map((r) => r.latency_ms).filter((n) => typeof n === "number");
+  const latencies = recent.filter((r) => r.model !== void 0 && r.memo !== true).map((r) => r.latency_ms).filter((n) => typeof n === "number");
   const tokens = recent.reduce((sum, r) => sum + (r.input_tokens ?? 0), 0);
   const errors = recent.filter((r) => r.decision === "error" || r.error !== void 0);
   const lastError = errors[errors.length - 1];
@@ -3266,6 +4548,15 @@ function statusReport(config, store, now = Date.now()) {
   );
   if (lastError !== void 0) {
     lines.push(`  last error: ${lastError.ts} ${lastError.event} ${lastError.error ?? "(unspecified)"}`);
+  }
+  const memoHits = recent.filter((r) => r.memo === true).length;
+  if (memoHits > 0) {
+    lines.push(
+      `  of those, ${memoHits} were answered from the daemon's memo: no call, no tokens, and excluded above.`
+    );
+  }
+  if (daemon !== void 0) {
+    lines.push("", ...daemonReport(config, daemon, now));
   }
   return lines.join("\n");
 }
@@ -3546,40 +4837,17 @@ function evidenceSection(tripById, notReissued, reissues, affirms) {
 }
 
 // src/hooks/main.ts
-var WALL_CLOCK_MS = 3500;
-var HANDLERS = {
-  PreToolUse: handlePreToolUse,
-  PostToolUse: handlePostToolUse,
-  PostToolUseFailure: handlePostToolUse,
-  /** Correlation bookkeeping only, wired up as an async hook. */
-  Approval: handleApproval,
-  UserPromptSubmit: handleUserPromptSubmit,
-  Stop: handleStop,
-  SubagentStop: handleStop,
-  SessionStart: handleSessionStart
-};
-function buildDeps(config) {
-  const model = config.apiKey === null ? null : new JevDecisionModel({
+var SESSION_START_DAEMON_MS = 3500;
+var SESSION_POST_MS = 700;
+function buildDeps(config, model) {
+  const resolved = model !== void 0 ? model : config.apiKey === null ? null : new JevDecisionModel({
     apiKey: config.apiKey,
     baseUrl: config.baseUrl,
     model: config.model,
     timeoutMs: config.timeoutMs,
     maxRetries: config.maxRetries
   });
-  return { model, config, store: new Store(config.dataDir), now: () => Date.now() };
-}
-async function withDeadline(work, ms) {
-  let timer;
-  try {
-    return await Promise.race([
-      work,
-      new Promise((resolve2) => {
-        timer = setTimeout(() => resolve2(void 0), ms);
-      })
-    ]);
-  } finally {
-    if (timer !== void 0) clearTimeout(timer);
-  }
+  return { model: resolved, config, store: new Store(config.dataDir), now: () => Date.now() };
 }
 async function readStdin() {
   if (process.stdin.isTTY === true) return "";
@@ -3588,20 +4856,6 @@ async function readStdin() {
     chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
   }
   return Buffer.concat(chunks).toString("utf8");
-}
-async function runEvent(event, raw, deps) {
-  const handler = HANDLERS[event];
-  if (handler === void 0) return void 0;
-  let input;
-  try {
-    const parsed = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return void 0;
-    input = parsed;
-  } catch {
-    return void 0;
-  }
-  if (input.hook_event_name === void 0) input.hook_event_name = event;
-  return handler(input, deps);
 }
 function sessionArgument(value) {
   if (value === void 0) return null;
@@ -3612,7 +4866,7 @@ function sessionArgument(value) {
 async function runCommand(command, args, deps) {
   switch (command) {
     case "status":
-      return statusReport(deps.config, deps.store, deps.now());
+      return statusReport(deps.config, deps.store, deps.now(), await daemonView(deps.config, deps.now()));
     case "why": {
       const numeric = args.map((arg) => Number(arg)).find((value) => Number.isFinite(value) && value > 0);
       const filter = args.map((arg) => arg.toLowerCase()).find(
@@ -3635,9 +4889,148 @@ async function runCommand(command, args, deps) {
   }
 }
 var COMMANDS = /* @__PURE__ */ new Set(["status", "why", "calibrate", "disable", "enable"]);
+async function runDaemonCtl(action, config, now) {
+  const port = config.daemonPort;
+  switch (action) {
+    case "status":
+      return daemonReport(config, await daemonView(config, now), now).join("\n");
+    case "stop": {
+      const result = await stopDaemon(config.dataDir, port);
+      const after = daemonReport(config, await daemonView(config, now), now).join("\n");
+      const headline = result === "stopped" ? `jev daemon stopped (port ${port}).` : result === "not-running" ? `jev daemon was not running on port ${port}.` : `jev daemon on port ${port} did not stop; its pid is still alive.`;
+      return `${headline}
+
+${after}`;
+    }
+    case "restart": {
+      const result = await stopDaemon(config.dataDir, port);
+      return `${result === "stopped" ? "jev daemon stopped" : `jev daemon was not running on port ${port}`}.
+A fresh one is not started from here: this command runs through the Bash tool, whose process may be
+sandboxed, and a daemon that inherited that sandbox could not read the data directory. The MCP
+server's watchdog starts a replacement within ten seconds, and the next session start does too.
+Nothing is broken in the meantime: with no daemon the http hooks fail open and say nothing.`;
+    }
+    default:
+      return "usage: /jev:daemon status | stop | restart";
+  }
+}
+function daemonSystemMessage(result, port) {
+  if (result === "conflict") {
+    return `[jev] Something other than jev is listening on 127.0.0.1:${port}, so jev's hooks are inactive for this session \u2014 they post to that port and whatever is there is not answering as jev. Nothing is blocked and nothing is being sent to it beyond the hook payload. Free the port, or set the jev daemon's port with JEV_DAEMON_PORT and update the plugin's hooks.json URL to match, then restart the session.`;
+  }
+  if (result === "failed") {
+    return `[jev] jev's judgment daemon did not confirm it was listening on 127.0.0.1:${port} within the time SessionStart has to wait, so the hooks that post to it may be inactive at the start of this session. They fail open: nothing is blocked either way. It may simply have been slow to start \u2014 /jev:daemon status says whether it is up now, and the daemon's own output is in daemon.log next to the session files.`;
+  }
+  return void 0;
+}
+function daemonBundlePath(env = process.env, scriptPath = process.argv[1]) {
+  if ((env.JEV_DAEMON_DISABLE ?? "").trim() === "1") return void 0;
+  if (scriptPath === void 0 || scriptPath === "") return void 0;
+  if (!scriptPath.endsWith(".mjs") && !scriptPath.endsWith(".js") && !scriptPath.endsWith(".cjs")) return void 0;
+  return scriptPath;
+}
+async function postJson(port, path, body, apiKey, timeoutMs) {
+  const { request: request2 } = await import("node:http");
+  return new Promise((resolve2) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve2(value);
+    };
+    const payload = Buffer.from(JSON.stringify(body ?? {}), "utf8");
+    const req = request2(
+      {
+        host: "127.0.0.1",
+        port,
+        path,
+        method: "POST",
+        timeout: timeoutMs,
+        headers: {
+          "content-type": "application/json",
+          "content-length": payload.byteLength,
+          "x-jev-protocol": String(PROTOCOL),
+          ...apiKey === null ? {} : { authorization: `Bearer ${apiKey}` }
+        }
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          let parsed;
+          try {
+            parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          } catch {
+            parsed = void 0;
+          }
+          finish({ status: res.statusCode ?? 0, body: parsed });
+        });
+        res.on("error", () => finish(void 0));
+      }
+    );
+    const timer = setTimeout(() => {
+      req.destroy();
+      finish(void 0);
+    }, timeoutMs + 50);
+    req.on("timeout", () => {
+      req.destroy();
+      finish(void 0);
+    });
+    req.on("error", () => finish(void 0));
+    req.end(payload);
+  });
+}
+async function startDaemonForSession(config, sessionId, bundlePath) {
+  const options = { dataDir: config.dataDir, port: config.daemonPort, bundlePath, env: process.env };
+  let result = await ensureDaemon(options);
+  if (result === "conflict") {
+    const message = daemonSystemMessage(result, config.daemonPort);
+    return { result, ...message !== void 0 ? { systemMessage: message } : {} };
+  }
+  const body = {
+    session_id: sessionId,
+    data_dir: config.dataDir,
+    config: sessionConfigOf(config),
+    protocol: PROTOCOL
+  };
+  let reply = await postJson(config.daemonPort, "/v1/session/start", body, config.apiKey, SESSION_POST_MS);
+  if (reply?.status === 401) {
+    result = await replaceDaemon(options);
+    if (result === "conflict" || result === "failed") {
+      const message = daemonSystemMessage(result, config.daemonPort);
+      return { result, ...message !== void 0 ? { systemMessage: message } : {} };
+    }
+    reply = await postJson(config.daemonPort, "/v1/session/start", body, config.apiKey, SESSION_POST_MS);
+  }
+  if (result === "failed" && reply === void 0) {
+    const message = daemonSystemMessage("failed", config.daemonPort);
+    return { result, ...message !== void 0 ? { systemMessage: message } : {} };
+  }
+  const replyBody = reply?.body;
+  if (typeof replyBody === "object" && replyBody !== null) {
+    const message = replyBody.systemMessage;
+    if (typeof message === "string" && message.trim() !== "") return { result, systemMessage: message };
+  }
+  return { result };
+}
+async function shouldRunFallback(config) {
+  const probe = await probeHealth(config.daemonPort, 150);
+  return probe.kind !== "jev";
+}
 async function main(argv = process.argv) {
   const event = argv[2] ?? "";
+  if (event === "daemon") {
+    await runDaemon(argv.slice(3), process.env);
+    return;
+  }
   const config = loadHookConfig();
+  if (event === "daemon-ctl") {
+    const text = await runDaemonCtl(argv[3] ?? "status", config, Date.now());
+    process.stdout.write(`${text}
+`);
+    return;
+  }
   if (config.disabled) return;
   const deps = buildDeps(config);
   if (COMMANDS.has(event)) {
@@ -3647,11 +5040,38 @@ async function main(argv = process.argv) {
     return;
   }
   if (!(event in HANDLERS)) return;
-  const output = await withDeadline(
-    (async () => runEvent(event, await readStdin(), deps))(),
-    WALL_CLOCK_MS
-  );
-  if (output !== void 0) process.stdout.write(JSON.stringify(output));
+  const fallback = argv.includes("--fallback");
+  if (fallback && !await shouldRunFallback(config)) return;
+  const raw = await readStdin();
+  const output = await withDeadline((async () => runEvent(event, raw, deps))(), WALL_CLOCK_MS);
+  let merged = output;
+  if (event === "SessionStart") {
+    const bundlePath = daemonBundlePath();
+    if (bundlePath !== void 0) {
+      let sessionId = "unknown";
+      try {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed.session_id === "string" && parsed.session_id.trim() !== "") sessionId = parsed.session_id;
+      } catch {
+      }
+      const started = await withDeadline(
+        startDaemonForSession(config, sessionId, bundlePath),
+        SESSION_START_DAEMON_MS
+      );
+      if (started?.systemMessage !== void 0) {
+        merged = {
+          ...merged ?? {},
+          systemMessage: merged?.systemMessage === void 0 ? started.systemMessage : `${merged.systemMessage}
+${started.systemMessage}`
+        };
+      }
+      try {
+        deps.store.updateSession(sessionId, (state) => ({ ...state, config: sessionConfigOf(config) }), deps.now());
+      } catch {
+      }
+    }
+  }
+  if (merged !== void 0) process.stdout.write(JSON.stringify(merged));
 }
 
 // src/hooks/cli.ts

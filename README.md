@@ -1,11 +1,15 @@
-# jev-mcp
+# jevwire
 
 **Jev** is TypeSafe AI's [System One](https://docs.typesafe.ai/concepts/system-one) model: a fast,
 calibrated classifier. You give it a state and a map of typed questions — yes/no, pick-one,
 rate-on-a-rubric — and it answers every one in parallel with a probability over the answer space
 *you* defined. It never generates text, so the answer is always inside your schema.
 
-This package is three things:
+**jevwire** wires it into a harness. The repository is
+[Brainwires/jevwire](https://github.com/Brainwires/jevwire); the npm package is still published as
+`jev-mcp` and the Claude Code plugin is `jev`.
+
+It is three things:
 
 - **6 MCP tools** — `jev_rank`, `jev_verify`, `jev_evaluate`, `jev_gate_action`, `jev_next_step`,
   `jev_list_models`.
@@ -20,8 +24,9 @@ It is **not** for generation, arithmetic, counting, date comparison, or multi-ho
 answers bounded questions over text you hand it. Anything numeric or ordered should be extracted as
 a choice over enumerated options and compared in code.
 
-Release 0.3.0 has been exercised against the live TypeSafe API on **2026-09-17**. Every latency,
-token count and cost figure quoted in this README comes from that run.
+Release 0.4.0 has been exercised against the live TypeSafe API on **2026-09-18**. Every latency,
+token count and cost figure quoted in this README comes from that run or the 0.3.0 one it is compared
+against.
 
 ## Install
 
@@ -30,7 +35,7 @@ Node >= 20 for all three routes.
 ### Claude Code plugin
 
 ```
-/plugin marketplace add Brainwires/jev-mcp
+/plugin marketplace add Brainwires/jevwire
 /plugin install jev@brainwires-jev
 ```
 
@@ -180,7 +185,8 @@ rejects `do not`, `must`, `never`, `proceed`, `treat it` and `ignore` in all of 
 | `PostToolUse` / `PostToolUseFailure` on gated tools (async) | — | Nothing you see. Records whether the last test/build/type-check/lint command passed, how many edits have happened since, and whether a re-issued call ran or failed |
 | `Stop` | Does the final message stop short of the requested work, or claim checks pass that the ledger says failed? | Ask Claude to continue, at most once per prompt |
 | `UserPromptSubmit` | Bookkeeping, always: records your last few prompts so the other hooks know what you asked for. Optionally classifies the task kind | Add one advisory line |
-| `SessionStart` | Is the plugin configured? | Say once when it is not |
+| `SessionStart` | Is the plugin configured? | Say once when it is not. Also starts the daemon below |
+| `SessionEnd` | — | Nothing. Tells the daemon the session is over |
 
 A small set of catastrophic shapes — `rm -rf ~`, `git push --force` to main, `git reset --hard`,
 `DROP TABLE`, `mkfs`, `dd of=/dev/…`, `chmod -R 777`, a fork bomb — skip the model entirely and trip
@@ -192,6 +198,62 @@ call is blocked. So a note can inform the next step and nothing else. If you wan
 something, the tripwire is the part that does that — and a trip is answerable by Claude, not by you.
 
 What leaves your machine, what never does, and how to delete the local log: [SECURITY.md](SECURITY.md).
+
+### How the hooks reach the plugin (0.4.0)
+
+Until 0.3 every hook was a fresh `node` process: about 160 ms of start-up on a call the plugin then
+usually said nothing about. Since 0.4 most of them are `type: "http"` posts to a small daemon on
+`127.0.0.1:10522` — the same `hook.mjs`, run as `node hook.mjs daemon`, one per user per machine.
+
+Measured on a MacBook (Node 24, macOS 15) against the real API, with `curl` opening a fresh
+connection each time:
+
+| path | 0.3.0 | 0.4.0 |
+|---|---|---|
+| a hook the prefilter skips, such as `ls -la` | ≈160–170 ms | **p50 2.8 ms, p95 8.4 ms** |
+| a judged hook, first call after the daemon starts | ≈665 ms | **501 ms** (the Jev call is 491 ms of it) |
+| a judged hook, warm connection | ≈665 ms | **p50 210 ms, p95 290 ms** |
+| the identical judgment again inside five minutes | another full call | **5 ms**, and no tokens billed |
+| `SessionStart` | ≈165 ms | ≈400–600 ms the first time, ≈170 ms after |
+
+The daemon's own overhead is the difference between those last two columns on a judged call: about
+10 ms. Everything else is Jev, and most of the improvement is that one process keeps its TLS session
+and connection pool instead of building both on every tool call.
+
+What it does not change is what the plugin decides. The http hooks and the command hooks run the same
+handlers from the same bundle, and the test suite drives one table of inputs through both and asserts
+the bytes match.
+
+**It starts itself and heals itself.** `SessionStart` starts it, or replaces it when a plugin update
+changed the bundle underneath it, and a watchdog in jev's MCP server re-checks every ten seconds. If
+it is not there, the hooks fail open in silence: Claude Code treats a refused connection as a
+non-blocking error, so nothing is blocked and nothing is said. Two sessions share one daemon. It exits
+after 30 minutes with no hooks to serve, or a minute after the last session ends.
+
+`/jev:status` has a **Daemon** section, and `/jev:daemon [status|stop|restart]` is the direct
+control. Both report: up or down, pid, version, protocol, uptime, sessions registered, hooks served by
+event, Jev calls versus memo hits, timeouts, restarts, and whether something else is on the port.
+
+One quirk worth knowing: a `/jev:*` command runs through the Bash tool, whose process may be
+sandboxed away from loopback sockets. When that happens the report says *"the state file says running
+and pid N is alive, but it is not reachable from this shell"* rather than "down", because the hooks
+reach the daemon from Claude Code's own process and are working fine.
+
+`restart` only stops. A daemon spawned from a sandboxed Bash process would inherit that sandbox and be
+unable to read its own data directory, so the replacement is left to the watchdog (ten seconds) or the
+next session start.
+
+**The port is 10522, and it is effectively fixed.** A hook URL in `hooks.json` is a literal — Claude
+Code interpolates environment variables into hook *headers*, not URLs — so `JEV_DAEMON_PORT` moves the
+daemon but you must edit the manifest's URLs to match. If something else is already listening there,
+the plugin says so loudly at session start, marks `port-conflict` in its state file, leaves the other
+process alone, and its hooks stay inactive for the session. Nothing is blocked.
+
+**Multi-user hosts are not supported.** The daemon is on loopback and authenticates with your
+TypeSafe API key, but a different local user who binds the port first would receive the hook payloads
+and that key in a header. See [SECURITY.md](SECURITY.md#the-daemon). To turn the whole thing off
+and go back to a process per hook, set `JEV_DAEMON_DISABLE=1` — the command fallback on
+`UserPromptSubmit` keeps working and the http hooks simply fail open.
 
 ## Settings
 
@@ -207,6 +269,11 @@ environment fallback for hand-wired use.
 | `screen_results` | boolean | `true` | The `PostToolUse` injection screen | `JEV_SCREEN_RESULTS` |
 | `route_prompts` | boolean | `false` | One advisory line naming the kind of task a prompt asks for. Off by default: it costs a call on every prompt | `JEV_ROUTE_PROMPTS` |
 | `auto_threshold` | number, 0.5–0.99 | `0.85` | Probability at or above which a signal counts as established. Lower means more notes | `JEV_AUTO_THRESHOLD` |
+| `daemon_port` | number, 0–65535 | `10522` | Loopback port for the daemon. Moving it also means editing the URLs in the plugin's `hooks/hooks.json`, because a hook URL cannot read an environment variable | `JEV_DAEMON_PORT` |
+| `daemon_idle_ms` | number, 1 s–24 h | `1800000` | How long the daemon stays resident with no hook to serve | `JEV_DAEMON_IDLE_MS` |
+
+Environment-only, no plugin setting: `JEV_DAEMON_DISABLE=1` stops `SessionStart` starting a daemon at
+all, and `JEV_HOOKS_DISABLE=1` turns every hook off.
 
 Constants, not settings: a trip is answerable for 30 minutes, at most 20 are tracked per session, at
 most 5 notes go out per user prompt, the same action is not noted twice within 30 minutes, and an
@@ -477,6 +544,7 @@ The policy layer — `gate`, `gateNoul`, `lean`, `gateActionPolicy`, `nextStepPo
 | `/jev:status` | Configuration (including any deprecation warning), 24-hour counts of notes, suppressions, tripwires, re-issues and markers, p50/p95 latency, token spend and estimated cost, error count and the last error. Never prints the key |
 | `/jev:why [n] [notes\|trips]` | The last n notes, tripwires, re-issues and errors: the exact text Claude was handed, the signals behind it, and the marker text of any re-issue |
 | `/jev:calibrate` | What Claude was told and what was suppressed, every tripwire's outcome, marker hygiene, signal distributions by outcome, and an exact replay of your own log at other thresholds |
+| `/jev:daemon [status\|stop\|restart]` | The loopback daemon the http hooks post to: up or down, pid, version, protocol, uptime, sessions, hooks served by event, Jev calls versus memo hits, timeouts, restarts, port conflicts. `restart` only stops — the watchdog starts the replacement |
 | `/jev:off` | Turn every hook off for this session |
 | `/jev:on` | Turn them back on, clearing both the session flag and the global one |
 

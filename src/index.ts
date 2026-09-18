@@ -9,6 +9,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
+import { startDaemonWatchdog } from "./daemon-watchdog.js";
 import { JevDecisionModel } from "./jev/client.js";
 import { createServer, SERVER_NAME, SERVER_VERSION } from "./server.js";
 
@@ -38,6 +39,11 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
 
   log(`v${SERVER_VERSION} ready on stdio (model ${config.model}, base ${config.baseUrl}).`);
+
+  // Only when the plugin manifest asked for it. Starting a hook daemon from a
+  // plain `npx jev-mcp` would start a process with no hooks to serve.
+  const watchdog = startDaemonWatchdog();
+  if (watchdog !== undefined) log("watching the hook daemon every 10 s (JEV_PLUGIN_DAEMON=1).");
 }
 
 main().catch((error: unknown) => {

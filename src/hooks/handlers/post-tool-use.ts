@@ -16,7 +16,7 @@
  */
 
 import type { NoulAnswer, Question } from "../../decision/types.js";
-import { requestText } from "../store.js";
+import { modelCost, requestText } from "../store.js";
 import { redactAndClamp } from "../redact.js";
 import { applyLedgerEvent, EMPTY_LEDGER, ledgerEvent } from "../verification.js";
 import { injectionNoteText, injectionSystemMessage } from "../wording.js";
@@ -203,9 +203,7 @@ export async function handlePostToolUse(input: HookInput, deps: Deps): Promise<H
       ...base,
       decision: flagged ? "flagged" : "clean",
       signals,
-      model: result.model,
-      latency_ms: result.latency_ms,
-      input_tokens: result.usage.input_tokens,
+      ...modelCost(result),
     });
 
     if (!flagged) return undefined;

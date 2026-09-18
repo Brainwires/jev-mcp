@@ -3,8 +3,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { runEvent, WALL_CLOCK_MS } from "../../src/hooks/main.js";
+import { HANDLERS, runEvent, WALL_CLOCK_MS } from "../../src/hooks/main.js";
 import { FakeModel, noul, score } from "../helpers/fake-model.js";
+import { CASES } from "./cases.js";
 import { cleanup, makeDeps, tempDir } from "./helpers.js";
 
 const PRE = JSON.stringify({
@@ -144,5 +145,49 @@ describe("the wall-clock budget", () => {
   it("leaves headroom under the 5 second hooks.json timeout", () => {
     expect(WALL_CLOCK_MS).toBeLessThan(5000);
     expect(WALL_CLOCK_MS).toBeGreaterThan(2000);
+  });
+});
+
+/**
+ * The command half of the conformance pair.
+ *
+ * `conformance.test.ts` runs the same table against a real daemon and asserts
+ * byte equality with what happens here. This half pins what the bytes are, so a
+ * change in behaviour fails as a changed expectation rather than as two paths
+ * quietly agreeing on something new.
+ */
+describe("the shared case table, in process", () => {
+  for (const hookCase of CASES) {
+    it(hookCase.name, async () => {
+      const deps = makeDeps(dir, {
+        ...(hookCase.model !== undefined ? { model: hookCase.model() } : {}),
+        ...(hookCase.config !== undefined ? { config: hookCase.config } : {}),
+      });
+      hookCase.prepare?.(deps.store);
+      const output = await runEvent(hookCase.event, JSON.stringify(hookCase.input), deps);
+      const text = JSON.stringify(output ?? {});
+      if (hookCase.expect !== undefined) expect(text).toBe(hookCase.expect);
+      for (const needle of hookCase.contains ?? []) expect(text).toContain(needle);
+    });
+  }
+});
+
+describe("HANDLERS", () => {
+  it("is exported, so hooks.json and the daemon's routes can be checked against it", () => {
+    // `Approval` is this repo's own label rather than a Claude Code event, and
+    // the daemon exposes one route per key here, so it has to be in the map.
+    expect(Object.keys(HANDLERS).sort()).toEqual(
+      [
+        "Approval",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PreToolUse",
+        "SessionEnd",
+        "SessionStart",
+        "Stop",
+        "SubagentStop",
+        "UserPromptSubmit",
+      ].sort(),
+    );
   });
 });

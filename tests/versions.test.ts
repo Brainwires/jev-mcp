@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { editsFor, plan, VERSION_PATTERN } from "../scripts/bump.js";
+import { HOOK_VERSION } from "../src/hooks/version.js";
 import { SERVER_VERSION } from "../src/server.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -44,6 +45,13 @@ describe("versions agree", () => {
     expect(SERVER_VERSION).toBe(pkg.version);
   });
 
+  it("HOOK_VERSION matches package.json, so the daemon reports the truth", () => {
+    // The hook bundle cannot import SERVER_VERSION without dragging the MCP SDK
+    // in, so it has its own constant — and `ensureDaemon` replaces a daemon by
+    // comparing what health reports against what the caller shipped with.
+    expect(HOOK_VERSION).toBe(pkg.version);
+  });
+
   it("the lockfile matches package.json, in both places it says so", () => {
     expect(lock.version).toBe(pkg.version);
     const packages = lock.packages as Record<string, { version?: string }> | undefined;
@@ -66,6 +74,7 @@ describe("npm run bump", () => {
         "package-lock.json",
         "package.json",
         "plugin/.claude-plugin/plugin.json",
+        "src/hooks/version.ts",
         "src/server.ts",
       ].sort(),
     );
@@ -77,7 +86,7 @@ describe("npm run bump", () => {
 
   it("covers exactly the files this test asserts on", () => {
     // If someone adds a version to a new file, both lists have to grow.
-    expect(editsFor("jev-mcp")).toHaveLength(5);
+    expect(editsFor("jev-mcp")).toHaveLength(6);
   });
 
   it("leaves dependency versions alone", () => {

@@ -61,7 +61,11 @@ let env: Record<string, string>;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "jev-e2e-"));
-  env = { CLAUDE_PLUGIN_DATA: dir };
+  // No daemon from this file. SessionStart starts one since 0.4.0, and these
+  // tests are about the command path; `tests/hooks/daemon-e2e.test.ts` covers
+  // the spawn, on a port it picked itself. Nothing in the suite may leave a
+  // process on the real 10522.
+  env = { CLAUDE_PLUGIN_DATA: dir, JEV_DAEMON_DISABLE: "1" };
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });

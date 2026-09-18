@@ -21,6 +21,11 @@ plugin whose HOOKS put Jev judgments at harness boundaries. Same repo, same core
 5. **Latency budget.** Jev call timeout 1500 ms, maxRetries 0 in hooks. hooks.json `timeout`: 5 (seconds).
 6. **Zero install step.** Plugin installs do not run npm. Ship committed, esbuild-bundled,
    dependency-free single files in `plugin/dist/`: `hook.mjs`, `mcp.mjs`. Node >= 20 only.
+7. **One implementation, two transports.** (0.4.0) The `type: "http"` hooks and the command hooks
+   run the same `runEvent` from the same bundle. `tests/hooks/cases.ts` is driven by both
+   `main.test.ts` (in process) and `conformance.test.ts` (POST to a real daemon) and asserts
+   byte-identical output, with `{}` standing in for `undefined`. A behaviour that depends on
+   whether a daemon happens to be up is a bug, not a mode.
 
 ## Layout (repo root = marketplace; plugin in ./plugin)
 ```
@@ -197,6 +202,79 @@ specific plugins; just the classification. Low confidence -> no output.
 If no API key configured: additionalContext + systemMessage, once per session: jev hooks are inactive;
 set the key via `/plugin` config or TYPESAFE_API_KEY. Otherwise silent.
 
+Since 0.4.0 SessionStart has a second job, run *after* the handler so a slow spawn can never delay or
+suppress the one thing SessionStart exists to say: `ensureDaemon()`, then
+`POST /v1/session/start` with this session's non-secret config snapshot. It merges any `systemMessage`
+from either step into its own and always exits 0.
+
+### SessionEnd — `type: "http"`, `timeout` 2
+Minimal by construction. The handler (`src/hooks/handlers/session-end.ts`) returns `undefined`; the
+daemon's route ends the session in its registry and, if that was the last one, arms a 60 s exit timer.
+SessionEnd hooks share a 1.5 s budget across every installed plugin and Claude Code discards their
+output, so nothing that matters may live here.
+
+## The daemon (0.4.0) — `src/hooks/daemon/*`
+`node hook.mjs daemon` runs a loopback HTTP server. Same bundle as the hooks (no third artifact), so
+handlers cannot drift between the two transports.
+
+- **Binding.** `127.0.0.1` only, port `10522` by default. `JEV_DAEMON_PORT` / the `daemon_port`
+  option move it, but a hook URL is a literal in `hooks.json` and cannot read an environment
+  variable, so moving the daemon means editing the manifest too. `--port 0` (tests) asks the OS and
+  publishes the answer in `daemon.json`.
+- **Routes.** `GET /v1/health` (unauthenticated, secret-free: `jev, pid, port, version, protocol,
+  bundle_path, bundle_mtime, started_at, uptime_ms, sessions, auth, counters`);
+  `POST /v1/session/start`, `POST /v1/session/end`; `POST /v1/hook/<Event>` for every key of
+  `HANDLERS`, which includes `Approval` — this repo's own label for the bookkeeping-only path wired
+  to `PostToolUse` and `PostToolUseFailure`, not a Claude Code event. There is deliberately **no
+  shutdown route**: signals only.
+- **Order of checks.** authorize (401) → known event (404) → declared protocol mismatch (409) →
+  body ≤ 4 MB (413) → unparseable body (`200 {}`) → `withDeadline(runEvent, 3500)` → `200` with the
+  handler's JSON, or `{}` for `undefined`. A handler that throws is `500`. Every one of those is a
+  non-blocking error to Claude Code, so the tool call proceeds either way.
+- **Auth.** `Authorization: Bearer <key>` or `X-Jev-Env-Key: <key>`, compared with `timingSafeEqual`
+  over sha256 digests. An empty `Bearer ` is *absent*, not wrong: the spike showed
+  `CLAUDE_PLUGIN_OPTION_API_KEY` interpolating to the empty string when the option is unset. No key
+  configured anywhere → unauthenticated, stated as `auth: "none"` in health.
+- **Lifetime.** Idle 30 min with no hook request (health probes deliberately do not count, or the
+  MCP watchdog's polling would keep it alive forever); 60 s grace after the last session ends;
+  SIGTERM closes the listener first so a replacement can bind, drains ≤ 3.5 s, writes
+  `state: "stopped"`, exits 0.
+- **Per-session config.** `SessionStart` posts the snapshot (`SessionConfig` =
+  `Omit<HookConfig, "apiKey"|"warnings"|"dataDir"|"disabled">`) and also writes it to the session
+  file, so a daemon replaced mid-session reloads a session's settings from disk rather than judging
+  it with its own environment's.
+- **Jev latency.** One `JevDecisionModel` for the life of the process, wrapped
+  `MemoizedModel(LimitedModel(client))` — memo outside so a hit never queues behind four real calls.
+  Memo: 256 entries, 5 min, keyed by sha256 of `{model, state, questions}`, successful results only.
+  A hit records `latency_ms: 0, input_tokens: 0, memo: true`, and `/jev:status` excludes memo hits
+  from its latency percentiles.
+- **State.** `daemon.json` (heartbeat every 15 s and once on exit, written by rename),
+  `daemon.lock` (`O_EXCL`, `<pid> <ms>`, stale if the pid is dead or the file is > 30 s old),
+  `daemon.log` (stderr, truncated at start). Disk stays the source of truth: a `/jev:*` command runs
+  through the Bash tool, which may be sandboxed away from loopback sockets.
+- **`ensureDaemon()`** → `running | started | replaced | conflict | failed`. Probe (300 ms):
+  answers as jev and same protocol and not an older `bundle_mtime` → `running`; answers as jev but
+  stale → SIGTERM, wait ≤ 2 s for the port, SIGKILL, spawn, wait ≤ 2 s for health → `replaced`;
+  answers but is not jev → write `port-conflict`, `conflict`, and never signal it; connects but
+  never answers → `replaced` if our own state file names a live pid (a wedged daemon), else
+  `conflict`, because signalling an unidentified process is not something a plugin may do; refused →
+  take the lock, re-probe under it, spawn → `started`. A stale pid file is ignored: the port is the
+  authority, not a file. Never spawns from a Bash-tool process — `/jev:daemon restart` only stops.
+- **Watchdog.** `src/daemon-watchdog.ts`, started by the MCP server when the manifest sets
+  `JEV_PLUGIN_DAEMON=1`. `ensureDaemon` every 10 s, interval `unref`'d, runs never overlap, every
+  error swallowed and counted.
+
+### hooks.json shape (0.4.0)
+`SessionStart`: command. `UserPromptSubmit`: an http entry **and** a command fallback
+(`… hook.mjs UserPromptSubmit --fallback`), which probes the port in process (~2 ms) and exits
+silently if the daemon answered; `nextPrompts` drops an identical consecutive prompt so a lost race
+is invisible. `PreToolUse`, `PostToolUse` ×2 (the second to `Approval`), `PostToolUseFailure`,
+`Stop`, `SessionEnd`: pure `type: "http"` to `http://127.0.0.1:10522/v1/hook/<Event>`, with
+`headers` carrying both credential forms plus `X-Jev-Protocol`, `allowedEnvVars`
+`["CLAUDE_PLUGIN_OPTION_API_KEY","TYPESAFE_API_KEY"]`, and `timeout` 5 (2 on SessionEnd).
+No entry declares `async`: Claude Code honours it on command hooks only, so the daemon answers
+`Approval` with `{}` first and does the bookkeeping afterwards instead.
+
 ## Hook runtime (`src/hooks/main.ts` -> dist/hook.mjs)
 argv[2] = event. Read all stdin, JSON.parse, dispatch. Each handler is a pure-ish function
 `(input, deps:{model: DecisionModel, config, store, now}) => Promise<HookOutput|undefined>` so tests inject
@@ -250,6 +328,14 @@ end-to-end through the shipped bundle: spawn `node dist/hook.mjs PreToolUse` wit
 key -> exit 0 and empty stdout on a skip, a `deny` with tripwire text on a hard pattern, a trip answered by
 a marker in a later process, and a legacy `gate_mode=off` still silencing everything; with garbage stdin ->
 exit 0. `claude plugin validate --strict` on both the marketplace root and `./plugin`.
+
+0.4.0 adds: the shared case table driven by both transports (`cases.ts` + `conformance.test.ts`), the
+daemon's HTTP surface (`daemon.test.ts`), the control plane against real processes — spawn, stale pid
+file, wedged daemon, foreign listener, older bundle, two racing callers (`daemon-control.test.ts`), the
+shipped bundle as a daemon (`daemon-e2e.test.ts`, run twice concurrently in CI), the manifest against
+`HANDLERS` (`hooks-json.test.ts`), the memo and the limiter (`memo.test.ts`), and the watchdog
+(`watchdog.test.ts`). Every test picks an ephemeral port and kills what it started; CI asserts nothing
+answers on 10522 afterwards.
 
 ## README
 Add a top-level "Claude Code plugin" section: install (`/plugin marketplace add <path-or-repo>`,

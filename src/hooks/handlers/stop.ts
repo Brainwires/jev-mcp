@@ -13,7 +13,7 @@
 
 import type { NoulAnswer, Question } from "../../decision/types.js";
 import { redactAndClamp } from "../redact.js";
-import { requestText } from "../store.js";
+import { modelCost, requestText } from "../store.js";
 import { EMPTY_LEDGER, verificationPolicy } from "../verification.js";
 import type { Deps, HookInput, HookOutput } from "../types.js";
 
@@ -176,9 +176,7 @@ export async function handleStop(input: HookInput, deps: Deps): Promise<HookOutp
       decision,
       signals: { ...signals },
       reasons: [...policy.reasons, ...verified.reasons],
-      model: result.model,
-      latency_ms: result.latency_ms,
-      input_tokens: result.usage.input_tokens,
+      ...modelCost(result),
     });
 
     if (!blocked) return undefined;

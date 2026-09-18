@@ -7,6 +7,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { HOOK_DEFAULTS, installIdFromScriptPath, loadHookConfig, resolveDataDir } from "../../src/hooks/config.js";
+import { DEFAULT_PORT } from "../../src/hooks/daemon/protocol.js";
+import { hookConfigFrom, readSessionConfig, sessionConfigOf } from "../../src/hooks/daemon/registry.js";
 
 describe("loadHookConfig", () => {
   it("uses the documented defaults with an empty environment", () => {
@@ -168,5 +170,102 @@ describe("resolveDataDir", () => {
     expect(installIdFromScriptPath("/repo/jev-mcp/plugin/dist/hook.mjs")).toBeUndefined();
     expect(installIdFromScriptPath("/x/cache/a/b/1/dist/hook.mjs")).toBeUndefined();
     expect(installIdFromScriptPath(undefined)).toBeUndefined();
+  });
+});
+
+describe("daemon settings", () => {
+  it("defaults to the port the plugin manifest hard-codes into its hook URLs", () => {
+    // `hooks.json` can interpolate environment variables into headers only, so
+    // the URL carries a literal and these two have to agree.
+    expect(loadHookConfig({}).daemonPort).toBe(DEFAULT_PORT);
+    expect(DEFAULT_PORT).toBe(10522);
+  });
+
+  it("defaults to a thirty minute idle window", () => {
+    expect(loadHookConfig({}).daemonIdleMs).toBe(30 * 60 * 1000);
+  });
+
+  it("reads the port from either name", () => {
+    expect(loadHookConfig({ JEV_DAEMON_PORT: "10599" }).daemonPort).toBe(10599);
+    expect(loadHookConfig({ CLAUDE_PLUGIN_OPTION_DAEMON_PORT: "10598" }).daemonPort).toBe(10598);
+  });
+
+  it("allows port 0, which is how the tests stay off the real one", () => {
+    const config = loadHookConfig({ JEV_DAEMON_PORT: "0" });
+    expect(config.daemonPort).toBe(0);
+    expect(config.warnings).toEqual([]);
+  });
+
+  it("warns and falls back rather than throwing on a nonsense port", () => {
+    for (const bad of ["-1", "70000", "http", ""]) {
+      const config = loadHookConfig({ JEV_DAEMON_PORT: bad });
+      expect(config.daemonPort, bad).toBe(DEFAULT_PORT);
+    }
+    expect(loadHookConfig({ JEV_DAEMON_PORT: "70000" }).warnings.join(" ")).toContain("daemon_port");
+  });
+
+  it("clamps the idle window to something a daemon can actually use", () => {
+    expect(loadHookConfig({ JEV_DAEMON_IDLE_MS: "60000" }).daemonIdleMs).toBe(60_000);
+    expect(loadHookConfig({ JEV_DAEMON_IDLE_MS: "1" }).daemonIdleMs).toBe(30 * 60 * 1000);
+    expect(loadHookConfig({ JEV_DAEMON_IDLE_MS: "999999999" }).daemonIdleMs).toBe(30 * 60 * 1000);
+  });
+});
+
+describe("the session config snapshot", () => {
+  it("carries every setting the daemon needs and no secret", () => {
+    const snapshot = sessionConfigOf(loadHookConfig({ TYPESAFE_API_KEY: "sk-secret", JEV_GATE: "strict" }));
+    expect(snapshot.gate).toBe("strict");
+    expect(JSON.stringify(snapshot)).not.toContain("sk-secret");
+    expect(snapshot).not.toHaveProperty("apiKey");
+    expect(snapshot).not.toHaveProperty("dataDir");
+    expect(snapshot).not.toHaveProperty("disabled");
+    expect(snapshot).not.toHaveProperty("warnings");
+  });
+
+  it("round-trips through validation unchanged", () => {
+    const snapshot = sessionConfigOf(loadHookConfig({ JEV_GATE: "strict", JEV_ROUTE_PROMPTS: "1" }));
+    expect(readSessionConfig(snapshot, sessionConfigOf(loadHookConfig({})))).toEqual(snapshot);
+  });
+
+  it("replaces every unusable field with the daemon's own value", () => {
+    const own = sessionConfigOf(loadHookConfig({}));
+    const read = readSessionConfig(
+      {
+        gate: "wide-open",
+        autoThreshold: 42,
+        reviewThreshold: -1,
+        timeoutMs: 0,
+        stopCheck: "yes",
+        model: "",
+        daemonPort: 999_999,
+      },
+      own,
+    );
+    expect(read).toEqual(own);
+  });
+
+  it("never lets a snapshot raise the review threshold above the auto one", () => {
+    const own = sessionConfigOf(loadHookConfig({}));
+    const read = readSessionConfig({ autoThreshold: 0.7, reviewThreshold: 0.95 }, own);
+    expect(read?.autoThreshold).toBe(0.7);
+    expect(read?.reviewThreshold).toBe(0.7);
+  });
+
+  it("rejects a snapshot that is not an object at all", () => {
+    const own = sessionConfigOf(loadHookConfig({}));
+    for (const bad of [null, undefined, 42, "gate=off", [1, 2]]) {
+      expect(readSessionConfig(bad, own), JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+
+  it("rebuilds a full config from a snapshot plus this daemon's secrets", () => {
+    const own = loadHookConfig({ JEV_GATE: "strict" });
+    const rebuilt = hookConfigFrom(sessionConfigOf(own), "sk-daemon", "/tmp/data");
+    expect(rebuilt.gate).toBe("strict");
+    expect(rebuilt.apiKey).toBe("sk-daemon");
+    expect(rebuilt.dataDir).toBe("/tmp/data");
+    // The kill switch is never inherited: it stops the hook before the daemon.
+    expect(rebuilt.disabled).toBe(false);
+    expect(rebuilt.warnings).toEqual([]);
   });
 });

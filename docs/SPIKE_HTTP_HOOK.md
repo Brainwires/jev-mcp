@@ -63,6 +63,20 @@ result changes the design rather than just confirming it.
 
 Record the answers in this file under "Results" with the Claude Code version (`claude --version`).
 
-## Results
+## Results (Claude Code 2.1.275, 2026-09-18, headless `claude -p … --settings <file>` sessions)
 
-_(pending)_
+| # | Answer | Evidence |
+|---|---|---|
+| 1 | **Yes.** `$VAR` and `${VAR}` both interpolate when listed in `allowedEnvVars`; an unlisted `$HOME` became an empty string; a static value passed through. `CLAUDE_PLUGIN_OPTION_API_KEY` was empty in a *settings* hook (that variable exists only in a plugin's hook environment) — `TYPESAFE_API_KEY` from the shell resolved to its full 108-char value. | listener log: `Authorization` = 6 chars ("Bearer " + empty), `X-Env-Key` = 108 chars, `X-Static` = 12 chars, `X-Unlisted` = 0 chars |
+| 2 | **Yes.** A `2xx {}` reply is silent: the stream-json transcript shows no hook event for the http hooks at all (only the plugins' command `SessionStart` hooks appear), and the session completed normally. | run "up": `result success done`, hook mentions identical to a session without the http hooks |
+| 3 | **Quiet.** With the listener stopped, the session ran identically: same transcript shape, no warning, the Bash call ran. Fail-open needs no fallback on the hot path. | run "down": identical line count and hook-event count to run "up" |
+| 4 | **Quiet.** A `text/plain` reply produced nothing visible either. | run "text": identical |
+| 5 | Fired: the `async: true` PostToolUse entry reached the listener 1–3 s after each PreToolUse. Whether it blocked the turn was not measurable headless (no delay was added). The daemon design answers `{}` first and does bookkeeping after, so it does not depend on this. | listener log ordering |
+| 6 | **Yes.** `UserPromptSubmit` reached the listener before the first `PreToolUse` of the turn in all three runs. Plugin command `SessionStart` hooks ran before the prompt (they appear first in the transcript). | listener log ordering; transcript |
+| 7 | Not measurable headless. Cosmetic. | — |
+
+Design consequences: pure `type: "http"` hooks on the hot path; a command hook only on `SessionStart`
+(to start/replace the daemon); keep a command fallback on `UserPromptSubmit` only (once per prompt,
+protects the first prompt when the daemon is cold — cheap insurance even though question 6 passed).
+Auth: the shell key interpolates; inside the plugin `CLAUDE_PLUGIN_OPTION_API_KEY` is expected to as
+well (docs), but the daemon must accept either header and must treat an empty `Bearer` as absent.

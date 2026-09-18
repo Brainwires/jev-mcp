@@ -25,6 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import type { SessionConfig } from "./daemon/registry.js";
 import { liveTrips, MAX_TRIPS, readTrip, type Trip, type TripSource } from "./tripwire.js";
 import { VERIFICATION_KINDS, type VerificationLedger } from "./verification.js";
 
@@ -39,10 +40,20 @@ export const MAX_PROMPT_CHARS = 2000;
 export const SHORT_PROMPT_CHARS = 40;
 export const MAX_SHORT_PROMPTS = 2;
 
-/** Append a prompt, trimming short and substantive prompts separately. Order is preserved. */
+/**
+ * Append a prompt, trimming short and substantive prompts separately. Order is
+ * preserved.
+ *
+ * An identical consecutive prompt is dropped. In 0.4.0 `UserPromptSubmit` has
+ * both an http entry and a command fallback, and the fallback is supposed to
+ * notice the daemon answered and exit — but if it ever double-fires, the only
+ * visible effect should be nothing at all, rather than the same sentence
+ * occupying two of the three prompt slots and evicting the request before it.
+ */
 export function nextPrompts(existing: readonly string[], prompt: string): string[] {
   const text = prompt.trim();
   if (text === "") return [...existing];
+  if (existing[existing.length - 1] === text) return [...existing];
   const all = [...existing, text];
   const isShort = (p: string): boolean => p.length < SHORT_PROMPT_CHARS;
   let short = all.filter(isShort).length;
@@ -131,6 +142,14 @@ export interface SessionState {
   /** SessionStart already told the user the key is missing. */
   key_warned?: boolean;
   /**
+   * The non-secret configuration snapshot this session posted to the daemon.
+   *
+   * Written so a *replaced* daemon — a plugin update, a crash, a
+   * `/jev:daemon restart` — can answer a hook for a session it never saw hello
+   * from with that session's settings rather than with its own environment's.
+   */
+  config?: SessionConfig;
+  /**
    * What the last test/build/type-check/lint run established, and how many
    * edits have happened since. Deliberately NOT reset by a new user prompt:
    * a failing test suite is still failing after the user types something.
@@ -179,7 +198,34 @@ export interface DecisionRecord {
   model?: string;
   latency_ms?: number;
   input_tokens?: number;
+  /**
+   * The daemon answered this from its in-memory cache: no call went out, so
+   * `latency_ms` and `input_tokens` are both 0 and mean it.
+   */
+  memo?: boolean;
   error?: string;
+}
+
+/**
+ * The cost fields of a record, from a model result.
+ *
+ * One helper rather than four copies of the same three lines, because 0.4.0
+ * added a fourth field — `memo` — and a handler that forgot it would report a
+ * cached answer as a 0 ms, 0 token real call, which is the one thing the memo
+ * must never be allowed to do to the log.
+ */
+export function modelCost(result: {
+  model: string;
+  latency_ms: number;
+  usage: { input_tokens: number };
+  memo?: boolean;
+}): Pick<DecisionRecord, "model" | "latency_ms" | "input_tokens" | "memo"> {
+  return {
+    model: result.model,
+    latency_ms: result.latency_ms,
+    input_tokens: result.usage.input_tokens,
+    ...(result.memo === true ? { memo: true } : {}),
+  };
 }
 
 function safe<T>(fn: () => T, fallback: T): T {
@@ -261,6 +307,12 @@ export class Store {
       };
       if (state.disabled === true) session.disabled = true;
       if (state.key_warned === true) session.key_warned = true;
+      // Kept opaque here and validated field by field where it is used
+      // (`readSessionConfig`), which is the only place that knows what a
+      // sensible value for each setting is.
+      if (typeof state.config === "object" && state.config !== null && !Array.isArray(state.config)) {
+        session.config = state.config;
+      }
       if (Array.isArray(state.pending_reissues)) {
         session.pending_reissues = state.pending_reissues.filter(
           (p): p is PendingReissue => typeof p === "object" && p !== null && typeof p.tool_use_id === "string",

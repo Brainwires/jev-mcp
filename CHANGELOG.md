@@ -1,9 +1,84 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
+All notable changes to jevwire ([Brainwires/jevwire](https://github.com/Brainwires/jevwire)) are
+documented in this file. The npm package is published as `jev-mcp` and the Claude Code plugin is
+`jev`; the repository was renamed to jevwire after 0.3.0.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.4.0] - 2026-09-18
+
+**The hooks stop paying for a process each.** Most of them are now `type: "http"` posts to a small
+loopback daemon that `SessionStart` starts, instead of a fresh `node` per tool call. Measured on this
+machine, against the real API, with a temp data directory and an ephemeral port:
+
+| path | 0.3.0 | 0.4.0 | how |
+|---|---|---|---|
+| skip-path hook (`ls -la`) | ≈160–170 ms | **p50 2.8 ms, p95 8.4 ms** (n=20) | no process to start |
+| judged hook, cold socket | ≈665 ms | **501 ms** (Jev 491 ms of it) | first call after start |
+| judged hook, warm socket | ≈665 ms | **p50 210 ms, p95 290 ms** (n=4; Jev 198–284 ms) | TLS and the pool are paid for once |
+| the same judgment again | a second full call | **5 ms**, `memo: true`, 0 tokens | 5-minute memo |
+| SessionStart | ≈165 ms | ≈400–600 ms the first time, ≈170 ms after | spawn plus a health wait |
+
+Nothing about what the plugin *decides* changed. The http hooks and the command hooks run the same
+handlers from the same bundle, and a shared case table asserts byte-identical output from both.
+
+### Added
+
+- **A loopback daemon**, `node hook.mjs daemon`, in the same bundle as the hooks. One per user per
+  machine, `127.0.0.1:10522`, serving `POST /v1/hook/<Event>` for every event the plugin handles.
+  Idle-exits after 30 minutes, 60 seconds after the last session ends, and drains on SIGTERM.
+- **`/jev:daemon [status|stop|restart]`**, and a "Daemon" section in `/jev:status`: up or down, pid,
+  version, protocol, uptime, sessions, hooks served by event, Jev calls versus memo hits, timeouts,
+  restarts and the port-conflict flag.
+- **Self-healing.** `SessionStart` starts or replaces the daemon; a watchdog in the plugin's MCP
+  server checks every 10 seconds. A plugin update is picked up automatically: the daemon reports its
+  `bundle_mtime` and protocol in `/v1/health`, and an older one is replaced rather than trusted.
+- **A 5-minute memo** in front of the Jev client (256 entries, keyed by a sha256 of the model, the
+  state and the questions; successful answers only). A hit is logged as `memo: true` with
+  `latency_ms: 0` and `input_tokens: 0`, and `/jev:status` leaves hits out of its latency
+  percentiles, so neither number flatters the real cost.
+- **A concurrency limit of 4** on Jev calls, so a burst of tool calls cannot open a socket each.
+- **A `SessionEnd` hook**, deliberately empty: it is how the daemon learns a session is over.
+- `JEV_DAEMON_PORT` / `daemon_port` and `JEV_DAEMON_IDLE_MS` / `daemon_idle_ms` settings, and
+  `JEV_DAEMON_DISABLE=1` to keep `SessionStart` from starting a daemon at all.
+
+### Changed
+
+- `plugin/hooks/hooks.json`: `PreToolUse`, `PostToolUse` (both matchers), `PostToolUseFailure`,
+  `Stop` and `SessionEnd` are `type: "http"`. `SessionStart` stays a command hook — it is what starts
+  the daemon. `UserPromptSubmit` has both, the command entry as a fallback that probes the port first
+  and says nothing if the daemon answered, so the first prompt of a session is covered while the
+  daemon is still coming up.
+- `nextPrompts` drops an identical consecutive prompt, so a double-fired `UserPromptSubmit` is
+  invisible rather than evicting the request before it.
+- The plugin manifest passes `JEV_PLUGIN_DAEMON=1`, `JEV_PLUGIN_ROOT` and every
+  `CLAUDE_PLUGIN_OPTION_*` to the MCP server, so a watchdog-started daemon is configured exactly like
+  a hook-started one.
+- `src/hooks/main.ts` exports `HANDLERS`; dispatch moved to `src/hooks/dispatch.ts` (re-exported, so
+  nothing that imported `runEvent` from `main.ts` changed).
+- The hook bundle grew from 187.0 KiB to 188.2 KiB — four more node builtins (`http`, `net`,
+  `crypto`, `child_process`) and no new dependency. It still contains no MCP SDK and no zod.
+
+### Fixed
+
+- A memo hit reached the decision log without its `memo` flag, because `runGateAction` rebuilt the
+  result and dropped it. It read as a 0 ms, 0-token *real* call, which would have quietly flattered
+  both the latency percentiles and the cost estimate in `/jev:status`. Found in live verification.
+- `/v1/health` reported `jev_calls: 0` and `memo_hits: 0` forever: the server never calls Jev, so it
+  cannot count the calls, and it was not asking the model stack that can. Also found live.
+
+### Security
+
+- The daemon binds loopback only and authenticates with the TypeSafe API key, accepted in either
+  `Authorization: Bearer` or `X-Jev-Env-Key` and compared in constant time. `/v1/health` is
+  unauthenticated and carries no secret. There is no shutdown endpoint; stopping it takes a signal,
+  which takes being the same user.
+- Residual risk, stated in `SECURITY.md`: a different local user who squats the port before the
+  daemon starts receives the hook payloads and the key in a header. **Multi-user hosts are not
+  supported.** A keyless install runs the daemon unauthenticated, which `/v1/health` says plainly as
+  `auth: "none"`; there is nothing to spend and no judgment to make without a key.
 
 ## [0.3.0] - 2026-09-17
 
@@ -259,10 +334,12 @@ are unchanged; the decision log records them so `/jev:calibrate` can replay the 
 
 Not yet exercised against the live API at the time of this release.
 
-[0.2.1]: https://github.com/Brainwires/jev-mcp/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/Brainwires/jev-mcp/compare/v0.1.4...v0.2.0
-[0.1.4]: https://github.com/Brainwires/jev-mcp/compare/v0.1.3...v0.1.4
-[0.1.3]: https://github.com/Brainwires/jev-mcp/compare/v0.1.2...v0.1.3
-[0.1.2]: https://github.com/Brainwires/jev-mcp/compare/v0.1.1...v0.1.2
-[0.1.1]: https://github.com/Brainwires/jev-mcp/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/Brainwires/jev-mcp/releases/tag/v0.1.0
+[0.4.0]: https://github.com/Brainwires/jevwire/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Brainwires/jevwire/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/Brainwires/jevwire/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/Brainwires/jevwire/compare/v0.1.4...v0.2.0
+[0.1.4]: https://github.com/Brainwires/jevwire/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/Brainwires/jevwire/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/Brainwires/jevwire/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/Brainwires/jevwire/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/Brainwires/jevwire/releases/tag/v0.1.0

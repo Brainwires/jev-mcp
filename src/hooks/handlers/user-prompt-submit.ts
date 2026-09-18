@@ -12,7 +12,7 @@
  */
 
 import type { ChoiceAnswer, Question, ScoreAnswer } from "../../decision/types.js";
-import { MAX_PROMPT_CHARS, nextPrompts } from "../store.js";
+import { MAX_PROMPT_CHARS, modelCost, nextPrompts } from "../store.js";
 import { redactAndClamp } from "../redact.js";
 import type { Deps, HookInput, HookOutput } from "../types.js";
 
@@ -110,7 +110,7 @@ export async function handleUserPromptSubmit(input: HookInput, deps: Deps): Prom
     if (typeof ambiguity?.score === "number") signals.ambiguity = ambiguity.score;
 
     if (kind === undefined || confidence < config.autoThreshold) {
-      store.append({ ...base, decision: "low-confidence", signals, model: result.model, latency_ms: result.latency_ms, input_tokens: result.usage.input_tokens });
+      store.append({ ...base, decision: "low-confidence", signals, ...modelCost(result) });
       return undefined;
     }
 
@@ -123,9 +123,7 @@ export async function handleUserPromptSubmit(input: HookInput, deps: Deps): Prom
       ...base,
       decision: kind.choice,
       signals,
-      model: result.model,
-      latency_ms: result.latency_ms,
-      input_tokens: result.usage.input_tokens,
+      ...modelCost(result),
     });
 
     return {

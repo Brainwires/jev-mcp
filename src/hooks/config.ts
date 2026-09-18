@@ -14,6 +14,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_IDLE_MS, DEFAULT_PORT } from "./daemon/protocol.js";
 
 /**
  * How much the tool gate says.
@@ -52,6 +53,17 @@ export interface HookConfig {
   routePrompts: boolean;
   autoThreshold: number;
   reviewThreshold: number;
+  /**
+   * Loopback port the daemon listens on.
+   *
+   * `hooks.json` can interpolate environment variables into *headers* only, so
+   * the URL in the manifest carries the literal default and this setting exists
+   * for tests and for a hand-wired install. Changing it without changing the
+   * manifest moves the daemon somewhere the http hooks do not look.
+   */
+  daemonPort: number;
+  /** No request for this long and the daemon exits rather than sit resident. */
+  daemonIdleMs: number;
   /** Directory for session files and the decision log. */
   dataDir: string;
   /** `JEV_HOOKS_DISABLE=1`: every hook becomes a no-op. */
@@ -72,6 +84,8 @@ export const HOOK_DEFAULTS = {
   routePrompts: false,
   autoThreshold: 0.85,
   reviewThreshold: 0.6,
+  daemonPort: DEFAULT_PORT,
+  daemonIdleMs: DEFAULT_IDLE_MS,
 } as const;
 
 export type Env = Record<string, string | undefined>;
@@ -203,6 +217,18 @@ export function loadHookConfig(env: Env = process.env): HookConfig {
     routePrompts: readBool(env, "route_prompts", HOOK_DEFAULTS.routePrompts, warnings, "JEV_ROUTE_PROMPTS"),
     autoThreshold: auto,
     reviewThreshold: Math.min(review, auto),
+    // Port 0 is allowed and means "ask the OS": the tests use it so they never
+    // touch the real port, and nothing in a normal install sets it.
+    daemonPort: readNumber(env, "daemon_port", HOOK_DEFAULTS.daemonPort, 0, 65_535, warnings, "JEV_DAEMON_PORT"),
+    daemonIdleMs: readNumber(
+      env,
+      "daemon_idle_ms",
+      HOOK_DEFAULTS.daemonIdleMs,
+      1000,
+      24 * 60 * 60 * 1000,
+      warnings,
+      "JEV_DAEMON_IDLE_MS",
+    ),
     dataDir: resolveDataDir(env),
     disabled: readBool(env, "hooks_disable", false, warnings, "JEV_HOOKS_DISABLE"),
     warnings,
