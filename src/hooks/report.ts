@@ -175,9 +175,14 @@ export function daemonReport(config: HookConfig, view: DaemonView, now: number =
         `deadline overruns: ${counters.deadline_overruns}`,
       `  rejected: ${counters.unauthorized} unauthorized, ${counters.protocol_mismatch} wrong protocol, ` +
         `${counters.unknown_event} unknown event, ${counters.bad_request} unparseable, ${counters.oversize} oversize`,
+      ...(counters.session_auth > 0
+        ? [
+            `  served by session id: ${counters.session_auth} (headers carried no key this daemon holds; the body named a known session)`,
+          ]
+        : []),
       ...(counters.unauthorized > 0
         ? [
-            `  ${counters.unauthorized} hook posts carried a key this daemon does not hold. The hooks send the plugin's api_key option and the shell's TYPESAFE_API_KEY; the daemon accepts any key present when it started, and /jev:daemon restart picks up a changed one.`,
+            `  ${counters.unauthorized} hook posts carried no key this daemon holds and named no session it knows. A session becomes known at SessionStart; the hooks' key header is only filled when TYPESAFE_API_KEY is exported in the shell.`,
           ]
         : []),
       health?.counters === undefined

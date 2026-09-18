@@ -53,6 +53,7 @@ interface StartOptions {
   expectedKeys?: readonly string[];
   model?: DecisionModel | null;
   depsFor?: (sessionId: string) => Deps;
+  sessionKnown?: (sessionId: string) => boolean;
   registry?: SessionRegistry;
   idleMs?: number;
   lastSessionGraceMs?: number;
@@ -76,6 +77,7 @@ async function start(options: StartOptions = {}): Promise<{
     idleMs: options.idleMs ?? 0,
     lastSessionGraceMs: options.lastSessionGraceMs ?? 0,
     ...(options.wallClockMs !== undefined ? { wallClockMs: options.wallClockMs } : {}),
+    ...(options.sessionKnown !== undefined ? { sessionKnown: options.sessionKnown } : {}),
   });
   handles.push(handle);
   return { handle, registry, deps };
@@ -135,6 +137,7 @@ describe("GET /v1/health", () => {
     expect(typeof body.uptime_ms).toBe("number");
     expect(body.sessions).toBe(0);
     expect(body.counters).toBeDefined();
+    expect((body.counters as Record<string, number>).session_auth).toBe(0);
   });
 
   it("contains no secret of any kind", async () => {
@@ -237,6 +240,73 @@ describe("authorization", () => {
     const { handle } = await start();
     const response = await fetch(`http://127.0.0.1:${handle.port}/v1/health`);
     expect(response.status).toBe(200);
+  });
+
+  it("serves a hook post with no key when the body names a registered session", async () => {
+    const { handle } = await start({
+      expectedKeys: [KEY],
+      sessionKnown: (id: string): boolean => id === "s1",
+    });
+    const reply = await hook(handle.port, "PreToolUse", PRE, {});
+    expect(reply.status).toBe(200);
+    expect(handle.stats().hooks.PreToolUse).toBe(1);
+    expect(handle.stats().session_auth).toBe(1);
+    expect(handle.stats().unauthorized).toBe(0);
+  });
+
+  it("refuses a keyless hook post naming an unknown session", async () => {
+    const { handle } = await start({
+      expectedKeys: [KEY],
+      sessionKnown: (id: string): boolean => id === "s1",
+    });
+    const reply = await hook(handle.port, "PreToolUse", { ...PRE, session_id: "nobody" }, {});
+    expect(reply.status).toBe(200);
+    expect(reply.text).toBe("{}");
+    expect(handle.stats().hooks.PreToolUse).toBeUndefined();
+    expect(handle.stats().unauthorized).toBe(1);
+    expect(handle.stats().session_auth).toBe(0);
+  });
+
+  it("a known session does not open the session routes", async () => {
+    const { handle } = await start({
+      expectedKeys: [KEY],
+      sessionKnown: (id: string): boolean => id === "s1",
+    });
+    const startResp = await fetch(`http://127.0.0.1:${handle.port}/v1/session/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: "s1" }),
+    });
+    expect(startResp.status).toBe(401);
+    const endResp = await fetch(`http://127.0.0.1:${handle.port}/v1/session/end`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: "s1" }),
+    });
+    expect(endResp.status).toBe(401);
+  });
+
+  it("an oversize keyless body is refused before any session lookup", async () => {
+    let knownCalls = 0;
+    const { handle } = await start({
+      expectedKeys: [KEY],
+      sessionKnown: (id: string): boolean => {
+        knownCalls += 1;
+        return id === "s1";
+      },
+    });
+    const big = `{"session_id":"s1","pad":"${"a".repeat(MAX_BODY_BYTES + 1024)}"}`;
+    const response = await fetch(`http://127.0.0.1:${handle.port}/v1/hook/PreToolUse`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: big,
+    }).catch(() => undefined);
+    if (response !== undefined) {
+      expect([413, 200]).toContain(response.status);
+      if (response.status === 200) expect(await response.text()).toBe("{}");
+    }
+    await waitFor(() => handle.stats().oversize === 1);
+    expect(knownCalls).toBe(0);
   });
 });
 
@@ -361,7 +431,7 @@ describe("routing", () => {
     expect((await hook(handle.port, "PreToolUse", PRE)).status).toBe(200);
   });
 
-  it("checks authorization before the route, so an unknown hook path is refused in silence", async () => {
+  it("checks the route before authorization, so an unknown hook path is counted as unknown event", async () => {
     const { handle } = await start();
     const response = await fetch(`http://127.0.0.1:${handle.port}/v1/hook/NoSuchEvent`, {
       method: "POST",
@@ -370,7 +440,8 @@ describe("routing", () => {
     // A hook route answers every refusal `200 {}`; the counter is the record.
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("{}");
-    expect(handle.stats().unauthorized).toBe(1);
+    expect(handle.stats().unknown_event).toBe(1);
+    expect(handle.stats().unauthorized).toBe(0);
   });
 });
 

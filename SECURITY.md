@@ -85,6 +85,13 @@ non-2xx from an http hook to the user as a hook error, and the plugin fails open
 `/v1/health` exposes an 8-hex-character sha256 fingerprint of each held key so `/jev:daemon status`
 can say what the daemon accepts without ever printing a key.
 
+A hook post whose headers carry no held key is still served when its body names a session the
+daemon knows — one registered by `SessionStart` over an authenticated `/v1/session/start`, or one
+with a snapshot in the data directory. A live session id is a capability another process of the same
+user could already read from the transcript files, so this keeps the existing threat model (single
+user, loopback) rather than widening it; the `/v1/session/*` routes, which change what the daemon
+knows, always require the key. `/jev:daemon status` reports how many posts were served this way.
+
 **`/v1/health` is unauthenticated and carries no secret.** It has to be: it is how a starting hook
 tells "my daemon, current version" from "my daemon, stale" from "somebody else's server" before it
 has anywhere to send a credential. It reports a pid, a port, a version, a protocol number, the

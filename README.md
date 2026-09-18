@@ -284,7 +284,9 @@ process alone, and its hooks stay inactive for the session. Nothing is blocked.
 
 **Multi-user hosts are not supported.** The daemon is on loopback and authenticates with your
 TypeSafe API key, but a different local user who binds the port first would receive the hook payloads
-and that key in a header. See [SECURITY.md](SECURITY.md#the-daemon). To turn the whole thing off
+and that key in a header. The key never has to be in the shell for the hooks to work: the option alone
+is enough, because hook posts are authorized by session once `SessionStart` has registered it. See
+[SECURITY.md](SECURITY.md#the-daemon). To turn the whole thing off
 and go back to a process per hook, set `JEV_DAEMON_DISABLE=1` — the command fallback on
 `UserPromptSubmit` keeps working and the http hooks simply fail open.
 

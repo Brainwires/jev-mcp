@@ -45,6 +45,13 @@ export interface DaemonOptions {
   /** Builds the `Deps` for one session id, honouring that session's config. */
   depsFor: (sessionId: string) => Deps;
   registry: SessionRegistry;
+  /**
+   * True when the session was registered by SessionStart or has a snapshot on disk; a known
+   * session id authorizes a hook post on its own, because Claude Code does not interpolate the
+   * plugin's option into http hook headers and the session id is the one credential every hook
+   * payload carries.
+   */
+  sessionKnown?: (sessionId: string) => boolean;
   /** No requests for this long and the daemon asks to exit. */
   idleMs?: number;
   /** After the last session ends, wait this long before asking to exit. */
@@ -222,18 +229,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         // this plugin fails open in silence. The counters keep the refusal
         // countable, and the session routes keep their real status because
         // `/v1/session/start` uses a 401 to recognise a stale daemon.
+        // The body is read before authorization because a hook's session id is a
+        // credential and it lives in the body; `MAX_BODY_BYTES` bounds what an
+        // unauthenticated caller can make the daemon read.
         const refuse = (status: number): void => {
           req.resume();
           respond(res, isHook ? 200 : status, {});
         };
 
-        // ----------------------------------------------------- authorization
-        if (!authorize(req.headers, options.expectedKeys)) {
-          bump(counters, "unauthorized");
-          refuse(401);
-          return;
-        }
-
+        // ---------------------------------------------------------- method
         if (req.method !== "POST") {
           refuse(405);
           return;
@@ -286,8 +290,19 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           return;
         }
 
-        touch();
+        // ----------------------------------------------------- authorization
+        // `readBody` has consumed the request, so no `req.resume()` here.
         const sessionId = sessionIdOf(parsed);
+        const keyed = authorize(req.headers, options.expectedKeys);
+        const bySession = !keyed && isHook && sessionId !== "unknown" && options.sessionKnown?.(sessionId) === true;
+        if (!keyed && !bySession) {
+          bump(counters, "unauthorized");
+          respond(res, isHook ? 200 : 401, {});
+          return;
+        }
+        if (bySession) bump(counters, "session_auth");
+
+        touch();
 
         // ------------------------------------------------ session lifecycle
         if (url === "/v1/session/start") {

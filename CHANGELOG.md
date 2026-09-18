@@ -7,6 +7,22 @@ documented in this file. The npm package is published as `jevwire` and the Claud
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] — 2026-09-18
+
+### Fixed
+
+- **A hook post from a known session is authorized without a key header.** Claude Code does not
+  interpolate `$CLAUDE_PLUGIN_OPTION_API_KEY` into a plugin's `type: "http"` hook headers; only
+  variables in its own process environment do. A user who set the key only in the plugin option
+  therefore had hooks that could never authenticate, and since 0.5.1 that failure was silent: the
+  daemon answered every hook post `200 {}` and counted it `unauthorized`, so the plugin was simply
+  inert. Since 0.5.2 a `POST /v1/hook/*` whose body names a session the daemon knows — one registered
+  by `SessionStart` over an authenticated `/v1/session/start`, or one with a snapshot on disk — is
+  served without any key header. The `/v1/session/*` routes still require a held key, and refusals on
+  hook routes still answer `200 {}`; `/jev:daemon status` reports how many posts were served by
+  session id and rewords the `unauthorized` explanation to say that those posts named no session the
+  daemon knows.
+
 ## [0.5.1] — 2026-09-18
 
 ### Fixed

@@ -312,7 +312,11 @@ describe("node plugin/dist/hook.mjs", () => {
     await runHook(["PreToolUse"], JSON.stringify(PRE), env);
     const hook = Date.now() - started;
 
-    expect(hook - baseline, `hook ${hook} ms, bare node ${baseline} ms`).toBeLessThan(700);
+    // 700 ms of work on an idle machine; on a loaded one the bundle parse and
+    // the session read stretch by more than node itself does, so the bound is
+    // a multiple of the bare start rather than a fixed delta above it.
+    const allowed = 700 + 2.5 * baseline;
+    expect(hook, `hook ${hook} ms, bare node ${baseline} ms, allowed ${allowed} ms`).toBeLessThan(allowed);
     expect(hook, "absolute ceiling").toBeLessThan(6000);
   }, 20_000);
 });

@@ -690,6 +690,7 @@ function emptyCounters() {
     jev_errors: 0,
     memo_hits: 0,
     unauthorized: 0,
+    session_auth: 0,
     protocol_mismatch: 0,
     unknown_event: 0,
     bad_request: 0,
@@ -822,7 +823,7 @@ function openLog(dataDir) {
 }
 
 // src/hooks/version.ts
-var HOOK_VERSION = "0.5.1";
+var HOOK_VERSION = "0.5.2";
 
 // src/hooks/daemon/control.ts
 function isAlive(pid) {
@@ -5017,11 +5018,6 @@ async function startDaemon(options) {
           req.resume();
           respond(res, isHook ? 200 : status, {});
         };
-        if (!authorize(req.headers, options.expectedKeys)) {
-          bump(counters, "unauthorized");
-          refuse(401);
-          return;
-        }
         if (req.method !== "POST") {
           refuse(405);
           return;
@@ -5058,8 +5054,16 @@ async function startDaemon(options) {
           respond(res, 200, {});
           return;
         }
-        touch();
         const sessionId = sessionIdOf(parsed);
+        const keyed = authorize(req.headers, options.expectedKeys);
+        const bySession = !keyed && isHook && sessionId !== "unknown" && options.sessionKnown?.(sessionId) === true;
+        if (!keyed && !bySession) {
+          bump(counters, "unauthorized");
+          respond(res, isHook ? 200 : 401, {});
+          return;
+        }
+        if (bySession) bump(counters, "session_auth");
+        touch();
         if (url === "/v1/session/start") {
           const fallback = sessionConfigOf(options.depsFor(sessionId).config);
           const config = readSessionConfig(parsed.config, fallback) ?? fallback;
@@ -5199,7 +5203,7 @@ function makeDepsFor(config, model, registry) {
     stores.set(dir, store);
     return store;
   };
-  return (sessionId) => {
+  const depsFor = (sessionId) => {
     const entry = registry.get(sessionId);
     if (entry !== void 0) {
       return {
@@ -5222,6 +5226,8 @@ function makeDepsFor(config, model, registry) {
     }
     return { model, config, store, now: () => Date.now() };
   };
+  const sessionKnown = (sessionId) => registry.get(sessionId) !== void 0 || readSessionConfig(storeFor(config.dataDir).readSession(sessionId).config, own) !== void 0;
+  return { depsFor, sessionKnown };
 }
 function stateFrom(config, handle, counters, restarts, run) {
   const bundle = bundleIdentity();
@@ -5260,7 +5266,7 @@ async function runDaemon(argv, env) {
   const { model, memo } = buildDaemonModel(config);
   const modelStats = modelStatsOf(memo);
   const registry = new SessionRegistry();
-  const depsFor = makeDepsFor(config, model, registry);
+  const { depsFor, sessionKnown } = makeDepsFor(config, model, registry);
   let stopping = false;
   let handle;
   let heartbeat;
@@ -5285,6 +5291,7 @@ async function runDaemon(argv, env) {
       expectedKeys: keys,
       depsFor,
       registry,
+      sessionKnown,
       idleMs: config.daemonIdleMs,
       onExitRequested: () => shutdown("idle"),
       ...modelStats !== void 0 ? { modelStats } : {}
@@ -5439,8 +5446,11 @@ function daemonReport(config, view, now = Date.now()) {
       `  jev calls: ${counters.jev_calls}   memo hits: ${counters.memo_hits}   timeouts: ${counters.jev_timeouts}   errors: ${counters.jev_errors}`,
       `  sessions: ${counters.sessions_started} started, ${counters.sessions_ended} ended   deadline overruns: ${counters.deadline_overruns}`,
       `  rejected: ${counters.unauthorized} unauthorized, ${counters.protocol_mismatch} wrong protocol, ${counters.unknown_event} unknown event, ${counters.bad_request} unparseable, ${counters.oversize} oversize`,
+      ...counters.session_auth > 0 ? [
+        `  served by session id: ${counters.session_auth} (headers carried no key this daemon holds; the body named a known session)`
+      ] : [],
       ...counters.unauthorized > 0 ? [
-        `  ${counters.unauthorized} hook posts carried a key this daemon does not hold. The hooks send the plugin's api_key option and the shell's TYPESAFE_API_KEY; the daemon accepts any key present when it started, and /jev:daemon restart picks up a changed one.`
+        `  ${counters.unauthorized} hook posts carried no key this daemon holds and named no session it knows. A session becomes known at SessionStart; the hooks' key header is only filled when TYPESAFE_API_KEY is exported in the shell.`
       ] : [],
       health?.counters === void 0 ? "  counters read from the state file, which is rewritten every 15 s, so they lag by up to that." : "  counters read live from the daemon."
     );

@@ -40,6 +40,8 @@ export interface DaemonCounters {
   jev_errors: number;
   memo_hits: number;
   unauthorized: number;
+  /** Hook posts served because their body named a known session, their headers carrying no key the daemon holds. */
+  session_auth: number;
   protocol_mismatch: number;
   unknown_event: number;
   bad_request: number;
@@ -60,6 +62,7 @@ export function emptyCounters(): DaemonCounters {
     jev_errors: 0,
     memo_hits: 0,
     unauthorized: 0,
+    session_auth: 0,
     protocol_mismatch: 0,
     unknown_event: 0,
     bad_request: 0,

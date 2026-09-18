@@ -29351,6 +29351,7 @@ function emptyCounters() {
     jev_errors: 0,
     memo_hits: 0,
     unauthorized: 0,
+    session_auth: 0,
     protocol_mismatch: 0,
     unknown_event: 0,
     bad_request: 0,
@@ -29478,7 +29479,7 @@ function openLog(dataDir) {
 }
 
 // src/hooks/version.ts
-var HOOK_VERSION = "0.5.1";
+var HOOK_VERSION = "0.5.2";
 
 // src/hooks/daemon/control.ts
 function isAlive(pid) {
@@ -39694,7 +39695,7 @@ function normalizeVerdict(choice) {
 
 // src/server.ts
 var SERVER_NAME = "jevwire";
-var SERVER_VERSION = "0.5.1";
+var SERVER_VERSION = "0.5.2";
 var ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 function ok(output2) {
   return {

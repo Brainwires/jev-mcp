@@ -90,7 +90,7 @@ export function makeDepsFor(
   config: HookConfig,
   model: DecisionModel | null,
   registry: SessionRegistry,
-): (sessionId: string) => Deps {
+): { depsFor: (sessionId: string) => Deps; sessionKnown: (sessionId: string) => boolean } {
   const own = sessionConfigOf(config);
   const stores = new Map<string, Store>();
   const storeFor = (dir: string): Store => {
@@ -101,7 +101,7 @@ export function makeDepsFor(
     return store;
   };
 
-  return (sessionId: string): Deps => {
+  const depsFor = (sessionId: string): Deps => {
     const entry = registry.get(sessionId);
     if (entry !== undefined) {
       return {
@@ -129,6 +129,12 @@ export function makeDepsFor(
 
     return { model, config, store, now: () => Date.now() };
   };
+
+  const sessionKnown = (sessionId: string): boolean =>
+    registry.get(sessionId) !== undefined ||
+    readSessionConfig(storeFor(config.dataDir).readSession(sessionId).config, own) !== undefined;
+
+  return { depsFor, sessionKnown };
 }
 
 function stateFrom(
@@ -186,7 +192,7 @@ export async function runDaemon(argv: readonly string[], env: Env): Promise<void
   const { model, memo } = buildDaemonModel(config);
   const modelStats = modelStatsOf(memo);
   const registry = new SessionRegistry();
-  const depsFor = makeDepsFor(config, model, registry);
+  const { depsFor, sessionKnown } = makeDepsFor(config, model, registry);
 
   let stopping = false;
   let handle: DaemonHandle | undefined;
@@ -217,6 +223,7 @@ export async function runDaemon(argv: readonly string[], env: Env): Promise<void
       expectedKeys: keys,
       depsFor,
       registry,
+      sessionKnown,
       idleMs: config.daemonIdleMs,
       onExitRequested: () => shutdown("idle"),
       ...(modelStats !== undefined ? { modelStats } : {}),
